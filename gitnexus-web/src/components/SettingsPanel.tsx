@@ -281,7 +281,7 @@ export const SettingsPanel = ({ isOpen, onClose, onSettingsSaved, backendUrl, is
 
   if (!isOpen) return null;
 
-  const providers: LLMProvider[] = ['openai', 'gemini', 'anthropic', 'azure-openai', 'ollama', 'openrouter'];
+  const providers: LLMProvider[] = ['openai', 'gemini', 'anthropic', 'azure-openai', 'ollama', 'openrouter', 'custom', 'bedrock'];
 
 
   return (
@@ -366,7 +366,7 @@ export const SettingsPanel = ({ isOpen, onClose, onSettingsSaved, backendUrl, is
                     w-8 h-8 rounded-lg flex items-center justify-center text-lg
                     ${settings.activeProvider === provider ? 'bg-accent/20' : 'bg-surface'}
                   `}>
-                    {provider === 'openai' ? '🤖' : provider === 'gemini' ? '💎' : provider === 'anthropic' ? '🧠' : provider === 'ollama' ? '🦙' : provider === 'openrouter' ? '🌐' : '☁️'}
+                    {provider === 'openai' ? '🤖' : provider === 'gemini' ? '💎' : provider === 'anthropic' ? '🧠' : provider === 'ollama' ? '🦙' : provider === 'openrouter' ? '🌐' : provider === 'custom' ? '⚙️' : provider === 'bedrock' ? '🔶' : '☁️'}
                   </div>
                   <span className="font-medium">{getProviderDisplayName(provider)}</span>
                 </button>
@@ -815,6 +815,177 @@ export const SettingsPanel = ({ isOpen, onClose, onSettingsSaved, backendUrl, is
           )}
 
 
+
+          {/* Custom (OpenAI-compatible) Settings */}
+          {settings.activeProvider === 'custom' && (
+            <div className="space-y-4 animate-fade-in">
+              <div className="p-3 bg-blue-500/10 border border-blue-500/30 rounded-xl">
+                <p className="text-xs text-blue-300 leading-relaxed">
+                  Connect to any OpenAI-compatible API: vLLM, LM Studio, LocalAI, Groq, Mistral AI, AWS Bedrock (via compatibility endpoint), and more.
+                </p>
+              </div>
+
+              <div className="space-y-2">
+                <label className="flex items-center gap-2 text-sm font-medium text-text-secondary">
+                  <Server className="w-4 h-4" />
+                  Base URL
+                </label>
+                <input
+                  type="url"
+                  value={settings.custom?.baseUrl ?? ''}
+                  onChange={e => setSettings(prev => ({ ...prev, custom: { ...prev.custom!, baseUrl: e.target.value } }))}
+                  placeholder="http://localhost:8080/v1"
+                  className="w-full px-4 py-3 bg-elevated border border-border-subtle rounded-xl text-text-primary placeholder:text-text-muted focus:border-accent focus:ring-2 focus:ring-accent/20 outline-none transition-all font-mono text-sm"
+                />
+              </div>
+
+              <div className="space-y-2">
+                <label className="text-sm font-medium text-text-secondary">Model</label>
+                <input
+                  type="text"
+                  value={settings.custom?.model ?? ''}
+                  onChange={e => setSettings(prev => ({ ...prev, custom: { ...prev.custom!, model: e.target.value } }))}
+                  placeholder="e.g., llama-3, mistral-7b, gpt-4"
+                  className="w-full px-4 py-3 bg-elevated border border-border-subtle rounded-xl text-text-primary placeholder:text-text-muted focus:border-accent focus:ring-2 focus:ring-accent/20 outline-none transition-all font-mono text-sm"
+                />
+              </div>
+
+              <div className="space-y-2">
+                <label className="flex items-center gap-2 text-sm font-medium text-text-secondary">
+                  <Key className="w-4 h-4" />
+                  API Key <span className="text-text-muted font-normal">(optional)</span>
+                </label>
+                <div className="relative">
+                  <input
+                    type={showApiKey['custom'] ? 'text' : 'password'}
+                    value={settings.custom?.apiKey ?? ''}
+                    onChange={e => setSettings(prev => ({ ...prev, custom: { ...prev.custom!, apiKey: e.target.value } }))}
+                    placeholder="Not required for local servers"
+                    className="w-full px-4 py-3 pr-12 bg-elevated border border-border-subtle rounded-xl text-text-primary placeholder:text-text-muted focus:border-accent focus:ring-2 focus:ring-accent/20 outline-none transition-all"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => toggleApiKeyVisibility('custom')}
+                    className="absolute right-3 top-1/2 -translate-y-1/2 p-1 text-text-muted hover:text-text-primary transition-colors"
+                  >
+                    {showApiKey['custom'] ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* AWS Bedrock Settings */}
+          {settings.activeProvider === 'bedrock' && (
+            <div className="space-y-4 animate-fade-in">
+              <div className="grid grid-cols-2 gap-4">
+                <div className="space-y-2">
+                  <label className="flex items-center gap-2 text-sm font-medium text-text-secondary">
+                    <Key className="w-4 h-4" />
+                    Access Key ID
+                  </label>
+                  <div className="relative">
+                    <input
+                      type={showApiKey['bedrock-access'] ? 'text' : 'password'}
+                      value={settings.bedrock?.accessKeyId ?? ''}
+                      onChange={e => setSettings(prev => ({ ...prev, bedrock: { ...prev.bedrock!, accessKeyId: e.target.value } }))}
+                      placeholder="AKIAIOSFODNN7EXAMPLE"
+                      className="w-full px-4 py-3 pr-10 bg-elevated border border-border-subtle rounded-xl text-text-primary placeholder:text-text-muted focus:border-accent focus:ring-2 focus:ring-accent/20 outline-none transition-all font-mono text-xs"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => toggleApiKeyVisibility('bedrock-access')}
+                      className="absolute right-3 top-1/2 -translate-y-1/2 p-1 text-text-muted hover:text-text-primary transition-colors"
+                    >
+                      {showApiKey['bedrock-access'] ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                    </button>
+                  </div>
+                </div>
+
+                <div className="space-y-2">
+                  <label className="flex items-center gap-2 text-sm font-medium text-text-secondary">
+                    <Key className="w-4 h-4" />
+                    Secret Access Key
+                  </label>
+                  <div className="relative">
+                    <input
+                      type={showApiKey['bedrock-secret'] ? 'text' : 'password'}
+                      value={settings.bedrock?.secretAccessKey ?? ''}
+                      onChange={e => setSettings(prev => ({ ...prev, bedrock: { ...prev.bedrock!, secretAccessKey: e.target.value } }))}
+                      placeholder="wJalrXUtnFEMI/K7MDENG"
+                      className="w-full px-4 py-3 pr-10 bg-elevated border border-border-subtle rounded-xl text-text-primary placeholder:text-text-muted focus:border-accent focus:ring-2 focus:ring-accent/20 outline-none transition-all font-mono text-xs"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => toggleApiKeyVisibility('bedrock-secret')}
+                      className="absolute right-3 top-1/2 -translate-y-1/2 p-1 text-text-muted hover:text-text-primary transition-colors"
+                    >
+                      {showApiKey['bedrock-secret'] ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                    </button>
+                  </div>
+                </div>
+              </div>
+
+              <div className="space-y-2">
+                <label className="text-sm font-medium text-text-secondary">
+                  Session Token <span className="text-text-muted font-normal">(optional — for STS temporary credentials)</span>
+                </label>
+                <input
+                  type="text"
+                  value={settings.bedrock?.sessionToken ?? ''}
+                  onChange={e => setSettings(prev => ({ ...prev, bedrock: { ...prev.bedrock!, sessionToken: e.target.value } }))}
+                  placeholder="Leave empty for long-term credentials"
+                  className="w-full px-4 py-3 bg-elevated border border-border-subtle rounded-xl text-text-primary placeholder:text-text-muted focus:border-accent focus:ring-2 focus:ring-accent/20 outline-none transition-all font-mono text-xs"
+                />
+              </div>
+
+              <div className="grid grid-cols-2 gap-4">
+                <div className="space-y-2">
+                  <label className="text-sm font-medium text-text-secondary">Region</label>
+                  <select
+                    value={settings.bedrock?.region ?? 'us-east-1'}
+                    onChange={e => setSettings(prev => ({ ...prev, bedrock: { ...prev.bedrock!, region: e.target.value } }))}
+                    className="w-full px-4 py-3 bg-elevated border border-border-subtle rounded-xl text-text-primary focus:border-accent focus:ring-2 focus:ring-accent/20 outline-none transition-all"
+                  >
+                    <option value="us-east-1">us-east-1 (N. Virginia)</option>
+                    <option value="us-west-2">us-west-2 (Oregon)</option>
+                    <option value="eu-west-1">eu-west-1 (Ireland)</option>
+                    <option value="eu-central-1">eu-central-1 (Frankfurt)</option>
+                    <option value="ap-southeast-1">ap-southeast-1 (Singapore)</option>
+                    <option value="ap-northeast-1">ap-northeast-1 (Tokyo)</option>
+                  </select>
+                </div>
+
+                <div className="space-y-2">
+                  <label className="text-sm font-medium text-text-secondary">Model</label>
+                  <select
+                    value={settings.bedrock?.model ?? 'anthropic.claude-3-5-sonnet-20241022-v2:0'}
+                    onChange={e => setSettings(prev => ({ ...prev, bedrock: { ...prev.bedrock!, model: e.target.value } }))}
+                    className="w-full px-4 py-3 bg-elevated border border-border-subtle rounded-xl text-text-primary focus:border-accent focus:ring-2 focus:ring-accent/20 outline-none transition-all font-mono text-xs"
+                  >
+                    <option value="anthropic.claude-3-5-sonnet-20241022-v2:0">Claude 3.5 Sonnet v2</option>
+                    <option value="anthropic.claude-3-5-haiku-20241022-v1:0">Claude 3.5 Haiku</option>
+                    <option value="anthropic.claude-3-opus-20240229-v1:0">Claude 3 Opus</option>
+                    <option value="meta.llama3-70b-instruct-v1:0">Llama 3 70B</option>
+                    <option value="mistral.mistral-large-2402-v1:0">Mistral Large</option>
+                    <option value="amazon.titan-text-express-v1">Amazon Titan Express</option>
+                  </select>
+                </div>
+              </div>
+
+              <p className="text-xs text-text-muted">
+                Make sure Bedrock model access is enabled in your{' '}
+                <a
+                  href="https://console.aws.amazon.com/bedrock/home#/modelaccess"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="text-accent hover:underline"
+                >
+                  AWS Console
+                </a>
+              </p>
+            </div>
+          )}
 
           {/* Privacy Note */}
           <div className="p-4 bg-elevated/50 border border-border-subtle rounded-xl">
