@@ -72,6 +72,9 @@ export const FUNCTION_NODE_TYPES = new Set([
   // Swift
   'init_declaration',
   'deinit_declaration',
+  // COBOL
+  'paragraph_header',
+  'section_header',
 ]);
 
 /**
@@ -231,6 +234,12 @@ export const BUILT_IN_NAMES = new Set([
   'lock', 'read', 'write', 'try_lock',
   'spawn', 'join', 'sleep',
   'Some', 'None', 'Ok', 'Err',
+  // COBOL built-in verbs (not meaningful call targets)
+  'DISPLAY', 'ACCEPT', 'MOVE', 'ADD', 'SUBTRACT', 'MULTIPLY', 'DIVIDE',
+  'COMPUTE', 'STRING', 'UNSTRING', 'INSPECT', 'INITIALIZE', 'SET',
+  'OPEN', 'CLOSE', 'READ', 'WRITE', 'REWRITE', 'DELETE', 'START',
+  'STOP', 'EXIT', 'CONTINUE', 'GOBACK', 'GO', 'ALTER',
+  'EVALUATE', 'IF', 'PERFORM', 'SEARCH', 'SORT', 'MERGE',
 ]);
 
 /** Check if a name is a built-in function or common noise that should be filtered out */
@@ -387,6 +396,56 @@ export const getLanguageFromFilename = (filename: string): SupportedLanguages | 
     return SupportedLanguages.PHP;
   }
   if (filename.endsWith('.swift')) return SupportedLanguages.Swift;
+  // COBOL (standard extensions + enterprise copybook fragments)
+  if (filename.endsWith('.cbl') || filename.endsWith('.cob') ||
+      filename.endsWith('.cobol') || filename.endsWith('.cpy') ||
+      filename.endsWith('.copy') ||
+      // Enterprise COBOL copybook fragments (common in mainframe projects)
+      filename.endsWith('.GNM') || filename.endsWith('.FD') ||
+      filename.endsWith('.WRK') || filename.endsWith('.SEL') ||
+      filename.endsWith('.OPEN') || filename.endsWith('.CLOSE') ||
+      filename.endsWith('.INI') || filename.endsWith('.DEF')) {
+    return SupportedLanguages.COBOL;
+  }
+  return null;
+};
+
+/**
+ * Language path overrides loaded from GITNEXUS_COBOL_DIRS environment variable.
+ * Set to a comma-separated list of directory names whose extensionless files
+ * should be treated as COBOL. Example: GITNEXUS_COBOL_DIRS=s,c,src,cobol
+ */
+let _cobolDirs: Set<string> | null = null;
+const getCobolDirs = (): Set<string> => {
+  if (_cobolDirs) return _cobolDirs;
+  const raw = process.env.GITNEXUS_COBOL_DIRS;
+  _cobolDirs = raw ? new Set(raw.split(',').map(d => d.trim().toLowerCase())) : new Set();
+  return _cobolDirs;
+};
+
+/**
+ * Extended language detection that also handles extensionless files
+ * by checking if the file is in a known COBOL directory.
+ * Falls back to getLanguageFromFilename for files with extensions.
+ */
+export const getLanguageFromPath = (filePath: string): SupportedLanguages | null => {
+  const result = getLanguageFromFilename(filePath);
+  if (result) return result;
+
+  // Check for extensionless COBOL files via GITNEXUS_COBOL_DIRS env var
+  const cobolDirs = getCobolDirs();
+  if (cobolDirs.size > 0) {
+    const basename = filePath.split('/').pop() || '';
+    // File has no extension (no dot in basename)
+    if (!basename.includes('.')) {
+      // Check if any path segment matches a configured COBOL directory
+      const segments = filePath.toLowerCase().split('/');
+      for (const segment of segments) {
+        if (cobolDirs.has(segment)) return SupportedLanguages.COBOL;
+      }
+    }
+  }
+
   return null;
 };
 

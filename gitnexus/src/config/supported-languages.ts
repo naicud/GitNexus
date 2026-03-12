@@ -12,4 +12,5 @@ export enum SupportedLanguages {
     Kotlin = 'kotlin',
     // Ruby = 'ruby',
     Swift = 'swift',
+    COBOL = 'cobol',
 }

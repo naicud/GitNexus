@@ -16,11 +16,13 @@ import { SupportedLanguages } from '../../../config/supported-languages.js';
 import { LANGUAGE_QUERIES } from '../tree-sitter-queries.js';
 import { getTreeSitterBufferSize, TREE_SITTER_MAX_BUFFER } from '../constants.js';
 
-// tree-sitter-swift is an optionalDependency — may not be installed
+// tree-sitter-swift and tree-sitter-cobol are optionalDependencies — may not be installed
 const _require = createRequire(import.meta.url);
 let Swift: any = null;
 try { Swift = _require('tree-sitter-swift'); } catch {}
-import { findSiblingChild, getLanguageFromFilename, FUNCTION_NODE_TYPES, extractFunctionName, isBuiltInOrNoise, DEFINITION_CAPTURE_KEYS, getDefinitionNodeFromCaptures } from '../utils.js';
+let COBOL: any = null;
+try { COBOL = _require('tree-sitter-cobol'); } catch {}
+import { findSiblingChild, getLanguageFromFilename, getLanguageFromPath, FUNCTION_NODE_TYPES, extractFunctionName, isBuiltInOrNoise, DEFINITION_CAPTURE_KEYS, getDefinitionNodeFromCaptures } from '../utils.js';
 import { isNodeExported } from '../export-detection.js';
 import { detectFrameworkFromAST } from '../framework-detection.js';
 import { generateId } from '../../../lib/utils.js';
@@ -129,6 +131,7 @@ const languageMap: Record<string, any> = {
   [SupportedLanguages.Kotlin]: Kotlin,
   [SupportedLanguages.PHP]: PHP.php_only,
   ...(Swift ? { [SupportedLanguages.Swift]: Swift } : {}),
+  ...(COBOL ? { [SupportedLanguages.COBOL]: COBOL } : {}),
 };
 
 const setLanguage = (language: SupportedLanguages, filePath: string): void => {
@@ -229,7 +232,7 @@ const processBatch = (files: ParseWorkerInput[], onProgress?: (filesProcessed: n
   // Group by language to minimize setLanguage calls
   const byLanguage = new Map<SupportedLanguages, ParseWorkerInput[]>();
   for (const file of files) {
-    const lang = getLanguageFromFilename(file.path);
+    const lang = getLanguageFromPath(file.path);
     if (!lang) continue;
     let list = byLanguage.get(lang);
     if (!list) {

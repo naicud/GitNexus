@@ -10,7 +10,7 @@ import { createSymbolTable } from './symbol-table.js';
 import { createASTCache } from './ast-cache.js';
 import { PipelineProgress, PipelineResult } from '../../types/pipeline.js';
 import { walkRepositoryPaths, readFileContents } from './filesystem-walker.js';
-import { getLanguageFromFilename } from './utils.js';
+import { getLanguageFromFilename, getLanguageFromPath } from './utils.js';
 import { isLanguageAvailable } from '../tree-sitter/parser-loader.js';
 import { createWorkerPool, WorkerPool } from './workers/worker-pool.js';
 import fs from 'node:fs';
@@ -93,14 +93,14 @@ export const runPipelineFromRepo = async (
     // is in memory at a time. Each chunk is: read → parse → extract → free.
 
     const parseableScanned = scannedFiles.filter(f => {
-      const lang = getLanguageFromFilename(f.path);
+      const lang = getLanguageFromPath(f.path);
       return lang && isLanguageAvailable(lang);
     });
 
     // Warn about files skipped due to unavailable parsers
     const skippedByLang = new Map<string, number>();
     for (const f of scannedFiles) {
-      const lang = getLanguageFromFilename(f.path);
+      const lang = getLanguageFromPath(f.path);
       if (lang && !isLanguageAvailable(lang)) {
         skippedByLang.set(lang, (skippedByLang.get(lang) || 0) + 1);
       }

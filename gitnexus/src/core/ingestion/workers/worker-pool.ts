@@ -25,8 +25,10 @@ export interface WorkerPool {
 const SUB_BATCH_SIZE = 1500;
 
 /** Per sub-batch timeout. If a single sub-batch takes longer than this,
- *  likely a pathological file (e.g. minified 50MB JS). Fail fast. */
-const SUB_BATCH_TIMEOUT_MS = 30_000;
+ *  likely a pathological file (e.g. minified 50MB JS). Fail fast.
+ *  Configurable via GITNEXUS_WORKER_TIMEOUT_MS for codebases with slow
+ *  parsers (e.g. COBOL with external scanner on large batches). */
+const SUB_BATCH_TIMEOUT_MS = Number(process.env.GITNEXUS_WORKER_TIMEOUT_MS) || 120_000;
 
 /**
  * Create a pool of worker threads.
