@@ -958,18 +958,13 @@ export const SettingsPanel = ({ isOpen, onClose, onSettingsSaved, backendUrl, is
 
                 <div className="space-y-2">
                   <label className="text-sm font-medium text-text-secondary">Model</label>
-                  <select
+                  <input
+                    type="text"
                     value={settings.bedrock?.model ?? 'anthropic.claude-3-5-sonnet-20241022-v2:0'}
                     onChange={e => setSettings(prev => ({ ...prev, bedrock: { ...prev.bedrock!, model: e.target.value } }))}
-                    className="w-full px-4 py-3 bg-elevated border border-border-subtle rounded-xl text-text-primary focus:border-accent focus:ring-2 focus:ring-accent/20 outline-none transition-all font-mono text-xs"
-                  >
-                    <option value="anthropic.claude-3-5-sonnet-20241022-v2:0">Claude 3.5 Sonnet v2</option>
-                    <option value="anthropic.claude-3-5-haiku-20241022-v1:0">Claude 3.5 Haiku</option>
-                    <option value="anthropic.claude-3-opus-20240229-v1:0">Claude 3 Opus</option>
-                    <option value="meta.llama3-70b-instruct-v1:0">Llama 3 70B</option>
-                    <option value="mistral.mistral-large-2402-v1:0">Mistral Large</option>
-                    <option value="amazon.titan-text-express-v1">Amazon Titan Express</option>
-                  </select>
+                    placeholder="e.g. anthropic.claude-3-5-sonnet-20241022-v2:0"
+                    className="w-full px-4 py-3 bg-elevated border border-border-subtle rounded-xl text-text-primary placeholder:text-text-muted focus:border-accent focus:ring-2 focus:ring-accent/20 outline-none transition-all font-mono text-xs"
+                  />
                 </div>
               </div>
 
