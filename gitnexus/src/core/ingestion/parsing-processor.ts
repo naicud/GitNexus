@@ -7,6 +7,8 @@ import { SymbolTable } from './symbol-table.js';
 import { ASTCache } from './ast-cache.js';
 import { getLanguageFromFilename, getLanguageFromPath, yieldToEventLoop, DEFINITION_CAPTURE_KEYS, getDefinitionNodeFromCaptures } from './utils.js';
 import { isNodeExported } from './export-detection.js';
+import { preprocessCobolSource } from './cobol-preprocessor.js';
+import { SupportedLanguages } from '../../config/supported-languages.js';
 import { detectFrameworkFromAST } from './framework-detection.js';
 import { WorkerPool } from './workers/worker-pool.js';
 import type { ParseWorkerResult, ParseWorkerInput, ExtractedImport, ExtractedCall, ExtractedHeritage, ExtractedRoute } from './workers/parse-worker.js';
@@ -123,9 +125,13 @@ const processParsingSequential = async (
       continue;  // parser unavailable — already warned in pipeline
     }
 
+    const parseContent = language === SupportedLanguages.COBOL
+      ? preprocessCobolSource(file.content)
+      : file.content;
+
     let tree;
     try {
-      tree = parser.parse(file.content, undefined, { bufferSize: getTreeSitterBufferSize(file.content.length) });
+      tree = parser.parse(parseContent, undefined, { bufferSize: getTreeSitterBufferSize(parseContent.length) });
     } catch (parseError) {
       console.warn(`Skipping unparseable file: ${file.path}`);
       continue;

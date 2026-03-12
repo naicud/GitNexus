@@ -586,25 +586,29 @@ export const COBOL_QUERIES = `
 
 ; ── Sections in PROCEDURE DIVISION ─────────────────────────────────────
 (section_header
-  (WORD) @name) @definition.namespace
+  name: (WORD) @name) @definition.namespace
 
 ; ── Paragraphs (the primary callable units in COBOL) ───────────────────
 (paragraph_header
-  (WORD) @name) @definition.function
+  name: (WORD) @name) @definition.function
 
 ; ── CALL statements (external program invocation) ──────────────────────
 (call_statement
-  (string) @call.name) @call
+  x: (string) @call.name) @call
 
 ; ── PERFORM statements (internal procedure invocation) ─────────────────
 (perform_statement_call_proc
-  (perform_procedure
+  procedure: (perform_procedure
     (label
       (qualified_word) @call.name))) @call
 
-; ── COPY statements (copybook inclusion = imports) ─────────────────────
+; ── COPY statements — unquoted (WORD nodes, the majority) ──────────────
 (copy_statement
-  (string) @import.source) @import
+  book: (WORD) @import.source) @import
+
+; ── COPY statements — quoted (string nodes) ────────────────────────────
+(copy_statement
+  book: (string) @import.source) @import
 
 ; ── Data descriptions (entry_name captures variable names) ─────────────
 (data_description

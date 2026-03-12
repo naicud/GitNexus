@@ -22,6 +22,7 @@ let Swift: any = null;
 try { Swift = _require('tree-sitter-swift'); } catch {}
 let COBOL: any = null;
 try { COBOL = _require('tree-sitter-cobol'); } catch {}
+import { preprocessCobolSource } from '../cobol-preprocessor.js';
 import { findSiblingChild, getLanguageFromFilename, getLanguageFromPath, FUNCTION_NODE_TYPES, extractFunctionName, isBuiltInOrNoise, DEFINITION_CAPTURE_KEYS, getDefinitionNodeFromCaptures } from '../utils.js';
 import { isNodeExported } from '../export-detection.js';
 import { detectFrameworkFromAST } from '../framework-detection.js';
@@ -798,9 +799,13 @@ const processFileGroup = (
     // Skip files larger than the max tree-sitter buffer (32 MB)
     if (file.content.length > TREE_SITTER_MAX_BUFFER) continue;
 
+    const parseContent = language === SupportedLanguages.COBOL
+      ? preprocessCobolSource(file.content)
+      : file.content;
+
     let tree;
     try {
-      tree = parser.parse(file.content, undefined, { bufferSize: getTreeSitterBufferSize(file.content.length) });
+      tree = parser.parse(parseContent, undefined, { bufferSize: getTreeSitterBufferSize(parseContent.length) });
     } catch (err) {
       console.warn(`Failed to parse file ${file.path}: ${err instanceof Error ? err.message : String(err)}`);
       continue;
