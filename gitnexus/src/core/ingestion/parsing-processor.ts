@@ -7,7 +7,7 @@ import { SymbolTable } from './symbol-table.js';
 import { ASTCache } from './ast-cache.js';
 import { getLanguageFromFilename, getLanguageFromPath, yieldToEventLoop, DEFINITION_CAPTURE_KEYS, getDefinitionNodeFromCaptures } from './utils.js';
 import { isNodeExported } from './export-detection.js';
-import { preprocessCobolSource } from './cobol-preprocessor.js';
+import { preprocessCobolSource, extractCobolSymbolsWithRegex } from './cobol-preprocessor.js';
 import { SupportedLanguages } from '../../config/supported-languages.js';
 import { detectFrameworkFromAST } from './framework-detection.js';
 import { WorkerPool } from './workers/worker-pool.js';
@@ -245,6 +245,68 @@ const processParsingSequential = async (
 
       graph.addRelationship(relationship);
     });
+
+    // Supplement tree-sitter with regex for COBOL (grammar misses ~85% of paragraphs)
+    if (language === SupportedLanguages.COBOL) {
+      const regexResults = extractCobolSymbolsWithRegex(file.content, file.path);
+      const fileId = generateId('File', file.path);
+
+      // Add paragraphs not found by tree-sitter
+      for (const para of regexResults.paragraphs) {
+        if (!symbolTable.lookupExact(file.path, para.name)) {
+          const nodeId = generateId('Function', `${file.path}:${para.name}`);
+          graph.addNode({
+            id: nodeId,
+            label: 'Function',
+            properties: {
+              name: para.name,
+              filePath: file.path,
+              startLine: para.line,
+              endLine: para.line,
+              language: SupportedLanguages.COBOL,
+              isExported: true,
+            },
+          });
+          graph.addRelationship({
+            id: generateId('DEFINES', `${fileId}->${nodeId}`),
+            sourceId: fileId,
+            targetId: nodeId,
+            type: 'DEFINES',
+            confidence: 1.0,
+            reason: '',
+          });
+          symbolTable.add(file.path, para.name, nodeId, 'Function');
+        }
+      }
+
+      // Add sections not found by tree-sitter
+      for (const sec of regexResults.sections) {
+        if (!symbolTable.lookupExact(file.path, sec.name)) {
+          const nodeId = generateId('Namespace', `${file.path}:${sec.name}`);
+          graph.addNode({
+            id: nodeId,
+            label: 'Namespace',
+            properties: {
+              name: sec.name,
+              filePath: file.path,
+              startLine: sec.line,
+              endLine: sec.line,
+              language: SupportedLanguages.COBOL,
+              isExported: true,
+            },
+          });
+          graph.addRelationship({
+            id: generateId('DEFINES', `${fileId}->${nodeId}`),
+            sourceId: fileId,
+            targetId: nodeId,
+            type: 'DEFINES',
+            confidence: 1.0,
+            reason: '',
+          });
+          symbolTable.add(file.path, sec.name, nodeId, 'Namespace');
+        }
+      }
+    }
   }
 };
 
