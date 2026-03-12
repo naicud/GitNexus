@@ -22,7 +22,7 @@ let Swift: any = null;
 try { Swift = _require('tree-sitter-swift'); } catch {}
 let COBOL: any = null;
 try { COBOL = _require('tree-sitter-cobol'); } catch {}
-import { preprocessCobolSource } from '../cobol-preprocessor.js';
+import { preprocessCobolSource, extractCobolSymbolsWithRegex } from '../cobol-preprocessor.js';
 import { findSiblingChild, getLanguageFromFilename, getLanguageFromPath, FUNCTION_NODE_TYPES, extractFunctionName, isBuiltInOrNoise, DEFINITION_CAPTURE_KEYS, getDefinitionNodeFromCaptures } from '../utils.js';
 import { isNodeExported } from '../export-detection.js';
 import { detectFrameworkFromAST } from '../framework-detection.js';
@@ -952,6 +952,103 @@ const processFileGroup = (
     if (language === SupportedLanguages.PHP && (file.path.includes('/routes/') || file.path.startsWith('routes/')) && file.path.endsWith('.php')) {
       const extractedRoutes = extractLaravelRoutes(tree, file.path);
       result.routes.push(...extractedRoutes);
+    }
+
+    // Supplement tree-sitter with regex for COBOL (grammar misses ~85% of paragraphs)
+    if (language === SupportedLanguages.COBOL) {
+      const regexResults = extractCobolSymbolsWithRegex(file.content, file.path);
+      const fileId = generateId('File', file.path);
+
+      // Add paragraphs not found by tree-sitter
+      const existingFunctions = new Set(
+        result.nodes.filter(n => n.label === 'Function' && n.properties.filePath === file.path).map(n => n.properties.name)
+      );
+      for (const para of regexResults.paragraphs) {
+        if (!existingFunctions.has(para.name)) {
+          const nodeId = generateId('Function', `${file.path}:${para.name}`);
+          result.nodes.push({
+            id: nodeId,
+            label: 'Function',
+            properties: {
+              name: para.name,
+              filePath: file.path,
+              startLine: para.line,
+              endLine: para.line,
+              language: SupportedLanguages.COBOL,
+              isExported: true,
+            },
+          });
+          result.relationships.push({
+            id: generateId('DEFINES', `${fileId}->${nodeId}`),
+            sourceId: fileId,
+            targetId: nodeId,
+            type: 'DEFINES',
+            confidence: 1.0,
+            reason: '',
+          });
+          result.symbols.push({ filePath: file.path, name: para.name, nodeId, type: 'Function' });
+        }
+      }
+
+      // Add sections not found by tree-sitter
+      const existingSections = new Set(
+        result.nodes.filter(n => n.label === 'Namespace' && n.properties.filePath === file.path).map(n => n.properties.name)
+      );
+      for (const sec of regexResults.sections) {
+        if (!existingSections.has(sec.name)) {
+          const nodeId = generateId('Namespace', `${file.path}:${sec.name}`);
+          result.nodes.push({
+            id: nodeId,
+            label: 'Namespace',
+            properties: {
+              name: sec.name,
+              filePath: file.path,
+              startLine: sec.line,
+              endLine: sec.line,
+              language: SupportedLanguages.COBOL,
+              isExported: true,
+            },
+          });
+          result.relationships.push({
+            id: generateId('DEFINES', `${fileId}->${nodeId}`),
+            sourceId: fileId,
+            targetId: nodeId,
+            type: 'DEFINES',
+            confidence: 1.0,
+            reason: '',
+          });
+          result.symbols.push({ filePath: file.path, name: sec.name, nodeId, type: 'Namespace' });
+        }
+      }
+
+      // Add COPY imports not found by tree-sitter
+      const existingImports = new Set(
+        result.imports.filter(i => i.filePath === file.path).map(i => i.rawImportPath)
+      );
+      for (const copy of regexResults.copies) {
+        if (!existingImports.has(copy.target)) {
+          result.imports.push({ filePath: file.path, rawImportPath: copy.target, language: SupportedLanguages.COBOL });
+        }
+      }
+
+      // Add CALL targets not found by tree-sitter
+      for (const call of regexResults.calls) {
+        const calledName = call.target;
+        if (!isBuiltInOrNoise(calledName)) {
+          result.calls.push({ filePath: file.path, calledName, sourceId: generateId('File', file.path) });
+        }
+      }
+
+      // Add PERFORM calls with caller context
+      for (const perf of regexResults.performs) {
+        const calledName = perf.target;
+        if (!isBuiltInOrNoise(calledName)) {
+          const sourceId = perf.caller
+            ? generateId('Function', `${file.path}:${perf.caller}`)
+            : generateId('File', file.path);
+          result.calls.push({ filePath: file.path, calledName, sourceId });
+        }
+      }
     }
   }
 };
