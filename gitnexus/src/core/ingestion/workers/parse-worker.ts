@@ -16,11 +16,14 @@ import { SupportedLanguages } from '../../../config/supported-languages.js';
 import { LANGUAGE_QUERIES } from '../tree-sitter-queries.js';
 import { getTreeSitterBufferSize, TREE_SITTER_MAX_BUFFER } from '../constants.js';
 
-// tree-sitter-swift is an optionalDependency — may not be installed
+// tree-sitter-swift and tree-sitter-cobol are optionalDependencies — may not be installed
 const _require = createRequire(import.meta.url);
 let Swift: any = null;
 try { Swift = _require('tree-sitter-swift'); } catch {}
-import { findSiblingChild, getLanguageFromFilename, FUNCTION_NODE_TYPES, extractFunctionName, isBuiltInOrNoise, DEFINITION_CAPTURE_KEYS, getDefinitionNodeFromCaptures } from '../utils.js';
+let COBOL: any = null;
+try { COBOL = _require('tree-sitter-cobol'); } catch {}
+import { preprocessCobolSource, extractCobolSymbolsWithRegex } from '../cobol-preprocessor.js';
+import { findSiblingChild, getLanguageFromFilename, getLanguageFromPath, FUNCTION_NODE_TYPES, extractFunctionName, isBuiltInOrNoise, DEFINITION_CAPTURE_KEYS, getDefinitionNodeFromCaptures } from '../utils.js';
 import { isNodeExported } from '../export-detection.js';
 import { detectFrameworkFromAST } from '../framework-detection.js';
 import { generateId } from '../../../lib/utils.js';
@@ -129,6 +132,7 @@ const languageMap: Record<string, any> = {
   [SupportedLanguages.Kotlin]: Kotlin,
   [SupportedLanguages.PHP]: PHP.php_only,
   ...(Swift ? { [SupportedLanguages.Swift]: Swift } : {}),
+  ...(COBOL ? { [SupportedLanguages.COBOL]: COBOL } : {}),
 };
 
 const setLanguage = (language: SupportedLanguages, filePath: string): void => {
@@ -211,6 +215,72 @@ const appendKotlinWildcard = (importPath: string, importNode: any): string => {
 };
 
 // ============================================================================
+// COBOL regex-only processing (tree-sitter hangs on pathological files)
+// ============================================================================
+
+const processCobolRegexOnly = (file: ParseWorkerInput, result: ParseWorkerResult): void => {
+  const regexResults = extractCobolSymbolsWithRegex(file.content, file.path);
+  const fileId = generateId('File', file.path);
+
+  // Program name → Module node
+  if (regexResults.programName) {
+    const nodeId = generateId('Module', `${file.path}:${regexResults.programName}`);
+    result.nodes.push({
+      id: nodeId, label: 'Module',
+      properties: { name: regexResults.programName, filePath: file.path, startLine: 0, endLine: 0, language: SupportedLanguages.COBOL, isExported: true },
+    });
+    result.relationships.push({ id: generateId('DEFINES', `${fileId}->${nodeId}`), sourceId: fileId, targetId: nodeId, type: 'DEFINES', confidence: 1.0, reason: '' });
+    result.symbols.push({ filePath: file.path, name: regexResults.programName, nodeId, type: 'Module' });
+  }
+
+  // Paragraphs → Function nodes
+  for (const para of regexResults.paragraphs) {
+    const nodeId = generateId('Function', `${file.path}:${para.name}`);
+    result.nodes.push({
+      id: nodeId, label: 'Function',
+      properties: { name: para.name, filePath: file.path, startLine: para.line, endLine: para.line, language: SupportedLanguages.COBOL, isExported: true },
+    });
+    result.relationships.push({ id: generateId('DEFINES', `${fileId}->${nodeId}`), sourceId: fileId, targetId: nodeId, type: 'DEFINES', confidence: 1.0, reason: '' });
+    result.symbols.push({ filePath: file.path, name: para.name, nodeId, type: 'Function' });
+  }
+
+  // Sections → Namespace nodes
+  for (const sec of regexResults.sections) {
+    const nodeId = generateId('Namespace', `${file.path}:${sec.name}`);
+    result.nodes.push({
+      id: nodeId, label: 'Namespace',
+      properties: { name: sec.name, filePath: file.path, startLine: sec.line, endLine: sec.line, language: SupportedLanguages.COBOL, isExported: true },
+    });
+    result.relationships.push({ id: generateId('DEFINES', `${fileId}->${nodeId}`), sourceId: fileId, targetId: nodeId, type: 'DEFINES', confidence: 1.0, reason: '' });
+    result.symbols.push({ filePath: file.path, name: sec.name, nodeId, type: 'Namespace' });
+  }
+
+  // COPY → imports
+  for (const copy of regexResults.copies) {
+    result.imports.push({ filePath: file.path, rawImportPath: copy.target, language: SupportedLanguages.COBOL });
+  }
+
+  // CALL → calls
+  for (const call of regexResults.calls) {
+    if (!isBuiltInOrNoise(call.target)) {
+      result.calls.push({ filePath: file.path, calledName: call.target, sourceId: fileId });
+    }
+  }
+
+  // PERFORM → calls (with caller context)
+  for (const perf of regexResults.performs) {
+    if (!isBuiltInOrNoise(perf.target)) {
+      const sourceId = perf.caller
+        ? generateId('Function', `${file.path}:${perf.caller}`)
+        : fileId;
+      result.calls.push({ filePath: file.path, calledName: perf.target, sourceId });
+    }
+  }
+
+  result.fileCount++;
+};
+
+// ============================================================================
 // Process a batch of files
 // ============================================================================
 
@@ -229,7 +299,7 @@ const processBatch = (files: ParseWorkerInput[], onProgress?: (filesProcessed: n
   // Group by language to minimize setLanguage calls
   const byLanguage = new Map<SupportedLanguages, ParseWorkerInput[]>();
   for (const file of files) {
-    const lang = getLanguageFromFilename(file.path);
+    const lang = getLanguageFromPath(file.path);
     if (!lang) continue;
     let list = byLanguage.get(lang);
     if (!list) {
@@ -252,6 +322,16 @@ const processBatch = (files: ParseWorkerInput[], onProgress?: (filesProcessed: n
   } : undefined;
 
   for (const [language, langFiles] of byLanguage) {
+    // COBOL: skip tree-sitter entirely — external scanner hangs on ~5% of files
+    // with no way to timeout. Use regex-only extraction which is fast and reliable.
+    if (language === SupportedLanguages.COBOL) {
+      for (const file of langFiles) {
+        processCobolRegexOnly(file, result);
+        onFileProcessed?.();
+      }
+      continue;
+    }
+
     const queryString = LANGUAGE_QUERIES[language];
     if (!queryString) continue;
 
@@ -795,9 +875,13 @@ const processFileGroup = (
     // Skip files larger than the max tree-sitter buffer (32 MB)
     if (file.content.length > TREE_SITTER_MAX_BUFFER) continue;
 
+    const parseContent = language === SupportedLanguages.COBOL
+      ? preprocessCobolSource(file.content)
+      : file.content;
+
     let tree;
     try {
-      tree = parser.parse(file.content, undefined, { bufferSize: getTreeSitterBufferSize(file.content.length) });
+      tree = parser.parse(parseContent, undefined, { bufferSize: getTreeSitterBufferSize(parseContent.length) });
     } catch (err) {
       console.warn(`Failed to parse file ${file.path}: ${err instanceof Error ? err.message : String(err)}`);
       continue;
@@ -945,6 +1029,8 @@ const processFileGroup = (
       const extractedRoutes = extractLaravelRoutes(tree, file.path);
       result.routes.push(...extractedRoutes);
     }
+
+    // Note: COBOL is handled by processCobolRegexOnly in processBatch — no COBOL files reach here
   }
 };
 

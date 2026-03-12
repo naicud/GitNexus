@@ -5,8 +5,10 @@ import { LANGUAGE_QUERIES } from './tree-sitter-queries.js';
 import { generateId } from '../../lib/utils.js';
 import { SymbolTable } from './symbol-table.js';
 import { ASTCache } from './ast-cache.js';
-import { getLanguageFromFilename, yieldToEventLoop, DEFINITION_CAPTURE_KEYS, getDefinitionNodeFromCaptures } from './utils.js';
+import { getLanguageFromFilename, getLanguageFromPath, yieldToEventLoop, DEFINITION_CAPTURE_KEYS, getDefinitionNodeFromCaptures } from './utils.js';
 import { isNodeExported } from './export-detection.js';
+import { preprocessCobolSource, extractCobolSymbolsWithRegex } from './cobol-preprocessor.js';
+import { SupportedLanguages } from '../../config/supported-languages.js';
 import { detectFrameworkFromAST } from './framework-detection.js';
 import { WorkerPool } from './workers/worker-pool.js';
 import type { ParseWorkerResult, ParseWorkerInput, ExtractedImport, ExtractedCall, ExtractedHeritage, ExtractedRoute } from './workers/parse-worker.js';
@@ -40,7 +42,7 @@ const processParsingWithWorkers = async (
   // Filter to parseable files only
   const parseableFiles: ParseWorkerInput[] = [];
   for (const file of files) {
-    const lang = getLanguageFromFilename(file.path);
+    const lang = getLanguageFromPath(file.path);
     if (lang) parseableFiles.push({ path: file.path, content: file.content });
   }
 
@@ -110,9 +112,39 @@ const processParsingSequential = async (
 
     if (i % 20 === 0) await yieldToEventLoop();
 
-    const language = getLanguageFromFilename(file.path);
+    const language = getLanguageFromPath(file.path);
 
     if (!language) continue;
+
+    // COBOL: skip tree-sitter entirely — external scanner hangs on ~5% of files
+    // with no way to timeout. Use regex-only extraction which is fast and reliable.
+    if (language === SupportedLanguages.COBOL) {
+      const regexResults = extractCobolSymbolsWithRegex(file.content, file.path);
+      const fileId = generateId('File', file.path);
+
+      if (regexResults.programName) {
+        const nodeId = generateId('Module', `${file.path}:${regexResults.programName}`);
+        graph.addNode({ id: nodeId, label: 'Module' as any, properties: { name: regexResults.programName, filePath: file.path, startLine: 0, endLine: 0, language: SupportedLanguages.COBOL, isExported: true } });
+        graph.addRelationship({ id: generateId('DEFINES', `${fileId}->${nodeId}`), sourceId: fileId, targetId: nodeId, type: 'DEFINES', confidence: 1.0, reason: '' });
+        symbolTable.add(file.path, regexResults.programName, nodeId, 'Module');
+      }
+
+      for (const para of regexResults.paragraphs) {
+        const nodeId = generateId('Function', `${file.path}:${para.name}`);
+        graph.addNode({ id: nodeId, label: 'Function' as any, properties: { name: para.name, filePath: file.path, startLine: para.line, endLine: para.line, language: SupportedLanguages.COBOL, isExported: true } });
+        graph.addRelationship({ id: generateId('DEFINES', `${fileId}->${nodeId}`), sourceId: fileId, targetId: nodeId, type: 'DEFINES', confidence: 1.0, reason: '' });
+        symbolTable.add(file.path, para.name, nodeId, 'Function');
+      }
+
+      for (const sec of regexResults.sections) {
+        const nodeId = generateId('Namespace', `${file.path}:${sec.name}`);
+        graph.addNode({ id: nodeId, label: 'Namespace' as any, properties: { name: sec.name, filePath: file.path, startLine: sec.line, endLine: sec.line, language: SupportedLanguages.COBOL, isExported: true } });
+        graph.addRelationship({ id: generateId('DEFINES', `${fileId}->${nodeId}`), sourceId: fileId, targetId: nodeId, type: 'DEFINES', confidence: 1.0, reason: '' });
+        symbolTable.add(file.path, sec.name, nodeId, 'Namespace');
+      }
+
+      continue;
+    }
 
     // Skip files larger than the max tree-sitter buffer (32 MB)
     if (file.content.length > TREE_SITTER_MAX_BUFFER) continue;
@@ -123,9 +155,11 @@ const processParsingSequential = async (
       continue;  // parser unavailable — already warned in pipeline
     }
 
+    const parseContent = file.content;
+
     let tree;
     try {
-      tree = parser.parse(file.content, undefined, { bufferSize: getTreeSitterBufferSize(file.content.length) });
+      tree = parser.parse(parseContent, undefined, { bufferSize: getTreeSitterBufferSize(parseContent.length) });
     } catch (parseError) {
       console.warn(`Skipping unparseable file: ${file.path}`);
       continue;

@@ -8,6 +8,8 @@ import { LANGUAGE_QUERIES } from './tree-sitter-queries.js';
 import { generateId } from '../../lib/utils.js';
 import { getLanguageFromFilename, isVerboseIngestionEnabled, yieldToEventLoop, FUNCTION_NODE_TYPES, extractFunctionName, isBuiltInOrNoise } from './utils.js';
 import { getTreeSitterBufferSize } from './constants.js';
+import { preprocessCobolSource } from './cobol-preprocessor.js';
+import { SupportedLanguages } from '../../config/supported-languages.js';
 import type { ExtractedCall, ExtractedRoute } from './workers/parse-worker.js';
 
 /**
@@ -78,8 +80,11 @@ export const processCalls = async (
     if (!tree) {
       // Cache Miss: Re-parse
       // Use larger bufferSize for files > 32KB
+      const parseContent = language === SupportedLanguages.COBOL
+        ? preprocessCobolSource(file.content)
+        : file.content;
       try {
-        tree = parser.parse(file.content, undefined, { bufferSize: getTreeSitterBufferSize(file.content.length) });
+        tree = parser.parse(parseContent, undefined, { bufferSize: getTreeSitterBufferSize(parseContent.length) });
       } catch (parseError) {
         // Skip files that can't be parsed
         continue;

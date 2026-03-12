@@ -10,14 +10,14 @@ import { createSymbolTable } from './symbol-table.js';
 import { createASTCache } from './ast-cache.js';
 import { PipelineProgress, PipelineResult } from '../../types/pipeline.js';
 import { walkRepositoryPaths, readFileContents } from './filesystem-walker.js';
-import { getLanguageFromFilename } from './utils.js';
+import { getLanguageFromFilename, getLanguageFromPath } from './utils.js';
 import { isLanguageAvailable } from '../tree-sitter/parser-loader.js';
 import { createWorkerPool, WorkerPool } from './workers/worker-pool.js';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
-const isDev = process.env.NODE_ENV === 'development';
+const isDev = process.env.NODE_ENV === 'development' || !!process.env.GITNEXUS_VERBOSE;
 
 /** Max bytes of source content to load per parse chunk. Each chunk's source +
  *  parsed ASTs + extracted records + worker serialization overhead all live in
@@ -93,14 +93,14 @@ export const runPipelineFromRepo = async (
     // is in memory at a time. Each chunk is: read → parse → extract → free.
 
     const parseableScanned = scannedFiles.filter(f => {
-      const lang = getLanguageFromFilename(f.path);
+      const lang = getLanguageFromPath(f.path);
       return lang && isLanguageAvailable(lang);
     });
 
     // Warn about files skipped due to unavailable parsers
     const skippedByLang = new Map<string, number>();
     for (const f of scannedFiles) {
-      const lang = getLanguageFromFilename(f.path);
+      const lang = getLanguageFromPath(f.path);
       if (lang && !isLanguageAvailable(lang)) {
         skippedByLang.set(lang, (skippedByLang.get(lang) || 0) + 1);
       }
@@ -149,7 +149,9 @@ export const runPipelineFromRepo = async (
       stats: { filesProcessed: 0, totalFiles: totalParseable, nodesCreated: graph.nodeCount },
     });
 
-    // Create worker pool once, reuse across chunks
+    // Create worker pool once, reuse across chunks.
+    // For COBOL repos, use smaller sub-batches (200 vs 1500) to prevent worker
+    // timeouts — COBOL tree-sitter + preprocessing + regex takes ~150ms/file.
     let workerPool: WorkerPool | undefined;
     try {
       let workerUrl = new URL('./workers/parse-worker.js', import.meta.url);
@@ -162,7 +164,11 @@ export const runPipelineFromRepo = async (
           workerUrl = pathToFileURL(distWorker) as URL;
         }
       }
-      workerPool = createWorkerPool(workerUrl);
+      const cobolSubBatch = process.env.GITNEXUS_COBOL_DIRS ? 200 : undefined;
+      workerPool = createWorkerPool(workerUrl, undefined, cobolSubBatch);
+      if (isDev && cobolSubBatch) {
+        console.log(`🔧 Worker pool: ${workerPool.size} workers, sub-batch=${cobolSubBatch} (COBOL mode)`);
+      }
     } catch (err) {
       if (isDev) console.warn('Worker pool creation failed, using sequential fallback:', (err as Error).message);
     }
@@ -227,6 +233,11 @@ export const runPipelineFromRepo = async (
             await processRoutesFromExtracted(graph, chunkWorkerData.routes, symbolTable, importMap);
           }
         } else {
+          // Pool failed — disable for all remaining chunks to avoid 120s timeout per chunk.
+          if (workerPool) {
+            await workerPool.terminate();
+            workerPool = undefined;
+          }
           await processImports(graph, chunkFiles, astCache, importMap, undefined, repoPath, allPaths);
           sequentialChunkPaths.push(chunkPaths);
         }

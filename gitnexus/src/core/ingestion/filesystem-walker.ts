@@ -21,9 +21,6 @@ export interface FilePath {
 
 const READ_CONCURRENCY = 32;
 
-/** Skip files larger than 512KB — they're usually generated/vendored and crash tree-sitter */
-const MAX_FILE_SIZE = 512 * 1024;
-
 /**
  * Phase 1: Scan repository — stat files to get paths + sizes, no content loaded.
  * Memory: ~10MB for 100K files vs ~1GB+ with content.
@@ -41,7 +38,6 @@ export const walkRepositoryPaths = async (
   const filtered = files.filter(file => !shouldIgnorePath(file));
   const entries: ScannedFile[] = [];
   let processed = 0;
-  let skippedLarge = 0;
 
   for (let start = 0; start < filtered.length; start += READ_CONCURRENCY) {
     const batch = filtered.slice(start, start + READ_CONCURRENCY);
@@ -49,10 +45,6 @@ export const walkRepositoryPaths = async (
       batch.map(async relativePath => {
         const fullPath = path.join(repoPath, relativePath);
         const stat = await fs.stat(fullPath);
-        if (stat.size > MAX_FILE_SIZE) {
-          skippedLarge++;
-          return null;
-        }
         return { path: relativePath.replace(/\\/g, '/'), size: stat.size };
       })
     );
@@ -66,10 +58,6 @@ export const walkRepositoryPaths = async (
         onProgress?.(processed, filtered.length, batch[results.indexOf(result)]);
       }
     }
-  }
-
-  if (skippedLarge > 0) {
-    console.warn(`  Skipped ${skippedLarge} large files (>${MAX_FILE_SIZE / 1024}KB, likely generated/vendored)`);
   }
 
   return entries;

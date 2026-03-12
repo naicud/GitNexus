@@ -181,6 +181,10 @@ export const isNodeExported = (node: any, name: string, language: string): boole
       // Top-level functions are globally accessible
       return true;
 
+    // COBOL: All symbols are accessible (no visibility modifiers in COBOL)
+    case 'cobol':
+      return true;
+
     // Swift: Check for 'public' or 'open' access modifiers
     case 'swift':
       while (current) {

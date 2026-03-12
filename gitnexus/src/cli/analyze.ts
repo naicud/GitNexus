@@ -150,12 +150,15 @@ export const analyzeCommand = async (
   // same format so they don't flicker against each other.
   let lastPhaseLabel = 'Initializing...';
   let phaseStart = Date.now();
+  let lastDetail = '';
 
-  /** Update bar with phase label + elapsed seconds (shown after 3s). */
-  const updateBar = (value: number, phaseLabel: string) => {
-    if (phaseLabel !== lastPhaseLabel) { lastPhaseLabel = phaseLabel; phaseStart = Date.now(); }
+  /** Update bar with phase label + optional detail + elapsed seconds (shown after 3s). */
+  const updateBar = (value: number, phaseLabel: string, detail?: string) => {
+    if (phaseLabel !== lastPhaseLabel) { lastPhaseLabel = phaseLabel; phaseStart = Date.now(); lastDetail = ''; }
+    if (detail !== undefined) { lastDetail = detail; }
     const elapsed = Math.round((Date.now() - phaseStart) / 1000);
-    const display = elapsed >= 3 ? `${phaseLabel} (${elapsed}s)` : phaseLabel;
+    const detailPart = lastDetail ? ` | ${lastDetail}` : '';
+    const display = elapsed >= 3 ? `${phaseLabel}${detailPart} (${elapsed}s)` : `${phaseLabel}${detailPart}`;
     bar.update(value, { phase: display });
   };
 
@@ -165,7 +168,8 @@ export const analyzeCommand = async (
   const elapsedTimer = setInterval(() => {
     const elapsed = Math.round((Date.now() - phaseStart) / 1000);
     if (elapsed >= 3) {
-      bar.update({ phase: `${lastPhaseLabel} (${elapsed}s)` });
+      const detailPart = lastDetail ? ` | ${lastDetail}` : '';
+      bar.update({ phase: `${lastPhaseLabel}${detailPart} (${elapsed}s)` });
     }
   }, 1000);
 
@@ -192,7 +196,15 @@ export const analyzeCommand = async (
   const pipelineResult = await runPipelineFromRepo(repoPath, (progress) => {
     const phaseLabel = PHASE_LABELS[progress.phase] || progress.phase;
     const scaled = Math.round(progress.percent * 0.6);
-    updateBar(scaled, phaseLabel);
+    const detail =
+      progress.phase === 'parsing' && (progress.stats?.totalFiles ?? 0) > 0
+        ? `${progress.stats!.filesProcessed}/${progress.stats!.totalFiles} files${
+            options?.verbose && progress.detail
+              ? ` — ${progress.detail.split('/').at(-1)}`
+              : ''
+          }`
+        : undefined;
+    updateBar(scaled, phaseLabel, detail);
   });
 
   // ── Phase 2: KuzuDB (60–85%) ──────────────────────────────────────

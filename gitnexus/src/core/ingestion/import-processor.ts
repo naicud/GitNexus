@@ -10,6 +10,7 @@ import { getLanguageFromFilename, isVerboseIngestionEnabled, yieldToEventLoop } 
 import { SupportedLanguages } from '../../config/supported-languages.js';
 import type { ExtractedImport } from './workers/parse-worker.js';
 import { getTreeSitterBufferSize } from './constants.js';
+import { preprocessCobolSource } from './cobol-preprocessor.js';
 
 const isDev = process.env.NODE_ENV === 'development';
 
@@ -363,6 +364,8 @@ const EXTENSIONS = [
   '.php', '.phtml',
   // Swift
   '.swift',
+  // COBOL
+  '.cbl', '.cob', '.cobol', '.cpy', '.copy',
 ];
 
 /**
@@ -490,6 +493,48 @@ function suffixResolve(
     }
   }
   return null;
+}
+
+/**
+ * Resolve a COBOL COPY/CALL target to a file path.
+ * COBOL imports are name-based: COPY SSTORIA → file named SSTORIA (often extensionless).
+ */
+function resolveCobolImport(
+  importName: string,
+  ctx: ImportResolutionContext,
+): string | null {
+  let name = importName;
+  if ((name.startsWith('"') && name.endsWith('"')) || (name.startsWith("'") && name.endsWith("'"))) {
+    name = name.slice(1, -1);
+  }
+  name = name.trim();
+  if (!name) return null;
+
+  const cacheKey = `cobol::${name}`;
+  if (ctx.resolveCache.has(cacheKey)) return ctx.resolveCache.get(cacheKey) ?? null;
+
+  const cache = (result: string | null): string | null => {
+    ctx.resolveCache.set(cacheKey, result);
+    return result;
+  };
+
+  // Exact match via suffix index (handles extensionless files)
+  const exact = ctx.suffixIndex.get(name) || ctx.suffixIndex.getInsensitive(name);
+  if (exact) return cache(exact);
+
+  // Try with COBOL extensions
+  for (const ext of ['.cpy', '.copy', '.cbl', '.cob', '.cobol']) {
+    const r = ctx.suffixIndex.get(name + ext) || ctx.suffixIndex.getInsensitive(name + ext);
+    if (r) return cache(r);
+  }
+
+  // Case variants
+  for (const variant of [name.toUpperCase(), name.toLowerCase()]) {
+    const r = ctx.suffixIndex.get(variant) || ctx.suffixIndex.getInsensitive(variant);
+    if (r) return cache(r);
+  }
+
+  return cache(null);
 }
 
 /**
@@ -949,8 +994,11 @@ export const processImports = async (
     let wasReparsed = false;
 
     if (!tree) {
+      const parseContent = language === SupportedLanguages.COBOL
+        ? preprocessCobolSource(file.content)
+        : file.content;
       try {
-        tree = parser.parse(file.content, undefined, { bufferSize: getTreeSitterBufferSize(file.content.length) });
+        tree = parser.parse(parseContent, undefined, { bufferSize: getTreeSitterBufferSize(parseContent.length) });
       } catch (parseError) {
         continue;
       }
@@ -1079,6 +1127,17 @@ export const processImports = async (
             return;
           }
           // External framework (Foundation, UIKit, etc.) — skip
+          return;
+        }
+
+        // ---- COBOL: handle COPY/CALL name-based imports ----
+        if (language === SupportedLanguages.COBOL) {
+          const resolved = resolveCobolImport(rawImportPath, {
+            allFilePaths, allFileList, normalizedFileList, suffixIndex: index, resolveCache,
+          });
+          if (resolved) {
+            addImportEdge(file.path, resolved);
+          }
           return;
         }
 
@@ -1284,6 +1343,15 @@ export const processImportsFromExtracted = async (
               addImportEdge(filePath, fp);
             }
           }
+        }
+        continue;
+      }
+
+      // COBOL: handle COPY/CALL name-based imports
+      if (language === SupportedLanguages.COBOL) {
+        const resolved = resolveCobolImport(rawImportPath, ctx);
+        if (resolved) {
+          addImportEdge(filePath, resolved);
         }
         continue;
       }
