@@ -15,12 +15,12 @@ Web frontend per GitNexus — visualizzazione interattiva del knowledge graph di
 npm install
 
 # 2. Avvia il backend GitNexus (in un terminale separato, dalla directory di un repo indicizzato)
-cd ~/workproj/EPAGHE
+cd /path/to/your/indexed-repo
 npx gitnexus serve
 # → Backend su http://localhost:4747
 
 # 3. Avvia il dev server frontend
-cd ~/private/GitNexus/gitnexus-web
+cd gitnexus-web
 npm run dev
 # → Frontend su http://localhost:5173
 ```
@@ -76,7 +76,7 @@ Vite parte in automatico (task `vite:dev`), Chrome si apre con i devtools connes
 
 Seleziona la configurazione **"Full Stack (FE + Backend GitNexus)"** — avvia sia il backend (`gitnexus serve` sulla porta 4747) che il frontend con debug Chrome.
 
-> **Nota**: la task `gitnexus:serve` esegue `npx gitnexus serve` nella directory `~/workproj/EPAGHE`. Modifica il `cwd` in `.vscode/tasks.json` se il repo è altrove.
+> **Nota**: la task `gitnexus:serve` esegue `npx gitnexus serve` nella directory del repo indicizzato. Modifica il `cwd` in `.vscode/tasks.json` per puntare al tuo repo.
 
 ### Attach a Chrome esistente
 
