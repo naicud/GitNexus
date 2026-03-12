@@ -215,6 +215,72 @@ const appendKotlinWildcard = (importPath: string, importNode: any): string => {
 };
 
 // ============================================================================
+// COBOL regex-only processing (tree-sitter hangs on pathological files)
+// ============================================================================
+
+const processCobolRegexOnly = (file: ParseWorkerInput, result: ParseWorkerResult): void => {
+  const regexResults = extractCobolSymbolsWithRegex(file.content, file.path);
+  const fileId = generateId('File', file.path);
+
+  // Program name → Module node
+  if (regexResults.programName) {
+    const nodeId = generateId('Module', `${file.path}:${regexResults.programName}`);
+    result.nodes.push({
+      id: nodeId, label: 'Module',
+      properties: { name: regexResults.programName, filePath: file.path, startLine: 0, endLine: 0, language: SupportedLanguages.COBOL, isExported: true },
+    });
+    result.relationships.push({ id: generateId('DEFINES', `${fileId}->${nodeId}`), sourceId: fileId, targetId: nodeId, type: 'DEFINES', confidence: 1.0, reason: '' });
+    result.symbols.push({ filePath: file.path, name: regexResults.programName, nodeId, type: 'Module' });
+  }
+
+  // Paragraphs → Function nodes
+  for (const para of regexResults.paragraphs) {
+    const nodeId = generateId('Function', `${file.path}:${para.name}`);
+    result.nodes.push({
+      id: nodeId, label: 'Function',
+      properties: { name: para.name, filePath: file.path, startLine: para.line, endLine: para.line, language: SupportedLanguages.COBOL, isExported: true },
+    });
+    result.relationships.push({ id: generateId('DEFINES', `${fileId}->${nodeId}`), sourceId: fileId, targetId: nodeId, type: 'DEFINES', confidence: 1.0, reason: '' });
+    result.symbols.push({ filePath: file.path, name: para.name, nodeId, type: 'Function' });
+  }
+
+  // Sections → Namespace nodes
+  for (const sec of regexResults.sections) {
+    const nodeId = generateId('Namespace', `${file.path}:${sec.name}`);
+    result.nodes.push({
+      id: nodeId, label: 'Namespace',
+      properties: { name: sec.name, filePath: file.path, startLine: sec.line, endLine: sec.line, language: SupportedLanguages.COBOL, isExported: true },
+    });
+    result.relationships.push({ id: generateId('DEFINES', `${fileId}->${nodeId}`), sourceId: fileId, targetId: nodeId, type: 'DEFINES', confidence: 1.0, reason: '' });
+    result.symbols.push({ filePath: file.path, name: sec.name, nodeId, type: 'Namespace' });
+  }
+
+  // COPY → imports
+  for (const copy of regexResults.copies) {
+    result.imports.push({ filePath: file.path, rawImportPath: copy.target, language: SupportedLanguages.COBOL });
+  }
+
+  // CALL → calls
+  for (const call of regexResults.calls) {
+    if (!isBuiltInOrNoise(call.target)) {
+      result.calls.push({ filePath: file.path, calledName: call.target, sourceId: fileId });
+    }
+  }
+
+  // PERFORM → calls (with caller context)
+  for (const perf of regexResults.performs) {
+    if (!isBuiltInOrNoise(perf.target)) {
+      const sourceId = perf.caller
+        ? generateId('Function', `${file.path}:${perf.caller}`)
+        : fileId;
+      result.calls.push({ filePath: file.path, calledName: perf.target, sourceId });
+    }
+  }
+
+  result.fileCount++;
+};
+
+// ============================================================================
 // Process a batch of files
 // ============================================================================
 
@@ -256,6 +322,16 @@ const processBatch = (files: ParseWorkerInput[], onProgress?: (filesProcessed: n
   } : undefined;
 
   for (const [language, langFiles] of byLanguage) {
+    // COBOL: skip tree-sitter entirely — external scanner hangs on ~5% of files
+    // with no way to timeout. Use regex-only extraction which is fast and reliable.
+    if (language === SupportedLanguages.COBOL) {
+      for (const file of langFiles) {
+        processCobolRegexOnly(file, result);
+        onFileProcessed?.();
+      }
+      continue;
+    }
+
     const queryString = LANGUAGE_QUERIES[language];
     if (!queryString) continue;
 
@@ -954,102 +1030,7 @@ const processFileGroup = (
       result.routes.push(...extractedRoutes);
     }
 
-    // Supplement tree-sitter with regex for COBOL (grammar misses ~85% of paragraphs)
-    if (language === SupportedLanguages.COBOL) {
-      const regexResults = extractCobolSymbolsWithRegex(file.content, file.path);
-      const fileId = generateId('File', file.path);
-
-      // Add paragraphs not found by tree-sitter
-      const existingFunctions = new Set(
-        result.nodes.filter(n => n.label === 'Function' && n.properties.filePath === file.path).map(n => n.properties.name)
-      );
-      for (const para of regexResults.paragraphs) {
-        if (!existingFunctions.has(para.name)) {
-          const nodeId = generateId('Function', `${file.path}:${para.name}`);
-          result.nodes.push({
-            id: nodeId,
-            label: 'Function',
-            properties: {
-              name: para.name,
-              filePath: file.path,
-              startLine: para.line,
-              endLine: para.line,
-              language: SupportedLanguages.COBOL,
-              isExported: true,
-            },
-          });
-          result.relationships.push({
-            id: generateId('DEFINES', `${fileId}->${nodeId}`),
-            sourceId: fileId,
-            targetId: nodeId,
-            type: 'DEFINES',
-            confidence: 1.0,
-            reason: '',
-          });
-          result.symbols.push({ filePath: file.path, name: para.name, nodeId, type: 'Function' });
-        }
-      }
-
-      // Add sections not found by tree-sitter
-      const existingSections = new Set(
-        result.nodes.filter(n => n.label === 'Namespace' && n.properties.filePath === file.path).map(n => n.properties.name)
-      );
-      for (const sec of regexResults.sections) {
-        if (!existingSections.has(sec.name)) {
-          const nodeId = generateId('Namespace', `${file.path}:${sec.name}`);
-          result.nodes.push({
-            id: nodeId,
-            label: 'Namespace',
-            properties: {
-              name: sec.name,
-              filePath: file.path,
-              startLine: sec.line,
-              endLine: sec.line,
-              language: SupportedLanguages.COBOL,
-              isExported: true,
-            },
-          });
-          result.relationships.push({
-            id: generateId('DEFINES', `${fileId}->${nodeId}`),
-            sourceId: fileId,
-            targetId: nodeId,
-            type: 'DEFINES',
-            confidence: 1.0,
-            reason: '',
-          });
-          result.symbols.push({ filePath: file.path, name: sec.name, nodeId, type: 'Namespace' });
-        }
-      }
-
-      // Add COPY imports not found by tree-sitter
-      const existingImports = new Set(
-        result.imports.filter(i => i.filePath === file.path).map(i => i.rawImportPath)
-      );
-      for (const copy of regexResults.copies) {
-        if (!existingImports.has(copy.target)) {
-          result.imports.push({ filePath: file.path, rawImportPath: copy.target, language: SupportedLanguages.COBOL });
-        }
-      }
-
-      // Add CALL targets not found by tree-sitter
-      for (const call of regexResults.calls) {
-        const calledName = call.target;
-        if (!isBuiltInOrNoise(calledName)) {
-          result.calls.push({ filePath: file.path, calledName, sourceId: generateId('File', file.path) });
-        }
-      }
-
-      // Add PERFORM calls with caller context
-      for (const perf of regexResults.performs) {
-        const calledName = perf.target;
-        if (!isBuiltInOrNoise(calledName)) {
-          const sourceId = perf.caller
-            ? generateId('Function', `${file.path}:${perf.caller}`)
-            : generateId('File', file.path);
-          result.calls.push({ filePath: file.path, calledName, sourceId });
-        }
-      }
-    }
+    // Note: COBOL is handled by processCobolRegexOnly in processBatch — no COBOL files reach here
   }
 };
 

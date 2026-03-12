@@ -1,16 +1,22 @@
 /**
  * COBOL source pre-processing and regex-based symbol extraction.
  *
- * tree-sitter-cobol@0.0.1 has limitations:
+ * tree-sitter-cobol@0.0.1 has severe limitations:
  * - Patch markers in columns 1-6 (mzADD, estero, etc.) cause parse errors
  * - Only ~15% of paragraph headers are detected by the grammar
+ * - External scanner hangs indefinitely on ~5% of files (no timeout possible)
+ *
+ * Because of the hang issue, COBOL indexing uses regex-only extraction
+ * (no tree-sitter). This is fast (~1ms/file), reliable, and captures all
+ * critical symbols: program name, paragraphs, sections, CALL, PERFORM, COPY.
  *
  * This module provides:
- * 1. preprocessCobolSource() — cleans patch markers before tree-sitter parsing
- * 2. extractCobolSymbolsWithRegex() — supplements tree-sitter with regex extraction
+ * 1. preprocessCobolSource() — cleans patch markers (kept for potential future use)
+ * 2. extractCobolSymbolsWithRegex() — primary COBOL symbol extraction
  */
 
 export interface CobolRegexResults {
+  programName: string | null;
   paragraphs: Array<{ name: string; line: number }>;
   sections: Array<{ name: string; line: number }>;
   performs: Array<{ caller: string | null; target: string; thruTarget?: string; line: number }>;
@@ -46,8 +52,8 @@ const EXCLUDED_PARA_NAMES = new Set([
 ]);
 
 /**
- * Extract COBOL symbols using regex to supplement tree-sitter.
- * Only extracts from the PROCEDURE DIVISION onward.
+ * Extract COBOL symbols using regex — primary extraction method.
+ * Extracts program name, paragraphs, sections, CALL, PERFORM, COPY.
  */
 export function extractCobolSymbolsWithRegex(
   content: string,
@@ -55,12 +61,22 @@ export function extractCobolSymbolsWithRegex(
 ): CobolRegexResults {
   const lines = content.split('\n');
   const result: CobolRegexResults = {
+    programName: null,
     paragraphs: [],
     sections: [],
     performs: [],
     calls: [],
     copies: [],
   };
+
+  // Extract PROGRAM-ID from IDENTIFICATION DIVISION
+  for (let i = 0; i < lines.length; i++) {
+    const progMatch = lines[i].match(/\bPROGRAM-ID\.\s*([A-Z][A-Z0-9-]*)/i);
+    if (progMatch) {
+      result.programName = progMatch[1];
+      break;
+    }
+  }
 
   // Find PROCEDURE DIVISION start
   let procDivLine = -1;

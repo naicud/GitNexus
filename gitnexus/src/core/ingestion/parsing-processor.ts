@@ -116,6 +116,36 @@ const processParsingSequential = async (
 
     if (!language) continue;
 
+    // COBOL: skip tree-sitter entirely — external scanner hangs on ~5% of files
+    // with no way to timeout. Use regex-only extraction which is fast and reliable.
+    if (language === SupportedLanguages.COBOL) {
+      const regexResults = extractCobolSymbolsWithRegex(file.content, file.path);
+      const fileId = generateId('File', file.path);
+
+      if (regexResults.programName) {
+        const nodeId = generateId('Module', `${file.path}:${regexResults.programName}`);
+        graph.addNode({ id: nodeId, label: 'Module' as any, properties: { name: regexResults.programName, filePath: file.path, startLine: 0, endLine: 0, language: SupportedLanguages.COBOL, isExported: true } });
+        graph.addRelationship({ id: generateId('DEFINES', `${fileId}->${nodeId}`), sourceId: fileId, targetId: nodeId, type: 'DEFINES', confidence: 1.0, reason: '' });
+        symbolTable.add(file.path, regexResults.programName, nodeId, 'Module');
+      }
+
+      for (const para of regexResults.paragraphs) {
+        const nodeId = generateId('Function', `${file.path}:${para.name}`);
+        graph.addNode({ id: nodeId, label: 'Function' as any, properties: { name: para.name, filePath: file.path, startLine: para.line, endLine: para.line, language: SupportedLanguages.COBOL, isExported: true } });
+        graph.addRelationship({ id: generateId('DEFINES', `${fileId}->${nodeId}`), sourceId: fileId, targetId: nodeId, type: 'DEFINES', confidence: 1.0, reason: '' });
+        symbolTable.add(file.path, para.name, nodeId, 'Function');
+      }
+
+      for (const sec of regexResults.sections) {
+        const nodeId = generateId('Namespace', `${file.path}:${sec.name}`);
+        graph.addNode({ id: nodeId, label: 'Namespace' as any, properties: { name: sec.name, filePath: file.path, startLine: sec.line, endLine: sec.line, language: SupportedLanguages.COBOL, isExported: true } });
+        graph.addRelationship({ id: generateId('DEFINES', `${fileId}->${nodeId}`), sourceId: fileId, targetId: nodeId, type: 'DEFINES', confidence: 1.0, reason: '' });
+        symbolTable.add(file.path, sec.name, nodeId, 'Namespace');
+      }
+
+      continue;
+    }
+
     // Skip files larger than the max tree-sitter buffer (32 MB)
     if (file.content.length > TREE_SITTER_MAX_BUFFER) continue;
 
@@ -125,9 +155,7 @@ const processParsingSequential = async (
       continue;  // parser unavailable — already warned in pipeline
     }
 
-    const parseContent = language === SupportedLanguages.COBOL
-      ? preprocessCobolSource(file.content)
-      : file.content;
+    const parseContent = file.content;
 
     let tree;
     try {
@@ -245,68 +273,6 @@ const processParsingSequential = async (
 
       graph.addRelationship(relationship);
     });
-
-    // Supplement tree-sitter with regex for COBOL (grammar misses ~85% of paragraphs)
-    if (language === SupportedLanguages.COBOL) {
-      const regexResults = extractCobolSymbolsWithRegex(file.content, file.path);
-      const fileId = generateId('File', file.path);
-
-      // Add paragraphs not found by tree-sitter
-      for (const para of regexResults.paragraphs) {
-        if (!symbolTable.lookupExact(file.path, para.name)) {
-          const nodeId = generateId('Function', `${file.path}:${para.name}`);
-          graph.addNode({
-            id: nodeId,
-            label: 'Function',
-            properties: {
-              name: para.name,
-              filePath: file.path,
-              startLine: para.line,
-              endLine: para.line,
-              language: SupportedLanguages.COBOL,
-              isExported: true,
-            },
-          });
-          graph.addRelationship({
-            id: generateId('DEFINES', `${fileId}->${nodeId}`),
-            sourceId: fileId,
-            targetId: nodeId,
-            type: 'DEFINES',
-            confidence: 1.0,
-            reason: '',
-          });
-          symbolTable.add(file.path, para.name, nodeId, 'Function');
-        }
-      }
-
-      // Add sections not found by tree-sitter
-      for (const sec of regexResults.sections) {
-        if (!symbolTable.lookupExact(file.path, sec.name)) {
-          const nodeId = generateId('Namespace', `${file.path}:${sec.name}`);
-          graph.addNode({
-            id: nodeId,
-            label: 'Namespace',
-            properties: {
-              name: sec.name,
-              filePath: file.path,
-              startLine: sec.line,
-              endLine: sec.line,
-              language: SupportedLanguages.COBOL,
-              isExported: true,
-            },
-          });
-          graph.addRelationship({
-            id: generateId('DEFINES', `${fileId}->${nodeId}`),
-            sourceId: fileId,
-            targetId: nodeId,
-            type: 'DEFINES',
-            confidence: 1.0,
-            reason: '',
-          });
-          symbolTable.add(file.path, sec.name, nodeId, 'Namespace');
-        }
-      }
-    }
   }
 };
 

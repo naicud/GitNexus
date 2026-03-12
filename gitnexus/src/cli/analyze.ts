@@ -198,7 +198,11 @@ export const analyzeCommand = async (
     const scaled = Math.round(progress.percent * 0.6);
     const detail =
       progress.phase === 'parsing' && (progress.stats?.totalFiles ?? 0) > 0
-        ? `${progress.stats!.filesProcessed}/${progress.stats!.totalFiles} files`
+        ? `${progress.stats!.filesProcessed}/${progress.stats!.totalFiles} files${
+            options?.verbose && progress.detail
+              ? ` — ${progress.detail.split('/').at(-1)}`
+              : ''
+          }`
         : undefined;
     updateBar(scaled, phaseLabel, detail);
   });
