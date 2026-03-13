@@ -7,6 +7,7 @@ import {
   fetchOpenRouterModels,
 } from '../core/llm/settings-service';
 import type { LLMSettings, LLMProvider } from '../core/llm/types';
+import { testBedrockConnection, getBackendUrl } from '../services/backend';
 
 interface SettingsPanelProps {
   isOpen: boolean;
@@ -222,6 +223,9 @@ export const SettingsPanel = ({ isOpen, onClose, onSettingsSaved, backendUrl, is
   // OpenRouter models state
   const [openRouterModels, setOpenRouterModels] = useState<Array<{ id: string; name: string }>>([]);
   const [isLoadingModels, setIsLoadingModels] = useState(false);
+  // Bedrock connection test state
+  const [bedrockTestStatus, setBedrockTestStatus] = useState<'idle' | 'testing' | 'success' | 'error'>('idle');
+  const [bedrockTestMessage, setBedrockTestMessage] = useState('');
 
   // Load settings when panel opens
   useEffect(() => {
@@ -1004,6 +1008,70 @@ export const SettingsPanel = ({ isOpen, onClose, onSettingsSaved, backendUrl, is
                   AWS Console
                 </a>
               </p>
+
+              {/* Bedrock Health Check */}
+              <div className="space-y-2">
+                <button
+                  type="button"
+                  disabled={
+                    !settings.bedrock?.accessKeyId?.trim() ||
+                    !settings.bedrock?.secretAccessKey?.trim() ||
+                    !settings.bedrock?.model?.trim() ||
+                    bedrockTestStatus === 'testing'
+                  }
+                  onClick={async () => {
+                    setBedrockTestStatus('testing');
+                    setBedrockTestMessage('');
+                    try {
+                      const result = await testBedrockConnection({
+                        region: settings.bedrock?.region || 'us-east-1',
+                        accessKeyId: settings.bedrock?.accessKeyId || '',
+                        secretAccessKey: settings.bedrock?.secretAccessKey || '',
+                        sessionToken: settings.bedrock?.sessionToken || undefined,
+                        model: settings.bedrock?.model || '',
+                      });
+                      if (result.ok) {
+                        setBedrockTestStatus('success');
+                        setBedrockTestMessage(`Connected — ${result.model} in ${result.region}`);
+                      } else {
+                        setBedrockTestStatus('error');
+                        setBedrockTestMessage(result.error || 'Connection failed');
+                      }
+                    } catch (err: any) {
+                      setBedrockTestStatus('error');
+                      setBedrockTestMessage(err.message || 'Failed to reach backend server');
+                    }
+                  }}
+                  className="flex items-center gap-2 px-4 py-2 bg-accent/20 text-accent rounded-lg hover:bg-accent/30 transition-colors disabled:opacity-40 disabled:cursor-not-allowed text-sm font-medium"
+                >
+                  {bedrockTestStatus === 'testing' ? (
+                    <Loader2 className="w-4 h-4 animate-spin" />
+                  ) : (
+                    <Server className="w-4 h-4" />
+                  )}
+                  Test Connection
+                </button>
+
+                {bedrockTestStatus === 'success' && (
+                  <div className="flex items-start gap-2 p-3 bg-green-500/10 border border-green-500/20 rounded-lg">
+                    <Check className="w-4 h-4 text-green-400 flex-shrink-0 mt-0.5" />
+                    <span className="text-xs text-green-400">{bedrockTestMessage}</span>
+                  </div>
+                )}
+
+                {bedrockTestStatus === 'error' && (
+                  <div className="flex items-start gap-2 p-3 bg-red-500/10 border border-red-500/20 rounded-lg">
+                    <AlertCircle className="w-4 h-4 text-red-400 flex-shrink-0 mt-0.5" />
+                    <span className="text-xs text-red-400 break-all">{bedrockTestMessage}</span>
+                  </div>
+                )}
+
+                {!getBackendUrl() && (
+                  <p className="text-xs text-yellow-400/80">
+                    Bedrock requires the local server running (<code className="bg-elevated px-1 rounded">gitnexus serve</code>) to proxy API calls and bypass browser CORS restrictions.
+                  </p>
+                )}
+              </div>
             </div>
           )}
 

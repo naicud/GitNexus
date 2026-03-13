@@ -2,6 +2,18 @@
 
 All notable changes to GitNexus will be documented in this file.
 
+## [1.3.13] - 2026-03-13
+
+### Added
+
+- **AWS Bedrock backend proxy**: Bedrock API calls now route through the local Express server (`/api/bedrock/converse`, `/api/bedrock/converse-stream`) to bypass browser CORS/COEP restrictions that blocked direct browser-to-AWS calls — @naicud
+- **Bedrock health check**: "Test Connection" button in Settings validates credentials, region, and model access in one click — shows detailed error messages on failure — @naicud
+- **Claude 4 model support**: Added `anthropic.claude-sonnet-4-20250514-v1:0` and `anthropic.claude-opus-4-20250514-v1:0` to the Bedrock model list — @naicud
+
+### Changed
+
+- **Bedrock dual-mode routing**: `ChatBedrockBrowser` supports both direct browser calls (standalone) and backend proxy (server-connected) — proxy is auto-selected when backend is available — @naicud
+
 ## [1.3.12] - 2026-03-12
 
 ### Added

@@ -12,6 +12,8 @@ import express from 'express';
 import cors from 'cors';
 import path from 'path';
 import fs from 'fs/promises';
+import { Readable } from 'node:stream';
+import { AwsClient } from 'aws4fetch';
 import { loadMeta, listRegisteredRepos } from '../storage/repo-manager.js';
 import { executeQuery, closeKuzu, withKuzuDb } from '../core/kuzu/kuzu-adapter.js';
 import { NODE_TABLES } from '../core/kuzu/schema.js';
@@ -334,6 +336,125 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
       res.json(result);
     } catch (err: any) {
       res.status(statusFromError(err)).json({ error: err.message || 'Failed to query cluster detail' });
+    }
+  });
+
+  // ── AWS Bedrock proxy endpoints ────────────────────────────────────────
+  // Routes Bedrock API calls through the local server to bypass browser CORS/COEP.
+  // Credentials are sent per-request (never stored server-side).
+
+  /** Health check — minimal Converse call to validate credentials + model access */
+  app.post('/api/bedrock/test', async (req, res) => {
+    try {
+      const { region, accessKeyId, secretAccessKey, sessionToken, model } = req.body;
+      if (!region || !accessKeyId || !secretAccessKey || !model) {
+        res.status(400).json({ ok: false, error: 'Missing required fields: region, accessKeyId, secretAccessKey, model' });
+        return;
+      }
+
+      const aws = new AwsClient({
+        accessKeyId,
+        secretAccessKey,
+        sessionToken: sessionToken || undefined,
+        region,
+        service: 'bedrock',
+      });
+
+      const url = `https://bedrock-runtime.${region}.amazonaws.com/model/${encodeURIComponent(model)}/converse`;
+      const resp = await aws.fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          messages: [{ role: 'user', content: [{ type: 'text', text: 'Hi' }] }],
+          inferenceConfig: { maxTokens: 1, temperature: 0 },
+        }),
+      });
+
+      if (!resp.ok) {
+        const errBody = await resp.text();
+        res.json({ ok: false, error: `${resp.status}: ${errBody}` });
+        return;
+      }
+
+      res.json({ ok: true, model, region });
+    } catch (err: any) {
+      res.json({ ok: false, error: err.message || 'Unknown error' });
+    }
+  });
+
+  /** Non-streaming Converse proxy */
+  app.post('/api/bedrock/converse', async (req, res) => {
+    try {
+      const { region, credentials, model, body } = req.body;
+      if (!region || !credentials?.accessKeyId || !credentials?.secretAccessKey || !model || !body) {
+        res.status(400).json({ error: 'Missing required fields' });
+        return;
+      }
+
+      const aws = new AwsClient({
+        accessKeyId: credentials.accessKeyId,
+        secretAccessKey: credentials.secretAccessKey,
+        sessionToken: credentials.sessionToken || undefined,
+        region,
+        service: 'bedrock',
+      });
+
+      const url = `https://bedrock-runtime.${region}.amazonaws.com/model/${encodeURIComponent(model)}/converse`;
+      const awsResp = await aws.fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+
+      if (!awsResp.ok) {
+        const errBody = await awsResp.text();
+        res.status(awsResp.status).json({ error: errBody });
+        return;
+      }
+
+      const data = await awsResp.json();
+      res.json(data);
+    } catch (err: any) {
+      res.status(500).json({ error: err.message || 'Bedrock converse failed' });
+    }
+  });
+
+  /** Streaming Converse proxy — pipes raw AWS Event Stream binary back to client */
+  app.post('/api/bedrock/converse-stream', async (req, res) => {
+    try {
+      const { region, credentials, model, body } = req.body;
+      if (!region || !credentials?.accessKeyId || !credentials?.secretAccessKey || !model || !body) {
+        res.status(400).json({ error: 'Missing required fields' });
+        return;
+      }
+
+      const aws = new AwsClient({
+        accessKeyId: credentials.accessKeyId,
+        secretAccessKey: credentials.secretAccessKey,
+        sessionToken: credentials.sessionToken || undefined,
+        region,
+        service: 'bedrock',
+      });
+
+      const url = `https://bedrock-runtime.${region}.amazonaws.com/model/${encodeURIComponent(model)}/converse-stream`;
+      const awsResp = await aws.fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+
+      if (!awsResp.ok) {
+        const errBody = await awsResp.text();
+        res.status(awsResp.status).json({ error: errBody });
+        return;
+      }
+
+      res.setHeader('Content-Type', awsResp.headers.get('content-type') || 'application/vnd.amazon.eventstream');
+      // Pipe raw binary stream — frontend's parseEventStream() handles it as-is
+      const readable = Readable.fromWeb(awsResp.body as any);
+      readable.pipe(res);
+    } catch (err: any) {
+      res.status(500).json({ error: err.message || 'Bedrock stream failed' });
     }
   });
 

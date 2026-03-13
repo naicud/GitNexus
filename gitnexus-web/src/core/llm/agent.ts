@@ -260,6 +260,7 @@ export const createChatModel = (config: ProviderConfig): BaseChatModel => {
         temperature: bedrockConfig.temperature ?? 0.1,
         maxTokens: bedrockConfig.maxTokens,
         streaming: true,
+        proxyBaseUrl: bedrockConfig.proxyBaseUrl,
       }) as unknown as BaseChatModel;
     }
 

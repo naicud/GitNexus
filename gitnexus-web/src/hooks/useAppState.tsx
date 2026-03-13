@@ -578,6 +578,11 @@ export const AppStateProvider = ({ children }: { children: ReactNode }) => {
       return;
     }
 
+    // Inject proxy URL for Bedrock when backend is connected (bypasses browser CORS/COEP)
+    if (config.provider === 'bedrock' && serverBaseUrl) {
+      (config as import('../core/llm/types').AWSBedrockConfig).proxyBaseUrl = serverBaseUrl;
+    }
+
     setIsAgentInitializing(true);
     setAgentError(null);
 
@@ -602,7 +607,7 @@ export const AppStateProvider = ({ children }: { children: ReactNode }) => {
     } finally {
       setIsAgentInitializing(false);
     }
-  }, [projectName]);
+  }, [projectName, serverBaseUrl]);
 
   const sendChatMessage = useCallback(async (message: string): Promise<void> => {
     const api = apiRef.current;

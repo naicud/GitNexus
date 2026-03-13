@@ -41,6 +41,7 @@ interface ChatBedrockBrowserParams {
   temperature?: number;
   maxTokens?: number;
   streaming?: boolean;
+  proxyBaseUrl?: string;  // when set, routes calls through backend to bypass CORS
 }
 
 interface BedrockTool {
@@ -203,10 +204,14 @@ export class ChatBedrockBrowser extends BaseChatModel {
   private temperature: number;
   private maxTokens?: number;
   private boundTools?: BedrockTool[];
+  private credentials: BedrockCredentials;
+  private proxyBaseUrl?: string;
   readonly streaming: boolean;
 
   constructor(params: ChatBedrockBrowserParams) {
     super({});
+    this.credentials = params.credentials;
+    this.proxyBaseUrl = params.proxyBaseUrl;
     this.aws = new AwsClient({
       accessKeyId: params.credentials.accessKeyId,
       secretAccessKey: params.credentials.secretAccessKey,
@@ -247,17 +252,37 @@ export class ChatBedrockBrowser extends BaseChatModel {
     return JSON.stringify(body);
   }
 
+  private async proxyFetch(endpoint: 'converse' | 'converse-stream', bodyJson: string): Promise<Response> {
+    return fetch(`${this.proxyBaseUrl}/api/bedrock/${endpoint}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        region: this.region,
+        credentials: this.credentials,
+        model: this.modelId,
+        body: JSON.parse(bodyJson),
+      }),
+    });
+  }
+
   async _generate(
     messages: BaseMessage[],
     _options: BaseChatModelCallOptions,
     _runManager?: CallbackManagerForLLMRun
   ): Promise<ChatResult> {
-    const url = `https://bedrock-runtime.${this.region}.amazonaws.com/model/${encodeURIComponent(this.modelId)}/converse`;
-    const resp = await this.aws.fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: this.buildBody(messages),
-    });
+    const bodyJson = this.buildBody(messages);
+    let resp: Response;
+
+    if (this.proxyBaseUrl) {
+      resp = await this.proxyFetch('converse', bodyJson);
+    } else {
+      const url = `https://bedrock-runtime.${this.region}.amazonaws.com/model/${encodeURIComponent(this.modelId)}/converse`;
+      resp = await this.aws.fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: bodyJson,
+      });
+    }
 
     if (!resp.ok) {
       const err = await resp.text();
@@ -278,12 +303,19 @@ export class ChatBedrockBrowser extends BaseChatModel {
     _options: BaseChatModelCallOptions,
     runManager?: CallbackManagerForLLMRun
   ): AsyncGenerator<ChatGenerationChunk> {
-    const url = `https://bedrock-runtime.${this.region}.amazonaws.com/model/${encodeURIComponent(this.modelId)}/converse-stream`;
-    const resp = await this.aws.fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: this.buildBody(messages),
-    });
+    const bodyJson = this.buildBody(messages);
+    let resp: Response;
+
+    if (this.proxyBaseUrl) {
+      resp = await this.proxyFetch('converse-stream', bodyJson);
+    } else {
+      const url = `https://bedrock-runtime.${this.region}.amazonaws.com/model/${encodeURIComponent(this.modelId)}/converse-stream`;
+      resp = await this.aws.fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: bodyJson,
+      });
+    }
 
     if (!resp.ok) {
       const err = await resp.text();

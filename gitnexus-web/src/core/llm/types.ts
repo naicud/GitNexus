@@ -98,6 +98,7 @@ export interface AWSBedrockConfig extends BaseProviderConfig {
   sessionToken?: string;  // for temporary STS credentials
   region: string;
   model: string;
+  proxyBaseUrl?: string;  // when set, routes API calls through backend to bypass CORS
 }
 
 /**
