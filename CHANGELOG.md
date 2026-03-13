@@ -2,6 +2,27 @@
 
 All notable changes to GitNexus will be documented in this file.
 
+## [1.3.12] - 2026-03-12
+
+### Added
+
+- **COBOL language support**: Full indexing pipeline for GnuCOBOL codebases — PROGRAM-ID, paragraphs, sections, CALL/PERFORM/COPY edges extracted via regex-only processing (no tree-sitter) for reliable performance on large repos (#1) — @naicud
+- **COBOL regex-only worker path**: Replaces tree-sitter-cobol entirely in both worker pool and sequential fallback to avoid external-scanner hangs on ~5% of files; sub-batch size auto-set to 200 for COBOL repos (#1) — @naicud
+- **AWS Bedrock & custom OpenAI-compatible providers**: Embeddings and LLM calls can now target AWS Bedrock endpoints and any OpenAI-compatible API in addition to OpenAI
+- **Enhanced `analyze` progress display**: Optional `--detail` flag surfaces per-file parse stats; removed the large-file skip logic from the filesystem walker so all files are considered for indexing
+- **Web UI — model text input**: Settings panel model selector replaced with a free-text input, removing hard-coded dropdown options for improved flexibility
+
+### Fixed
+
+- **C/C++/C#/Rust language support**: Consolidated 6 overlapping PRs into unified `shared/utils.ts`; deduplicated `call-processor.ts`, `parse-worker.ts`, and `parsing-processor.ts`; fixed per-call `new Set()` allocation in `export-detection.ts`; added 72 tests (#237)
+- **Swift parser availability**: Sequential ingestion now skips unavailable native Swift parsers gracefully and emits a warning in verbose mode (#188)
+- **README**: Corrected backend and frontend directory paths in setup instructions
+
+### Changed
+
+- **CI — fork PR support**: PR report moved to `workflow_run` event and Claude Code Review workflow updated to handle fork-originated pull requests (#225, #222)
+- **CI — security hardening**: Workflow permissions tightened and reliability improvements applied across CI/CD pipeline (#222)
+
 ## [1.3.11] - 2026-03-08
 
 ### Security
