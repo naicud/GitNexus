@@ -942,18 +942,43 @@ export const SettingsPanel = ({ isOpen, onClose, onSettingsSaved, backendUrl, is
               <div className="grid grid-cols-2 gap-4">
                 <div className="space-y-2">
                   <label className="text-sm font-medium text-text-secondary">Region</label>
-                  <select
+                  <input
+                    type="text"
+                    list="aws-regions"
                     value={settings.bedrock?.region ?? 'us-east-1'}
                     onChange={e => setSettings(prev => ({ ...prev, bedrock: { ...prev.bedrock!, region: e.target.value } }))}
-                    className="w-full px-4 py-3 bg-elevated border border-border-subtle rounded-xl text-text-primary focus:border-accent focus:ring-2 focus:ring-accent/20 outline-none transition-all"
-                  >
-                    <option value="us-east-1">us-east-1 (N. Virginia)</option>
-                    <option value="us-west-2">us-west-2 (Oregon)</option>
-                    <option value="eu-west-1">eu-west-1 (Ireland)</option>
-                    <option value="eu-central-1">eu-central-1 (Frankfurt)</option>
-                    <option value="ap-southeast-1">ap-southeast-1 (Singapore)</option>
-                    <option value="ap-northeast-1">ap-northeast-1 (Tokyo)</option>
-                  </select>
+                    placeholder="e.g. us-east-1"
+                    className="w-full px-4 py-3 bg-elevated border border-border-subtle rounded-xl text-text-primary placeholder:text-text-muted focus:border-accent focus:ring-2 focus:ring-accent/20 outline-none transition-all font-mono text-xs"
+                  />
+                  <datalist id="aws-regions">
+                    <option value="us-east-1">N. Virginia</option>
+                    <option value="us-east-2">Ohio</option>
+                    <option value="us-west-1">N. California</option>
+                    <option value="us-west-2">Oregon</option>
+                    <option value="eu-west-1">Ireland</option>
+                    <option value="eu-west-2">London</option>
+                    <option value="eu-west-3">Paris</option>
+                    <option value="eu-central-1">Frankfurt</option>
+                    <option value="eu-central-2">Zurich</option>
+                    <option value="eu-north-1">Stockholm</option>
+                    <option value="eu-south-1">Milan</option>
+                    <option value="eu-south-2">Spain</option>
+                    <option value="ap-southeast-1">Singapore</option>
+                    <option value="ap-southeast-2">Sydney</option>
+                    <option value="ap-southeast-3">Jakarta</option>
+                    <option value="ap-northeast-1">Tokyo</option>
+                    <option value="ap-northeast-2">Seoul</option>
+                    <option value="ap-northeast-3">Osaka</option>
+                    <option value="ap-south-1">Mumbai</option>
+                    <option value="ap-south-2">Hyderabad</option>
+                    <option value="ap-east-1">Hong Kong</option>
+                    <option value="sa-east-1">São Paulo</option>
+                    <option value="ca-central-1">Canada</option>
+                    <option value="me-south-1">Bahrain</option>
+                    <option value="me-central-1">UAE</option>
+                    <option value="af-south-1">Cape Town</option>
+                    <option value="il-central-1">Tel Aviv</option>
+                  </datalist>
                 </div>
 
                 <div className="space-y-2">

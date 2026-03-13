@@ -24,6 +24,7 @@ import type { ChatResult, ChatGenerationChunk } from '@langchain/core/outputs';
 import type { CallbackManagerForLLMRun } from '@langchain/core/callbacks/manager';
 import type { StructuredToolInterface } from '@langchain/core/tools';
 import { z } from 'zod';
+import { zodToJsonSchema } from 'zod-to-json-schema';
 
 // ─── Types ─────────────────────────────────────────────────────────────────
 
@@ -124,7 +125,7 @@ function toBedrockTools(tools: StructuredToolInterface[]): BedrockTool[] {
       description: t.description,
       inputSchema: {
         json: t.schema instanceof z.ZodType
-          ? (t.schema as any)._def // fallback: Zod schema as-is; Bedrock accepts JSONSchema
+          ? zodToJsonSchema(t.schema, { $refStrategy: 'none' })
           : t.schema,
       },
     },

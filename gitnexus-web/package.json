@@ -52,7 +52,8 @@
     "vite-plugin-top-level-await": "^1.6.0",
     "vite-plugin-wasm": "^3.5.0",
     "web-tree-sitter": "^0.20.8",
-    "zod": "^3.25.76"
+    "zod": "^3.25.76",
+    "zod-to-json-schema": "^3.24.5"
   },
   "devDependencies": {
     "@babel/types": "^7.28.5",

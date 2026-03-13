@@ -31,6 +31,11 @@ const DEFAULT_SUB_BATCH_SIZE = 1500;
  *  parsers (e.g. COBOL with external scanner on large batches). */
 const SUB_BATCH_TIMEOUT_MS = Number(process.env.GITNEXUS_WORKER_TIMEOUT_MS) || 120_000;
 
+/** Time to wait for all workers to signal readiness before giving up.
+ *  Workers send { type: 'ready' } after module init (tree-sitter loading etc.).
+ *  Configurable via GITNEXUS_WORKER_STARTUP_TIMEOUT_MS. */
+const WORKER_STARTUP_TIMEOUT_MS = Number(process.env.GITNEXUS_WORKER_STARTUP_TIMEOUT_MS) || 60_000;
+
 /**
  * Create a pool of worker threads.
  */
@@ -46,13 +51,39 @@ export const createWorkerPool = (workerUrl: URL, poolSize?: number, subBatchSize
   const size = poolSize ?? Math.min(8, Math.max(1, os.cpus().length - 1));
   const workers: Worker[] = [];
 
+  // Track worker readiness — each worker sends { type: 'ready' } after module init
+  const readyPromises: Promise<void>[] = [];
+
   for (let i = 0; i < size; i++) {
-    workers.push(new Worker(workerUrl));
+    const worker = new Worker(workerUrl);
+    workers.push(worker);
+
+    readyPromises.push(new Promise<void>((resolve) => {
+      const onReady = (msg: any) => {
+        if (msg && msg.type === 'ready') {
+          worker.removeListener('message', onReady);
+          resolve();
+        }
+      };
+      worker.on('message', onReady);
+    }));
   }
+
+  const allWorkersReady = Promise.race([
+    Promise.all(readyPromises),
+    new Promise<void[]>((_, reject) =>
+      setTimeout(() => reject(new Error(
+        `Workers failed to become ready within ${WORKER_STARTUP_TIMEOUT_MS / 1000}s. ` +
+        `Increase GITNEXUS_WORKER_STARTUP_TIMEOUT_MS or check for native module loading issues.`
+      )), WORKER_STARTUP_TIMEOUT_MS)
+    ),
+  ]);
 
   const dispatch = <TInput, TResult>(items: TInput[], onProgress?: (filesProcessed: number) => void): Promise<TResult[]> => {
     if (items.length === 0) return Promise.resolve([]);
 
+    // Wait for all workers to finish initialization before sending work
+    return allWorkersReady.then(() => {
     const chunkSize = Math.ceil(items.length / size);
     const chunks: TInput[][] = [];
     for (let i = 0; i < items.length; i += chunkSize) {
@@ -145,6 +176,7 @@ export const createWorkerPool = (workerUrl: URL, poolSize?: number, subBatchSize
     });
 
     return Promise.all(promises);
+    }); // end allWorkersReady.then
   };
 
   const terminate = async (): Promise<void> => {

@@ -1,32 +1,73 @@
 import { parentPort } from 'node:worker_threads';
-import Parser from 'tree-sitter';
-import JavaScript from 'tree-sitter-javascript';
-import TypeScript from 'tree-sitter-typescript';
-import Python from 'tree-sitter-python';
-import Java from 'tree-sitter-java';
-import C from 'tree-sitter-c';
-import CPP from 'tree-sitter-cpp';
-import CSharp from 'tree-sitter-c-sharp';
-import Go from 'tree-sitter-go';
-import Rust from 'tree-sitter-rust';
-import Kotlin from 'tree-sitter-kotlin';
-import PHP from 'tree-sitter-php';
 import { createRequire } from 'node:module';
 import { SupportedLanguages } from '../../../config/supported-languages.js';
 import { LANGUAGE_QUERIES } from '../tree-sitter-queries.js';
 import { getTreeSitterBufferSize, TREE_SITTER_MAX_BUFFER } from '../constants.js';
-
-// tree-sitter-swift and tree-sitter-cobol are optionalDependencies — may not be installed
-const _require = createRequire(import.meta.url);
-let Swift: any = null;
-try { Swift = _require('tree-sitter-swift'); } catch {}
-let COBOL: any = null;
-try { COBOL = _require('tree-sitter-cobol'); } catch {}
 import { preprocessCobolSource, extractCobolSymbolsWithRegex } from '../cobol-preprocessor.js';
 import { findSiblingChild, getLanguageFromFilename, getLanguageFromPath, FUNCTION_NODE_TYPES, extractFunctionName, isBuiltInOrNoise, DEFINITION_CAPTURE_KEYS, getDefinitionNodeFromCaptures } from '../utils.js';
 import { isNodeExported } from '../export-detection.js';
 import { detectFrameworkFromAST } from '../framework-detection.js';
 import { generateId } from '../../../lib/utils.js';
+
+// ============================================================================
+// Lazy tree-sitter loading — skip native modules for COBOL-only repos
+// ============================================================================
+
+const _require = createRequire(import.meta.url);
+const isCobolOnlyMode = !!process.env.GITNEXUS_COBOL_DIRS;
+
+let treeSitterLoaded = false;
+let Parser: any = null;
+let parser: any = null;
+let languageMap: Record<string, any> = {};
+
+/** Load tree-sitter and all language grammars. No-op after first call. */
+const ensureTreeSitterLoaded = (): void => {
+  if (treeSitterLoaded) return;
+  treeSitterLoaded = true;
+
+  Parser = _require('tree-sitter');
+  parser = new Parser();
+
+  const JavaScript = _require('tree-sitter-javascript');
+  const TypeScript = _require('tree-sitter-typescript');
+  const Python = _require('tree-sitter-python');
+  const Java = _require('tree-sitter-java');
+  const C = _require('tree-sitter-c');
+  const CPP = _require('tree-sitter-cpp');
+  const CSharp = _require('tree-sitter-c-sharp');
+  const Go = _require('tree-sitter-go');
+  const Rust = _require('tree-sitter-rust');
+  const Kotlin = _require('tree-sitter-kotlin');
+  const PHP = _require('tree-sitter-php');
+
+  let Swift: any = null;
+  try { Swift = _require('tree-sitter-swift'); } catch {}
+  let COBOL: any = null;
+  try { COBOL = _require('tree-sitter-cobol'); } catch {}
+
+  languageMap = {
+    [SupportedLanguages.JavaScript]: JavaScript,
+    [SupportedLanguages.TypeScript]: TypeScript.typescript,
+    [`${SupportedLanguages.TypeScript}:tsx`]: TypeScript.tsx,
+    [SupportedLanguages.Python]: Python,
+    [SupportedLanguages.Java]: Java,
+    [SupportedLanguages.C]: C,
+    [SupportedLanguages.CPlusPlus]: CPP,
+    [SupportedLanguages.CSharp]: CSharp,
+    [SupportedLanguages.Go]: Go,
+    [SupportedLanguages.Rust]: Rust,
+    [SupportedLanguages.Kotlin]: Kotlin,
+    [SupportedLanguages.PHP]: PHP.php_only,
+    ...(Swift ? { [SupportedLanguages.Swift]: Swift } : {}),
+    ...(COBOL ? { [SupportedLanguages.COBOL]: COBOL } : {}),
+  };
+};
+
+// For non-COBOL repos, load eagerly at module init (no behavior change)
+if (!isCobolOnlyMode) {
+  ensureTreeSitterLoaded();
+}
 
 // ============================================================================
 // Types for serializable results
@@ -112,30 +153,8 @@ export interface ParseWorkerInput {
   content: string;
 }
 
-// ============================================================================
-// Worker-local parser + language map
-// ============================================================================
-
-const parser = new Parser();
-
-const languageMap: Record<string, any> = {
-  [SupportedLanguages.JavaScript]: JavaScript,
-  [SupportedLanguages.TypeScript]: TypeScript.typescript,
-  [`${SupportedLanguages.TypeScript}:tsx`]: TypeScript.tsx,
-  [SupportedLanguages.Python]: Python,
-  [SupportedLanguages.Java]: Java,
-  [SupportedLanguages.C]: C,
-  [SupportedLanguages.CPlusPlus]: CPP,
-  [SupportedLanguages.CSharp]: CSharp,
-  [SupportedLanguages.Go]: Go,
-  [SupportedLanguages.Rust]: Rust,
-  [SupportedLanguages.Kotlin]: Kotlin,
-  [SupportedLanguages.PHP]: PHP.php_only,
-  ...(Swift ? { [SupportedLanguages.Swift]: Swift } : {}),
-  ...(COBOL ? { [SupportedLanguages.COBOL]: COBOL } : {}),
-};
-
 const setLanguage = (language: SupportedLanguages, filePath: string): void => {
+  ensureTreeSitterLoaded();
   const key = language === SupportedLanguages.TypeScript && filePath.endsWith('.tsx')
     ? `${language}:tsx`
     : language;
@@ -1092,3 +1111,6 @@ parentPort!.on('message', (msg: any) => {
     parentPort!.postMessage({ type: 'error', error: message });
   }
 });
+
+// Signal that this worker is ready to receive work
+parentPort!.postMessage({ type: 'ready' });

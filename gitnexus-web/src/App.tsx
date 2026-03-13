@@ -18,6 +18,7 @@ const AppContent = () => {
   const {
     viewMode,
     setViewMode,
+    graph,
     setGraph,
     setFileContents,
     setProgress,
@@ -236,8 +237,8 @@ const AppContent = () => {
   // NOTE: Must be defined BEFORE any conditional returns (React hooks rule)
   const handleSettingsSaved = useCallback(() => {
     refreshLLMSettings();
-    initializeAgent();
-  }, [refreshLLMSettings, initializeAgent]);
+    if (graph) initializeAgent();
+  }, [refreshLLMSettings, initializeAgent, graph]);
 
   // Render based on view mode
   if (viewMode === 'onboarding') {
