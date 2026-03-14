@@ -47,12 +47,20 @@ export const TYPESCRIPT_QUERIES = `
 (import_statement
   source: (string) @import.source) @import
 
+; Re-export statements: export { X } from './y'
+(export_statement
+  source: (string) @import.source) @import
+
 (call_expression
   function: (identifier) @call.name) @call
 
 (call_expression
   function: (member_expression
     property: (property_identifier) @call.name)) @call
+
+; Constructor calls: new Foo()
+(new_expression
+  constructor: (identifier) @call.name) @call
 
 ; Heritage queries - class extends
 (class_declaration
@@ -105,12 +113,20 @@ export const JAVASCRIPT_QUERIES = `
 (import_statement
   source: (string) @import.source) @import
 
+; Re-export statements: export { X } from './y'
+(export_statement
+  source: (string) @import.source) @import
+
 (call_expression
   function: (identifier) @call.name) @call
 
 (call_expression
   function: (member_expression
     property: (property_identifier) @call.name)) @call
+
+; Constructor calls: new Foo()
+(new_expression
+  constructor: (identifier) @call.name) @call
 
 ; Heritage queries - class extends (JavaScript uses different AST than TypeScript)
 ; In tree-sitter-javascript, class_heritage directly contains the parent identifier
@@ -133,6 +149,9 @@ export const PYTHON_QUERIES = `
 
 (import_from_statement
   module_name: (dotted_name) @import.source) @import
+
+(import_from_statement
+  module_name: (relative_import) @import.source) @import
 
 (call
   function: (identifier) @call.name) @call
@@ -166,6 +185,9 @@ export const JAVA_QUERIES = `
 ; Calls
 (method_invocation name: (identifier) @call.name) @call
 (method_invocation object: (_) name: (identifier) @call.name) @call
+
+; Constructor calls: new Foo()
+(object_creation_expression type: (type_identifier) @call.name) @call
 
 ; Heritage - extends class
 (class_declaration name: (identifier) @heritage.class
@@ -216,15 +238,26 @@ export const GO_QUERIES = `
 ; Types
 (type_declaration (type_spec name: (type_identifier) @name type: (struct_type))) @definition.struct
 (type_declaration (type_spec name: (type_identifier) @name type: (interface_type))) @definition.interface
-(type_declaration (type_spec name: (type_identifier) @name)) @definition.type
 
 ; Imports
 (import_declaration (import_spec path: (interpreted_string_literal) @import.source)) @import
 (import_declaration (import_spec_list (import_spec path: (interpreted_string_literal) @import.source))) @import
 
+; Struct embedding (anonymous fields = inheritance)
+(type_declaration
+  (type_spec
+    name: (type_identifier) @heritage.class
+    type: (struct_type
+      (field_declaration_list
+        (field_declaration
+          type: (type_identifier) @heritage.extends))))) @definition.struct
+
 ; Calls
 (call_expression function: (identifier) @call.name) @call
 (call_expression function: (selector_expression field: (field_identifier) @call.name)) @call
+
+; Struct literal construction: User{Name: "Alice"}
+(composite_literal type: (type_identifier) @call.name) @call
 `;
 
 // C++ queries - works with tree-sitter-cpp
@@ -288,6 +321,9 @@ export const CPP_QUERIES = `
 (call_expression function: (qualified_identifier name: (identifier) @call.name)) @call
 (call_expression function: (template_function name: (identifier) @call.name)) @call
 
+; Constructor calls: new User()
+(new_expression type: (type_identifier) @call.name) @call
+
 ; Heritage
 (class_specifier name: (type_identifier) @heritage.class
   (base_class_clause (type_identifier) @heritage.extends)) @heritage
@@ -317,6 +353,10 @@ export const CSHARP_QUERIES = `
 (constructor_declaration name: (identifier) @name) @definition.constructor
 (property_declaration name: (identifier) @name) @definition.property
 
+; Primary constructors (C# 12): class User(string name, int age) { }
+(class_declaration name: (identifier) @name (parameter_list) @definition.constructor)
+(record_declaration name: (identifier) @name (parameter_list) @definition.constructor)
+
 ; Using
 (using_directive (qualified_name) @import.source) @import
 (using_directive (identifier) @import.source) @import
@@ -324,6 +364,12 @@ export const CSHARP_QUERIES = `
 ; Calls
 (invocation_expression function: (identifier) @call.name) @call
 (invocation_expression function: (member_access_expression name: (identifier) @call.name)) @call
+
+; Constructor calls: new Foo() and new Foo { Props }
+(object_creation_expression type: (identifier) @call.name) @call
+
+; Target-typed new (C# 9): User u = new("x", 5)
+(variable_declaration type: (identifier) @call.name (variable_declarator (implicit_object_creation_expression) @call))
 
 ; Heritage
 (class_declaration name: (identifier) @heritage.class
@@ -357,6 +403,9 @@ export const RUST_QUERIES = `
 (call_expression function: (field_expression field: (field_identifier) @call.name)) @call
 (call_expression function: (scoped_identifier name: (identifier) @call.name)) @call
 (call_expression function: (generic_function function: (identifier) @call.name)) @call
+
+; Struct literal construction: User { name: value }
+(struct_expression name: (type_identifier) @call.name) @call
 
 ; Heritage (trait implementation) — all combinations of concrete/generic trait × concrete/generic type
 (impl_item trait: (type_identifier) @heritage.trait type: (type_identifier) @heritage.class) @heritage
@@ -424,6 +473,9 @@ export const PHP_QUERIES = `
 (scoped_call_expression
   name: (name) @call.name) @call
 
+; Constructor call: new User()
+(object_creation_expression (name) @call.name) @call
+
 ; ── Heritage: extends ────────────────────────────────────────────────────────
 (class_declaration
   name: (name) @heritage.class
@@ -442,6 +494,51 @@ export const PHP_QUERIES = `
   body: (declaration_list
     (use_declaration
       [(name) (qualified_name)] @heritage.trait))) @heritage
+`;
+
+// Ruby queries - works with tree-sitter-ruby
+// NOTE: Ruby uses `call` for require, include, extend, prepend, attr_* etc.
+// These are all captured as @call and routed in JS post-processing:
+//   - require/require_relative → import extraction
+//   - include/extend/prepend → heritage (mixin) extraction
+//   - attr_accessor/attr_reader/attr_writer → property definition extraction
+//   - everything else → regular call extraction
+export const RUBY_QUERIES = `
+; ── Modules ──────────────────────────────────────────────────────────────────
+(module
+  name: (constant) @name) @definition.module
+
+; ── Classes ──────────────────────────────────────────────────────────────────
+(class
+  name: (constant) @name) @definition.class
+
+; ── Instance methods ─────────────────────────────────────────────────────────
+(method
+  name: (identifier) @name) @definition.method
+
+; ── Singleton (class-level) methods ──────────────────────────────────────────
+(singleton_method
+  name: (identifier) @name) @definition.method
+
+; ── All calls (require, include, attr_*, and regular calls routed in JS) ─────
+(call
+  method: (identifier) @call.name) @call
+
+; ── Bare calls without parens (identifiers at statement level are method calls) ─
+; NOTE: This may over-capture variable reads as calls (e.g. 'result' at
+; statement level). Ruby's grammar makes bare identifiers ambiguous — they
+; could be local variables or zero-arity method calls. Post-processing via
+; isBuiltInOrNoise and symbol resolution filtering suppresses most false
+; positives, but a variable name that coincidentally matches a method name
+; elsewhere may produce a false CALLS edge.
+(body_statement
+  (identifier) @call.name @call)
+
+; ── Heritage: class < SuperClass ─────────────────────────────────────────────
+(class
+  name: (constant) @heritage.class
+  superclass: (superclass
+    (constant) @heritage.extends)) @heritage
 `;
 
 // Kotlin queries - works with tree-sitter-kotlin (fwcd/tree-sitter-kotlin)
@@ -575,6 +672,11 @@ export const SWIFT_QUERIES = `
 ; Heritage - protocol inheritance
 (protocol_declaration name: (type_identifier) @heritage.class
   (inheritance_specifier inherits_from: (user_type (type_identifier) @heritage.extends))) @heritage
+
+; Heritage - extension protocol conformance (e.g. extension Foo: SomeProtocol)
+; Extensions wrap the name in user_type unlike class/struct/enum declarations
+(class_declaration "extension" name: (user_type (type_identifier) @heritage.class)
+  (inheritance_specifier inherits_from: (user_type (type_identifier) @heritage.extends))) @heritage
 `;
 
 // COBOL queries - works with tree-sitter-cobol
@@ -629,6 +731,7 @@ export const LANGUAGE_QUERIES: Record<SupportedLanguages, string> = {
   [SupportedLanguages.Go]: GO_QUERIES,
   [SupportedLanguages.CPlusPlus]: CPP_QUERIES,
   [SupportedLanguages.CSharp]: CSHARP_QUERIES,
+  [SupportedLanguages.Ruby]: RUBY_QUERIES,
   [SupportedLanguages.Rust]: RUST_QUERIES,
   [SupportedLanguages.PHP]: PHP_QUERIES,
   [SupportedLanguages.Kotlin]: KOTLIN_QUERIES,

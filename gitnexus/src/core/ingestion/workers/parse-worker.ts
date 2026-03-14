@@ -4,10 +4,22 @@ import { SupportedLanguages } from '../../../config/supported-languages.js';
 import { LANGUAGE_QUERIES } from '../tree-sitter-queries.js';
 import { getTreeSitterBufferSize, TREE_SITTER_MAX_BUFFER } from '../constants.js';
 import { preprocessCobolSource, extractCobolSymbolsWithRegex } from '../cobol-preprocessor.js';
-import { findSiblingChild, getLanguageFromFilename, getLanguageFromPath, FUNCTION_NODE_TYPES, extractFunctionName, isBuiltInOrNoise, DEFINITION_CAPTURE_KEYS, getDefinitionNodeFromCaptures } from '../utils.js';
-import { isNodeExported } from '../export-detection.js';
-import { detectFrameworkFromAST } from '../framework-detection.js';
-import { generateId } from '../../../lib/utils.js';
+import {
+  getLanguageFromFilename,
+  getLanguageFromPath,
+  FUNCTION_NODE_TYPES,
+  extractFunctionName,
+  isBuiltInOrNoise,
+  DEFINITION_CAPTURE_KEYS,
+  getDefinitionNodeFromCaptures,
+  findEnclosingClassId,
+  extractMethodSignature,
+  countCallArguments,
+  inferCallForm,
+  extractReceiverName,
+  findSiblingChild
+} from '../utils.js';
+import { buildTypeEnv, lookupTypeEnv } from '../type-env.js';
 
 // ============================================================================
 // Lazy tree-sitter loading — skip native modules for COBOL-only repos
@@ -40,6 +52,7 @@ const ensureTreeSitterLoaded = (): void => {
   const Rust = _require('tree-sitter-rust');
   const Kotlin = _require('tree-sitter-kotlin');
   const PHP = _require('tree-sitter-php');
+  const Ruby = _require('tree-sitter-ruby');
 
   let Swift: any = null;
   try { Swift = _require('tree-sitter-swift'); } catch {}
@@ -59,6 +72,7 @@ const ensureTreeSitterLoaded = (): void => {
     [SupportedLanguages.Rust]: Rust,
     [SupportedLanguages.Kotlin]: Kotlin,
     [SupportedLanguages.PHP]: PHP.php_only,
+    [SupportedLanguages.Ruby]: Ruby,
     ...(Swift ? { [SupportedLanguages.Swift]: Swift } : {}),
     ...(COBOL ? { [SupportedLanguages.COBOL]: COBOL } : {}),
   };
@@ -68,6 +82,12 @@ const ensureTreeSitterLoaded = (): void => {
 if (!isCobolOnlyMode) {
   ensureTreeSitterLoaded();
 }
+import { isNodeExported } from '../export-detection.js';
+import { detectFrameworkFromAST } from '../framework-detection.js';
+import { generateId } from '../../../lib/utils.js';
+import { extractNamedBindings } from '../named-binding-extraction.js';
+import { appendKotlinWildcard } from '../resolvers/index.js';
+import { callRouters } from '../call-routing.js';
 
 // ============================================================================
 // Types for serializable results
@@ -81,11 +101,13 @@ interface ParsedNode {
     filePath: string;
     startLine: number;
     endLine: number;
-    language: string;
+    language: SupportedLanguages;
     isExported: boolean;
     astFrameworkMultiplier?: number;
     astFrameworkReason?: string;
     description?: string;
+    parameterCount?: number;
+    returnType?: string;
   };
 }
 
@@ -103,12 +125,16 @@ interface ParsedSymbol {
   name: string;
   nodeId: string;
   type: string;
+  parameterCount?: number;
+  ownerId?: string;
 }
 
 export interface ExtractedImport {
   filePath: string;
   rawImportPath: string;
-  language: string;
+  language: SupportedLanguages;
+  /** Named bindings from the import (e.g., import {User as U} → [{local:'U', exported:'User'}]) */
+  namedBindings?: { local: string; exported: string }[];
 }
 
 export interface ExtractedCall {
@@ -116,13 +142,20 @@ export interface ExtractedCall {
   calledName: string;
   /** generateId of enclosing function, or generateId('File', filePath) for top-level */
   sourceId: string;
+  argCount?: number;
+  /** Discriminates free function calls from member/constructor calls */
+  callForm?: 'free' | 'member' | 'constructor';
+  /** Simple identifier of the receiver for member calls (e.g., 'user' in user.save()) */
+  receiverName?: string;
+  /** Resolved type name of the receiver (e.g., 'User' for user.save() when user: User) */
+  receiverTypeName?: string;
 }
 
 export interface ExtractedHeritage {
   filePath: string;
   className: string;
   parentName: string;
-  /** 'extends' | 'implements' | 'trait-impl' */
+  /** 'extends' | 'implements' | 'trait-impl' | 'include' | 'extend' | 'prepend' */
   kind: string;
 }
 
@@ -152,6 +185,248 @@ export interface ParseWorkerInput {
   path: string;
   content: string;
 }
+
+// ============================================================================
+// COBOL regex-only processing (tree-sitter hangs on pathological files)
+// ============================================================================
+
+// ---------------------------------------------------------------------------
+// COBOL deep indexing helpers (shared by processCobolRegexOnly)
+// ---------------------------------------------------------------------------
+
+/** Emit a node + DEFINES relationship + symbol entry in one call. */
+const emitCobolNode = (
+  result: ParseWorkerResult,
+  label: string,
+  nodeId: string,
+  name: string,
+  filePath: string,
+  line: number,
+  fileId: string,
+  opts?: { isExported?: boolean; description?: string },
+): void => {
+  result.nodes.push({
+    id: nodeId, label,
+    properties: {
+      name, filePath, startLine: line, endLine: line,
+      language: SupportedLanguages.COBOL,
+      isExported: opts?.isExported ?? false,
+      ...(opts?.description ? { description: opts.description } : {}),
+    },
+  });
+  result.relationships.push({
+    id: generateId('DEFINES', `${fileId}->${nodeId}`),
+    sourceId: fileId, targetId: nodeId, type: 'DEFINES', confidence: 1.0, reason: '',
+  });
+  result.symbols.push({ filePath, name, nodeId, type: label });
+};
+
+/** Emit a relationship (non-DEFINES). */
+const emitCobolRel = (
+  result: ParseWorkerResult,
+  type: string,
+  sourceId: string,
+  targetId: string,
+  confidence = 1.0,
+  reason = '',
+): void => {
+  result.relationships.push({
+    id: generateId(type, `${sourceId}->${targetId}`),
+    sourceId, targetId, type, confidence, reason,
+  });
+};
+
+/** Build a description string from key-value parts, skipping undefined values. */
+const buildDesc = (parts: Array<[string, string | number | undefined]>): string => {
+  return parts.filter(([, v]) => v !== undefined).map(([k, v]) => `${k}:${v}`).join(' ');
+};
+
+/** Get the node label for a data item based on its level number. */
+const dataItemLabel = (level: number): string =>
+  level === 1 || level === 0o1 ? 'Record' : 'Property';
+
+const processCobolRegexOnly = (file: ParseWorkerInput, result: ParseWorkerResult): void => {
+  const regexResults = extractCobolSymbolsWithRegex(file.content, file.path);
+  const fileId = generateId('File', file.path);
+
+  if (regexResults.programName) {
+    const nodeId = generateId('Module', `${file.path}:${regexResults.programName}`);
+    const metaDesc = buildDesc([
+      ['author', regexResults.programMetadata.author],
+      ['date', regexResults.programMetadata.dateWritten],
+    ]);
+    result.nodes.push({
+      id: nodeId, label: 'Module',
+      properties: {
+        name: regexResults.programName, filePath: file.path, startLine: 0, endLine: 0,
+        language: SupportedLanguages.COBOL, isExported: true,
+        ...(metaDesc ? { description: metaDesc } : {}),
+      },
+    });
+    result.relationships.push({
+      id: generateId('DEFINES', `${fileId}->${nodeId}`),
+      sourceId: fileId, targetId: nodeId, type: 'DEFINES', confidence: 1.0, reason: '',
+    });
+    result.symbols.push({ filePath: file.path, name: regexResults.programName, nodeId, type: 'Module' });
+  }
+
+  const moduleId = regexResults.programName
+    ? generateId('Module', `${file.path}:${regexResults.programName}`)
+    : fileId;
+
+  for (const para of regexResults.paragraphs) {
+    const nodeId = generateId('Function', `${file.path}:${para.name}`);
+    emitCobolNode(result, 'Function', nodeId, para.name, file.path, para.line, fileId, { isExported: true });
+  }
+
+  for (const sec of regexResults.sections) {
+    const nodeId = generateId('Namespace', `${file.path}:${sec.name}`);
+    emitCobolNode(result, 'Namespace', nodeId, sec.name, file.path, sec.line, fileId, { isExported: true });
+  }
+
+  for (const copy of regexResults.copies) {
+    result.imports.push({ filePath: file.path, rawImportPath: copy.target, language: SupportedLanguages.COBOL });
+  }
+
+  for (const call of regexResults.calls) {
+    if (!isBuiltInOrNoise(call.target)) {
+      result.calls.push({ filePath: file.path, calledName: call.target, sourceId: fileId });
+    }
+  }
+
+  for (const perf of regexResults.performs) {
+    if (!isBuiltInOrNoise(perf.target)) {
+      const sourceId = perf.caller
+        ? generateId('Function', `${file.path}:${perf.caller}`)
+        : fileId;
+      result.calls.push({ filePath: file.path, calledName: perf.target, sourceId });
+    }
+  }
+
+  const MAX_DATA_ITEMS_PER_FILE = 500;
+  const cappedDataItems = regexResults.dataItems.length > MAX_DATA_ITEMS_PER_FILE
+    ? regexResults.dataItems.slice(0, MAX_DATA_ITEMS_PER_FILE)
+    : regexResults.dataItems;
+
+  for (const item of cappedDataItems) {
+    if (item.values) {
+      const nodeId = generateId('Const', `${file.path}:${item.name}`);
+      const desc = `level:88 values:${item.values.join(',')}`;
+      emitCobolNode(result, 'Const', nodeId, item.name, file.path, item.line, fileId, { description: desc });
+    } else if (item.level === 1) {
+      const nodeId = generateId('Record', `${file.path}:${item.name}`);
+      const desc = buildDesc([['level', '01'], ['pic', item.pic], ['usage', item.usage], ['occurs', item.occurs], ['section', item.section]]);
+      emitCobolNode(result, 'Record', nodeId, item.name, file.path, item.line, fileId, { description: desc });
+      if (item.redefines) emitCobolRel(result, 'REDEFINES', nodeId, generateId('Record', `${file.path}:${item.redefines}`));
+    } else {
+      const nodeId = generateId('Property', `${file.path}:${item.name}`);
+      const desc = buildDesc([['level', String(item.level).padStart(2, '0')], ['pic', item.pic], ['usage', item.usage], ['occurs', item.occurs], ['section', item.section]]);
+      emitCobolNode(result, 'Property', nodeId, item.name, file.path, item.line, fileId, { description: desc });
+      if (item.redefines) emitCobolRel(result, 'REDEFINES', nodeId, generateId('Property', `${file.path}:${item.redefines}`));
+    }
+  }
+
+  const parentStack: Array<{ level: number; nodeId: string }> = [];
+  for (const item of cappedDataItems) {
+    if (item.values) continue;
+    const label = dataItemLabel(item.level);
+    const nodeId = generateId(label, `${file.path}:${item.name}`);
+    while (parentStack.length > 0 && parentStack[parentStack.length - 1].level >= item.level) parentStack.pop();
+    if (parentStack.length > 0) emitCobolRel(result, 'CONTAINS', parentStack[parentStack.length - 1].nodeId, nodeId);
+    else emitCobolRel(result, 'CONTAINS', moduleId, nodeId);
+    parentStack.push({ level: item.level, nodeId });
+  }
+
+  for (let i = 0; i < cappedDataItems.length; i++) {
+    const item = cappedDataItems[i];
+    if (!item.values) continue;
+    for (let j = i - 1; j >= 0; j--) {
+      if (!cappedDataItems[j].values) {
+        const parentLabel = dataItemLabel(cappedDataItems[j].level);
+        const parentId = generateId(parentLabel, `${file.path}:${cappedDataItems[j].name}`);
+        emitCobolRel(result, 'CONTAINS', parentId, generateId('Const', `${file.path}:${item.name}`));
+        break;
+      }
+    }
+  }
+
+  for (const fd of regexResults.fileDeclarations) {
+    const nodeId = generateId('CodeElement', `${file.path}:SELECT:${fd.selectName}`);
+    const descParts = ['select'];
+    if (fd.organization) descParts.push(`org:${fd.organization}`);
+    if (fd.access) descParts.push(`access:${fd.access}`);
+    if (fd.recordKey) descParts.push(`key:${fd.recordKey}`);
+    if (fd.fileStatus) descParts.push(`status:${fd.fileStatus}`);
+    if (fd.assignTo) descParts.push(`assign:${fd.assignTo}`);
+    emitCobolNode(result, 'CodeElement', nodeId, fd.selectName, file.path, fd.line, fileId, { description: descParts.join(' ') });
+    if (fd.recordKey) emitCobolRel(result, 'RECORD_KEY_OF', generateId('Property', `${file.path}:${fd.recordKey}`), nodeId, 0.8, 'select-clause');
+    if (fd.fileStatus) emitCobolRel(result, 'FILE_STATUS_OF', generateId('Property', `${file.path}:${fd.fileStatus}`), nodeId, 0.8, 'select-clause');
+  }
+
+  for (const fd of regexResults.fdEntries) {
+    const nodeId = generateId('CodeElement', `${file.path}:FD:${fd.fdName}`);
+    const fdDescParts = ['fd'];
+    if (fd.recordName) fdDescParts.push(`record:${fd.recordName}`);
+    emitCobolNode(result, 'CodeElement', nodeId, fd.fdName, file.path, fd.line, fileId, { description: fdDescParts.join(' ') });
+    if (fd.recordName) emitCobolRel(result, 'CONTAINS', nodeId, generateId('Record', `${file.path}:${fd.recordName}`));
+    emitCobolRel(result, 'CONTAINS', generateId('CodeElement', `${file.path}:SELECT:${fd.fdName}`), nodeId, 0.9, 'fd-select-link');
+  }
+
+  const emittedSqlIds = new Set<string>();
+  for (const sql of regexResults.execSqlBlocks) {
+    for (const table of sql.tables) {
+      const tableId = generateId('CodeElement', `${file.path}:sql-table:${table}`);
+      if (!emittedSqlIds.has(tableId)) {
+        emittedSqlIds.add(tableId);
+        emitCobolNode(result, 'CodeElement', tableId, table, file.path, sql.line, fileId, { description: `sql-table op:${sql.operation}` });
+      }
+      emitCobolRel(result, 'ACCESSES', moduleId, tableId, 0.9, 'exec-sql');
+    }
+    for (const cursor of sql.cursors) {
+      const cursorId = generateId('CodeElement', `${file.path}:sql-cursor:${cursor}`);
+      if (!emittedSqlIds.has(cursorId)) {
+        emittedSqlIds.add(cursorId);
+        emitCobolNode(result, 'CodeElement', cursorId, cursor, file.path, sql.line, fileId, { description: 'sql-cursor' });
+      }
+      emitCobolRel(result, 'ACCESSES', moduleId, cursorId, 0.9, 'exec-sql');
+    }
+  }
+
+  const emittedCicsIds = new Set<string>();
+  for (const cics of regexResults.execCicsBlocks) {
+    if (cics.mapName) {
+      const mapId = generateId('CodeElement', `${file.path}:cics-map:${cics.mapName}`);
+      if (!emittedCicsIds.has(mapId)) {
+        emittedCicsIds.add(mapId);
+        emitCobolNode(result, 'CodeElement', mapId, cics.mapName, file.path, cics.line, fileId, { description: `cics-map cmd:${cics.command}` });
+      }
+      emitCobolRel(result, 'ACCESSES', moduleId, mapId, 0.9, 'exec-cics');
+    }
+    if (cics.programName) result.calls.push({ filePath: file.path, calledName: cics.programName, sourceId: moduleId });
+    if (cics.transId) {
+      const transIdNode = generateId('CodeElement', `${file.path}:cics-transid:${cics.transId}`);
+      if (!emittedCicsIds.has(transIdNode)) {
+        emittedCicsIds.add(transIdNode);
+        emitCobolNode(result, 'CodeElement', transIdNode, cics.transId, file.path, cics.line, fileId, { description: `cics-transid cmd:${cics.command}` });
+      }
+      emitCobolRel(result, 'ACCESSES', moduleId, transIdNode, 0.9, 'exec-cics');
+    }
+  }
+
+  for (const paramName of regexResults.procedureUsing) {
+    emitCobolRel(result, 'RECEIVES', moduleId, generateId('Property', `${file.path}:${paramName}`), 0.8, 'procedure-using');
+  }
+
+  for (const entry of regexResults.entryPoints) {
+    const entryId = generateId('Constructor', `${file.path}:${entry.name}`);
+    const desc = entry.parameters.length > 0 ? `entry params:${entry.parameters.join(',')}` : 'entry';
+    emitCobolNode(result, 'Constructor', entryId, entry.name, file.path, entry.line, fileId, { description: desc });
+    emitCobolRel(result, 'CONTAINS', moduleId, entryId);
+    result.symbols.push({ filePath: file.path, name: entry.name, nodeId: entryId, type: 'Constructor' });
+  }
+
+  result.fileCount++;
+};
 
 const setLanguage = (language: SupportedLanguages, filePath: string): void => {
   ensureTreeSitterLoaded();
@@ -220,355 +495,6 @@ const getLabelFromCaptures = (captureMap: Record<string, any>): string | null =>
 
 // DEFINITION_CAPTURE_KEYS and getDefinitionNodeFromCaptures imported from ../utils.js
 
-/**
- * Append .* to a Kotlin import path if the AST has a wildcard_import sibling node.
- * Pure function — returns a new string without mutating the input.
- */
-const appendKotlinWildcard = (importPath: string, importNode: any): string => {
-  for (let i = 0; i < importNode.childCount; i++) {
-    if (importNode.child(i)?.type === 'wildcard_import') {
-      return importPath.endsWith('.*') ? importPath : `${importPath}.*`;
-    }
-  }
-  return importPath;
-};
-
-// ============================================================================
-// COBOL regex-only processing (tree-sitter hangs on pathological files)
-// ============================================================================
-
-// ---------------------------------------------------------------------------
-// COBOL deep indexing helpers (shared by processCobolRegexOnly)
-// ---------------------------------------------------------------------------
-
-/** Emit a node + DEFINES relationship + symbol entry in one call. */
-const emitCobolNode = (
-  result: ParseWorkerResult,
-  label: string,
-  nodeId: string,
-  name: string,
-  filePath: string,
-  line: number,
-  fileId: string,
-  opts?: { isExported?: boolean; description?: string },
-): void => {
-  result.nodes.push({
-    id: nodeId, label,
-    properties: {
-      name, filePath, startLine: line, endLine: line,
-      language: SupportedLanguages.COBOL,
-      isExported: opts?.isExported ?? false,
-      ...(opts?.description ? { description: opts.description } : {}),
-    },
-  });
-  result.relationships.push({
-    id: generateId('DEFINES', `${fileId}->${nodeId}`),
-    sourceId: fileId, targetId: nodeId, type: 'DEFINES', confidence: 1.0, reason: '',
-  });
-  result.symbols.push({ filePath, name, nodeId, type: label });
-};
-
-/** Emit a relationship (non-DEFINES). */
-const emitCobolRel = (
-  result: ParseWorkerResult,
-  type: string,
-  sourceId: string,
-  targetId: string,
-  confidence = 1.0,
-  reason = '',
-): void => {
-  result.relationships.push({
-    id: generateId(type, `${sourceId}->${targetId}`),
-    sourceId, targetId, type, confidence, reason,
-  });
-};
-
-/** Build a description string from key-value parts, skipping undefined values. */
-const buildDesc = (parts: Array<[string, string | number | undefined]>): string => {
-  return parts.filter(([, v]) => v !== undefined).map(([k, v]) => `${k}:${v}`).join(' ');
-};
-
-/** Get the node label for a data item based on its level number. */
-const dataItemLabel = (level: number): string =>
-  level === 1 || level === 0o1 ? 'Record' : 'Property';
-
-// ---------------------------------------------------------------------------
-// COBOL regex-only processing (tree-sitter hangs on pathological files)
-// ---------------------------------------------------------------------------
-
-const processCobolRegexOnly = (file: ParseWorkerInput, result: ParseWorkerResult): void => {
-  const regexResults = extractCobolSymbolsWithRegex(file.content, file.path);
-  const fileId = generateId('File', file.path);
-
-  // Program name → Module node (with metadata if available)
-  if (regexResults.programName) {
-    const nodeId = generateId('Module', `${file.path}:${regexResults.programName}`);
-    const metaDesc = buildDesc([
-      ['author', regexResults.programMetadata.author],
-      ['date', regexResults.programMetadata.dateWritten],
-    ]);
-    result.nodes.push({
-      id: nodeId, label: 'Module',
-      properties: {
-        name: regexResults.programName, filePath: file.path, startLine: 0, endLine: 0,
-        language: SupportedLanguages.COBOL, isExported: true,
-        ...(metaDesc ? { description: metaDesc } : {}),
-      },
-    });
-    result.relationships.push({
-      id: generateId('DEFINES', `${fileId}->${nodeId}`),
-      sourceId: fileId, targetId: nodeId, type: 'DEFINES', confidence: 1.0, reason: '',
-    });
-    result.symbols.push({ filePath: file.path, name: regexResults.programName, nodeId, type: 'Module' });
-  }
-
-  const moduleId = regexResults.programName
-    ? generateId('Module', `${file.path}:${regexResults.programName}`)
-    : fileId;
-
-  // Paragraphs → Function nodes
-  for (const para of regexResults.paragraphs) {
-    const nodeId = generateId('Function', `${file.path}:${para.name}`);
-    emitCobolNode(result, 'Function', nodeId, para.name, file.path, para.line, fileId, { isExported: true });
-  }
-
-  // Sections → Namespace nodes
-  for (const sec of regexResults.sections) {
-    const nodeId = generateId('Namespace', `${file.path}:${sec.name}`);
-    emitCobolNode(result, 'Namespace', nodeId, sec.name, file.path, sec.line, fileId, { isExported: true });
-  }
-
-  // COPY → imports
-  for (const copy of regexResults.copies) {
-    result.imports.push({ filePath: file.path, rawImportPath: copy.target, language: SupportedLanguages.COBOL });
-  }
-
-  // CALL → calls
-  for (const call of regexResults.calls) {
-    if (!isBuiltInOrNoise(call.target)) {
-      result.calls.push({ filePath: file.path, calledName: call.target, sourceId: fileId });
-    }
-  }
-
-  // PERFORM → calls (with caller context)
-  for (const perf of regexResults.performs) {
-    if (!isBuiltInOrNoise(perf.target)) {
-      const sourceId = perf.caller
-        ? generateId('Function', `${file.path}:${perf.caller}`)
-        : fileId;
-      result.calls.push({ filePath: file.path, calledName: perf.target, sourceId });
-    }
-  }
-
-  // =========================================================================
-  // Deep indexing: data items, file declarations, FD entries
-  // =========================================================================
-
-  // --- Data Items → Record / Property / Const nodes ---
-  // Cap to prevent copy-expansion explosion (see parsing-processor.ts for rationale).
-  const MAX_DATA_ITEMS_PER_FILE = 500;
-  const cappedDataItems = regexResults.dataItems.length > MAX_DATA_ITEMS_PER_FILE
-    ? regexResults.dataItems.slice(0, MAX_DATA_ITEMS_PER_FILE)
-    : regexResults.dataItems;
-
-  for (const item of cappedDataItems) {
-    if (item.values) {
-      // 88-level → Const node
-      const nodeId = generateId('Const', `${file.path}:${item.name}`);
-      const desc = `level:88 values:${item.values.join(',')}`;
-      emitCobolNode(result, 'Const', nodeId, item.name, file.path, item.line, fileId, { description: desc });
-    } else if (item.level === 1) {
-      // 01-level → Record node
-      const nodeId = generateId('Record', `${file.path}:${item.name}`);
-      const desc = buildDesc([
-        ['level', '01'], ['pic', item.pic], ['usage', item.usage],
-        ['occurs', item.occurs], ['section', item.section],
-      ]);
-      emitCobolNode(result, 'Record', nodeId, item.name, file.path, item.line, fileId, { description: desc });
-      if (item.redefines) {
-        emitCobolRel(result, 'REDEFINES', nodeId, generateId('Record', `${file.path}:${item.redefines}`));
-      }
-    } else {
-      // 02-49, 77 → Property node
-      const nodeId = generateId('Property', `${file.path}:${item.name}`);
-      const desc = buildDesc([
-        ['level', String(item.level).padStart(2, '0')], ['pic', item.pic],
-        ['usage', item.usage], ['occurs', item.occurs], ['section', item.section],
-      ]);
-      emitCobolNode(result, 'Property', nodeId, item.name, file.path, item.line, fileId, { description: desc });
-      if (item.redefines) {
-        emitCobolRel(result, 'REDEFINES', nodeId, generateId('Property', `${file.path}:${item.redefines}`));
-      }
-    }
-  }
-
-  // --- CONTAINS hierarchy from level structure ---
-  const parentStack: Array<{ level: number; nodeId: string }> = [];
-  for (const item of cappedDataItems) {
-    if (item.values) continue; // 88-level handled separately below
-
-    const label = dataItemLabel(item.level);
-    const nodeId = generateId(label, `${file.path}:${item.name}`);
-
-    // Pop stack until we find a parent with lower level number
-    while (parentStack.length > 0 && parentStack[parentStack.length - 1].level >= item.level) {
-      parentStack.pop();
-    }
-
-    if (parentStack.length > 0) {
-      emitCobolRel(result, 'CONTAINS', parentStack[parentStack.length - 1].nodeId, nodeId);
-    } else {
-      // Top-level (01 or 77): CONTAINS from Module
-      emitCobolRel(result, 'CONTAINS', moduleId, nodeId);
-    }
-
-    parentStack.push({ level: item.level, nodeId });
-  }
-
-  // 88-level Const → parent Property/Record via CONTAINS
-  for (let i = 0; i < cappedDataItems.length; i++) {
-    const item = cappedDataItems[i];
-    if (!item.values) continue;
-    // Find parent: the most recent non-88 item before this one
-    for (let j = i - 1; j >= 0; j--) {
-      if (!cappedDataItems[j].values) {
-        const parentLabel = dataItemLabel(cappedDataItems[j].level);
-        const parentId = generateId(parentLabel, `${file.path}:${cappedDataItems[j].name}`);
-        const constId = generateId('Const', `${file.path}:${item.name}`);
-        emitCobolRel(result, 'CONTAINS', parentId, constId);
-        break;
-      }
-    }
-  }
-
-  // --- File Declarations → CodeElement nodes ---
-  for (const fd of regexResults.fileDeclarations) {
-    const nodeId = generateId('CodeElement', `${file.path}:SELECT:${fd.selectName}`);
-    const descParts = ['select'];
-    if (fd.organization) descParts.push(`org:${fd.organization}`);
-    if (fd.access) descParts.push(`access:${fd.access}`);
-    if (fd.recordKey) descParts.push(`key:${fd.recordKey}`);
-    if (fd.fileStatus) descParts.push(`status:${fd.fileStatus}`);
-    if (fd.assignTo) descParts.push(`assign:${fd.assignTo}`);
-    emitCobolNode(result, 'CodeElement', nodeId, fd.selectName, file.path, fd.line, fileId, { description: descParts.join(' ') });
-
-    if (fd.recordKey) {
-      emitCobolRel(result, 'RECORD_KEY_OF', generateId('Property', `${file.path}:${fd.recordKey}`), nodeId, 0.8, 'select-clause');
-    }
-    if (fd.fileStatus) {
-      emitCobolRel(result, 'FILE_STATUS_OF', generateId('Property', `${file.path}:${fd.fileStatus}`), nodeId, 0.8, 'select-clause');
-    }
-  }
-
-  // --- FD Entries → CodeElement nodes ---
-  for (const fd of regexResults.fdEntries) {
-    const nodeId = generateId('CodeElement', `${file.path}:FD:${fd.fdName}`);
-    const fdDescParts = ['fd'];
-    if (fd.recordName) fdDescParts.push(`record:${fd.recordName}`);
-    emitCobolNode(result, 'CodeElement', nodeId, fd.fdName, file.path, fd.line, fileId, { description: fdDescParts.join(' ') });
-
-    // Link FD to its record layout (01-level) if found
-    if (fd.recordName) {
-      emitCobolRel(result, 'CONTAINS', nodeId, generateId('Record', `${file.path}:${fd.recordName}`));
-    }
-    // Link FD to SELECT (same file-name)
-    emitCobolRel(result, 'CONTAINS', generateId('CodeElement', `${file.path}:SELECT:${fd.fdName}`), nodeId, 0.9, 'fd-select-link');
-  }
-
-  // =========================================================================
-  // Phase 2: EXEC SQL blocks → CodeElement nodes + ACCESSES edges
-  // =========================================================================
-
-  const emittedSqlIds = new Set<string>();
-
-  for (const sql of regexResults.execSqlBlocks) {
-    for (const table of sql.tables) {
-      const tableId = generateId('CodeElement', `${file.path}:sql-table:${table}`);
-      if (!emittedSqlIds.has(tableId)) {
-        emittedSqlIds.add(tableId);
-        emitCobolNode(result, 'CodeElement', tableId, table, file.path, sql.line, fileId, {
-          description: `sql-table op:${sql.operation}`,
-        });
-      }
-      emitCobolRel(result, 'ACCESSES', moduleId, tableId, 0.9, 'exec-sql');
-    }
-
-    for (const cursor of sql.cursors) {
-      const cursorId = generateId('CodeElement', `${file.path}:sql-cursor:${cursor}`);
-      if (!emittedSqlIds.has(cursorId)) {
-        emittedSqlIds.add(cursorId);
-        emitCobolNode(result, 'CodeElement', cursorId, cursor, file.path, sql.line, fileId, {
-          description: 'sql-cursor',
-        });
-      }
-      emitCobolRel(result, 'ACCESSES', moduleId, cursorId, 0.9, 'exec-sql');
-    }
-  }
-
-  // =========================================================================
-  // Phase 2: EXEC CICS blocks → CodeElement nodes + ACCESSES/CALLS edges
-  // =========================================================================
-
-  const emittedCicsIds = new Set<string>();
-
-  for (const cics of regexResults.execCicsBlocks) {
-    if (cics.mapName) {
-      const mapId = generateId('CodeElement', `${file.path}:cics-map:${cics.mapName}`);
-      if (!emittedCicsIds.has(mapId)) {
-        emittedCicsIds.add(mapId);
-        emitCobolNode(result, 'CodeElement', mapId, cics.mapName, file.path, cics.line, fileId, {
-          description: `cics-map cmd:${cics.command}`,
-        });
-      }
-      emitCobolRel(result, 'ACCESSES', moduleId, mapId, 0.9, 'exec-cics');
-    }
-
-    if (cics.programName) {
-      result.calls.push({ filePath: file.path, calledName: cics.programName, sourceId: moduleId });
-    }
-
-    if (cics.transId) {
-      const transIdNode = generateId('CodeElement', `${file.path}:cics-transid:${cics.transId}`);
-      if (!emittedCicsIds.has(transIdNode)) {
-        emittedCicsIds.add(transIdNode);
-        emitCobolNode(result, 'CodeElement', transIdNode, cics.transId, file.path, cics.line, fileId, {
-          description: `cics-transid cmd:${cics.command}`,
-        });
-      }
-      emitCobolRel(result, 'ACCESSES', moduleId, transIdNode, 0.9, 'exec-cics');
-    }
-  }
-
-  // =========================================================================
-  // Phase 3: PROCEDURE DIVISION USING → RECEIVES edges
-  // =========================================================================
-
-  for (const paramName of regexResults.procedureUsing) {
-    const propId = generateId('Property', `${file.path}:${paramName}`);
-    emitCobolRel(result, 'RECEIVES', moduleId, propId, 0.8, 'procedure-using');
-  }
-
-  // =========================================================================
-  // Phase 3: ENTRY points → Constructor nodes
-  // =========================================================================
-
-  for (const entry of regexResults.entryPoints) {
-    const entryId = generateId('Constructor', `${file.path}:${entry.name}`);
-    const desc = entry.parameters.length > 0 ? `entry params:${entry.parameters.join(',')}` : 'entry';
-    emitCobolNode(result, 'Constructor', entryId, entry.name, file.path, entry.line, fileId, {
-      description: desc,
-    });
-    emitCobolRel(result, 'CONTAINS', moduleId, entryId);
-    result.symbols.push({ filePath: file.path, name: entry.name, nodeId: entryId, type: 'Constructor' });
-  }
-
-  // NOTE: DATA_FLOW edges from MOVE statements are intentionally omitted.
-  // They are intra-file (Property → Property with file-scoped IDs), not in
-  // REL_TYPES, and generate O(moves × files) relationships that push the
-  // in-memory Map past V8's 16.7M limit on large COBOL repos.
-
-  result.fileCount++;
-};
 
 // ============================================================================
 // Process a batch of files
@@ -1165,13 +1091,9 @@ const processFileGroup = (
     // Skip files larger than the max tree-sitter buffer (32 MB)
     if (file.content.length > TREE_SITTER_MAX_BUFFER) continue;
 
-    const parseContent = language === SupportedLanguages.COBOL
-      ? preprocessCobolSource(file.content)
-      : file.content;
-
     let tree;
     try {
-      tree = parser.parse(parseContent, undefined, { bufferSize: getTreeSitterBufferSize(parseContent.length) });
+      tree = parser.parse(file.content, undefined, { bufferSize: getTreeSitterBufferSize(file.content.length) });
     } catch (err) {
       console.warn(`Failed to parse file ${file.path}: ${err instanceof Error ? err.message : String(err)}`);
       continue;
@@ -1179,6 +1101,10 @@ const processFileGroup = (
 
     result.fileCount++;
     onFileProcessed?.();
+
+    // Build per-file TypeEnv from explicit type annotations (for receiver resolution)
+    const typeEnv = buildTypeEnv(tree, language);
+    const callRouter = callRouters[language];
 
     let matches;
     try {
@@ -1199,10 +1125,12 @@ const processFileGroup = (
         const rawImportPath = language === SupportedLanguages.Kotlin
           ? appendKotlinWildcard(captureMap['import.source'].text.replace(/['"<>]/g, ''), captureMap['import'])
           : captureMap['import.source'].text.replace(/['"<>]/g, '');
+        const namedBindings = extractNamedBindings(captureMap['import'], language);
         result.imports.push({
           filePath: file.path,
           rawImportPath,
           language: language,
+          ...(namedBindings ? { namedBindings } : {}),
         });
         continue;
       }
@@ -1212,11 +1140,100 @@ const processFileGroup = (
         const callNameNode = captureMap['call.name'];
         if (callNameNode) {
           const calledName = callNameNode.text;
+
+          // Dispatch: route language-specific calls (heritage, properties, imports)
+          const routed = callRouter(calledName, captureMap['call']);
+          if (routed) {
+            if (routed.kind === 'skip') continue;
+
+            if (routed.kind === 'import') {
+              result.imports.push({
+                filePath: file.path,
+                rawImportPath: routed.importPath,
+                language,
+              });
+              continue;
+            }
+
+            if (routed.kind === 'heritage') {
+              for (const item of routed.items) {
+                result.heritage.push({
+                  filePath: file.path,
+                  className: item.enclosingClass,
+                  parentName: item.mixinName,
+                  kind: item.heritageKind,
+                });
+              }
+              continue;
+            }
+
+            if (routed.kind === 'properties') {
+              const propEnclosingClassId = findEnclosingClassId(captureMap['call'], file.path);
+              for (const item of routed.items) {
+                const nodeId = generateId('Property', `${file.path}:${item.propName}`);
+                result.nodes.push({
+                  id: nodeId,
+                  label: 'Property',
+                  properties: {
+                    name: item.propName,
+                    filePath: file.path,
+                    startLine: item.startLine,
+                    endLine: item.endLine,
+                    language,
+                    isExported: true,
+                    description: item.accessorType,
+                  },
+                });
+                result.symbols.push({
+                  filePath: file.path,
+                  name: item.propName,
+                  nodeId,
+                  type: 'Property',
+                  ...(propEnclosingClassId ? { ownerId: propEnclosingClassId } : {}),
+                });
+                const fileId = generateId('File', file.path);
+                const relId = generateId('DEFINES', `${fileId}->${nodeId}`);
+                result.relationships.push({
+                  id: relId,
+                  sourceId: fileId,
+                  targetId: nodeId,
+                  type: 'DEFINES',
+                  confidence: 1.0,
+                  reason: '',
+                });
+                if (propEnclosingClassId) {
+                  result.relationships.push({
+                    id: generateId('HAS_METHOD', `${propEnclosingClassId}->${nodeId}`),
+                    sourceId: propEnclosingClassId,
+                    targetId: nodeId,
+                    type: 'HAS_METHOD',
+                    confidence: 1.0,
+                    reason: '',
+                  });
+                }
+              }
+              continue;
+            }
+
+            // kind === 'call' — fall through to normal call processing below
+          }
+
           if (!isBuiltInOrNoise(calledName)) {
             const callNode = captureMap['call'];
             const sourceId = findEnclosingFunctionId(callNode, file.path)
               || generateId('File', file.path);
-            result.calls.push({ filePath: file.path, calledName, sourceId });
+            const callForm = inferCallForm(callNode, callNameNode);
+            const receiverName = callForm === 'member' ? extractReceiverName(callNameNode) : undefined;
+            const receiverTypeName = receiverName ? lookupTypeEnv(typeEnv, receiverName, callNode) : undefined;
+            result.calls.push({
+              filePath: file.path,
+              calledName,
+              sourceId,
+              argCount: countCallArguments(callNode),
+              ...(callForm !== undefined ? { callForm } : {}),
+              ...(receiverName !== undefined ? { receiverName } : {}),
+              ...(receiverTypeName !== undefined ? { receiverTypeName } : {}),
+            });
           }
         }
         continue;
@@ -1225,12 +1242,21 @@ const processFileGroup = (
       // Extract heritage (extends/implements)
       if (captureMap['heritage.class']) {
         if (captureMap['heritage.extends']) {
-          result.heritage.push({
-            filePath: file.path,
-            className: captureMap['heritage.class'].text,
-            parentName: captureMap['heritage.extends'].text,
-            kind: 'extends',
-          });
+          // Go struct embedding: the query matches ALL field_declarations with
+          // type_identifier, but only anonymous fields (no name) are embedded.
+          // Named fields like `Breed string` also match — skip them.
+          const extendsNode = captureMap['heritage.extends'];
+          const fieldDecl = extendsNode.parent;
+          const isNamedField = fieldDecl?.type === 'field_declaration'
+            && fieldDecl.childForFieldName('name');
+          if (!isNamedField) {
+            result.heritage.push({
+              filePath: file.path,
+              className: captureMap['heritage.class'].text,
+              parentName: captureMap['heritage.extends'].text,
+              kind: 'extends',
+            });
+          }
         }
         if (captureMap['heritage.implements']) {
           result.heritage.push({
@@ -1277,6 +1303,14 @@ const processFileGroup = (
         ? detectFrameworkFromAST(language, (definitionNode.text || '').slice(0, 300))
         : null;
 
+      let parameterCount: number | undefined;
+      let returnType: string | undefined;
+      if (nodeLabel === 'Function' || nodeLabel === 'Method' || nodeLabel === 'Constructor') {
+        const sig = extractMethodSignature(definitionNode);
+        parameterCount = sig.parameterCount;
+        returnType = sig.returnType;
+      }
+
       result.nodes.push({
         id: nodeId,
         label: nodeLabel,
@@ -1292,14 +1326,23 @@ const processFileGroup = (
             astFrameworkReason: frameworkHint.reason,
           } : {}),
           ...(description !== undefined ? { description } : {}),
+          ...(parameterCount !== undefined ? { parameterCount } : {}),
+          ...(returnType !== undefined ? { returnType } : {}),
         },
       });
+
+      // Compute enclosing class for Method/Constructor/Property/Function — used for both ownerId and HAS_METHOD
+      // Function is included because Kotlin/Rust/Python capture class methods as Function nodes
+      const needsOwner = nodeLabel === 'Method' || nodeLabel === 'Constructor' || nodeLabel === 'Property' || nodeLabel === 'Function';
+      const enclosingClassId = needsOwner ? findEnclosingClassId(nameNode || definitionNode, file.path) : null;
 
       result.symbols.push({
         filePath: file.path,
         name: nodeName,
         nodeId,
         type: nodeLabel,
+        ...(parameterCount !== undefined ? { parameterCount } : {}),
+        ...(enclosingClassId ? { ownerId: enclosingClassId } : {}),
       });
 
       const fileId = generateId('File', file.path);
@@ -1312,6 +1355,18 @@ const processFileGroup = (
         confidence: 1.0,
         reason: '',
       });
+
+      // ── HAS_METHOD: link method/constructor/property to enclosing class ──
+      if (enclosingClassId) {
+        result.relationships.push({
+          id: generateId('HAS_METHOD', `${enclosingClassId}->${nodeId}`),
+          sourceId: enclosingClassId,
+          targetId: nodeId,
+          type: 'HAS_METHOD',
+          confidence: 1.0,
+          reason: '',
+        });
+      }
     }
 
     // Extract Laravel routes from route files via procedural AST walk
@@ -1319,8 +1374,6 @@ const processFileGroup = (
       const extractedRoutes = extractLaravelRoutes(tree, file.path);
       result.routes.push(...extractedRoutes);
     }
-
-    // Note: COBOL is handled by processCobolRegexOnly in processBatch — no COBOL files reach here
   }
 };
 
@@ -1382,6 +1435,3 @@ parentPort!.on('message', (msg: any) => {
     parentPort!.postMessage({ type: 'error', error: message });
   }
 });
-
-// Signal that this worker is ready to receive work
-parentPort!.postMessage({ type: 'ready' });
