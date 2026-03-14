@@ -76,6 +76,14 @@ export type RelationshipType =
   | 'EXTENDS'
   | 'MEMBER_OF'
   | 'STEP_IN_PROCESS'
+  // COBOL deep indexing
+  | 'REDEFINES'
+  | 'RECORD_KEY_OF'
+  | 'FILE_STATUS_OF'
+  | 'ACCESSES'
+  | 'RECEIVES'
+  | 'DATA_FLOW'
+  | 'CONTRACTS'
 
 export interface GraphNode {
   id:  string,
