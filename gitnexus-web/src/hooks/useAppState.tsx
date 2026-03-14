@@ -586,8 +586,11 @@ export const AppStateProvider = ({ children }: { children: ReactNode }) => {
       return;
     }
 
-    // Resolve effective backend URL (explicit override takes priority over state)
-    const effectiveBackendUrl = overrideBackendUrl ?? serverBaseUrl ?? undefined;
+    // Resolve effective backend URL (explicit override takes priority over state).
+    // normalizeServerUrl() appends "/api" for server-connection.ts calls (e.g. baseUrl + "/repos"),
+    // but the worker constructs full paths itself (e.g. backendUrl + "/api/search"),
+    // so we must strip the trailing "/api" to avoid double-prefix "/api/api/...".
+    const effectiveBackendUrl = (overrideBackendUrl ?? serverBaseUrl ?? '').replace(/\/api$/, '') || undefined;
 
     // Bedrock CANNOT be called directly from the browser (AWS blocks CORS).
     // Always route through the backend proxy. Use the connected server URL if available,
