@@ -23,6 +23,14 @@ import { hybridSearch } from '../core/search/hybrid-search.js';
 // at server startup — crashes on unsupported Node ABI versions (#89)
 import { LocalBackend } from '../mcp/local/local-backend.js';
 import { mountMCPEndpoints } from './mcp-http.js';
+import type { DbConfig, NeptuneDbConfig } from '../core/db/interfaces.js';
+import { NeptuneAdapter } from '../core/db/neptune/neptune-adapter.js';
+
+/** Resolve DB config for a registry entry. Falls back to KuzuDB. */
+function getDbConfigFromEntry(entry: { storagePath: string; db?: DbConfig }): DbConfig {
+  if ((entry as any).db) return (entry as any).db;
+  return { type: 'kuzu', kuzuPath: path.join(entry.storagePath, 'kuzu') };
+}
 
 const buildGraph = async (): Promise<{ nodes: GraphNode[]; relationships: GraphRelationship[] }> => {
   const nodes: GraphNode[] = [];
@@ -139,6 +147,29 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
     return repos[0]; // default to first
   };
 
+  // ── /api/db/test — Test Neptune connectivity ───────────────────────
+  app.post('/api/db/test', async (req, res) => {
+    const { neptuneEndpoint, neptuneRegion, neptunePort } = req.body ?? {};
+
+    if (!neptuneEndpoint || !neptuneRegion) {
+      return res.status(400).json({ ok: false, error: 'neptuneEndpoint and neptuneRegion are required' });
+    }
+
+    const config: NeptuneDbConfig = {
+      type: 'neptune',
+      endpoint: neptuneEndpoint,
+      region: neptuneRegion,
+      port: typeof neptunePort === 'number' ? neptunePort : parseInt(neptunePort ?? '8182', 10),
+    };
+
+    try {
+      const result = await NeptuneAdapter.test(config);
+      return res.json({ ok: true, latencyMs: result.latencyMs });
+    } catch (err: any) {
+      return res.json({ ok: false, error: err.message ?? 'Connection failed' });
+    }
+  });
+
   // List all registered repos
   app.get('/api/repos', async (_req, res) => {
     try {
@@ -180,6 +211,73 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
         res.status(404).json({ error: 'Repository not found' });
         return;
       }
+
+      const dbConfig = getDbConfigFromEntry(entry);
+
+      // Neptune path
+      if (dbConfig.type === 'neptune') {
+        const adapter = new NeptuneAdapter(dbConfig);
+        try {
+          const nodes: GraphNode[] = [];
+          for (const table of NODE_TABLES) {
+            try {
+              let query = '';
+              if (table === 'File') {
+                query = `MATCH (n:File) RETURN n.id AS id, n.name AS name, n.filePath AS filePath, n.content AS content`;
+              } else if (table === 'Folder') {
+                query = `MATCH (n:Folder) RETURN n.id AS id, n.name AS name, n.filePath AS filePath`;
+              } else if (table === 'Community') {
+                query = `MATCH (n:Community) RETURN n.id AS id, n.label AS label, n.heuristicLabel AS heuristicLabel, n.cohesion AS cohesion, n.symbolCount AS symbolCount`;
+              } else if (table === 'Process') {
+                query = `MATCH (n:Process) RETURN n.id AS id, n.label AS label, n.heuristicLabel AS heuristicLabel, n.processType AS processType, n.stepCount AS stepCount, n.communities AS communities, n.entryPointId AS entryPointId, n.terminalId AS terminalId`;
+              } else {
+                query = `MATCH (n:\`${table}\`) RETURN n.id AS id, n.name AS name, n.filePath AS filePath, n.startLine AS startLine, n.endLine AS endLine, n.content AS content`;
+              }
+              const rows = await adapter.executeQuery(query);
+              for (const row of rows) {
+                nodes.push({
+                  id: (row.id ?? row[0]) as string,
+                  label: table as GraphNode['label'],
+                  properties: {
+                    name: row.name ?? row.label ?? row[1],
+                    filePath: row.filePath ?? row[2],
+                    startLine: row.startLine,
+                    endLine: row.endLine,
+                    content: row.content,
+                    heuristicLabel: row.heuristicLabel,
+                    cohesion: row.cohesion,
+                    symbolCount: row.symbolCount,
+                    processType: row.processType,
+                    stepCount: row.stepCount,
+                    communities: row.communities,
+                    entryPointId: row.entryPointId,
+                    terminalId: row.terminalId,
+                  } as GraphNode['properties'],
+                });
+              }
+            } catch { /* ignore empty labels */ }
+          }
+          const relRows = await adapter.executeQuery(
+            'MATCH (a)-[r:CodeRelation]->(b) RETURN a.id AS sourceId, b.id AS targetId, r.type AS type, r.confidence AS confidence, r.reason AS reason, r.step AS step'
+          );
+          const relationships: GraphRelationship[] = relRows.map(row => ({
+            id: `${row.sourceId}_${row.type}_${row.targetId}`,
+            type: row.type as GraphRelationship['type'],
+            sourceId: row.sourceId as string,
+            targetId: row.targetId as string,
+            confidence: row.confidence as number,
+            reason: row.reason as string,
+            step: row.step as number,
+          }));
+          await adapter.close();
+          return res.json({ nodes, relationships });
+        } catch (err: any) {
+          await adapter.close();
+          return res.status(500).json({ error: err.message || 'Failed to build graph' });
+        }
+      }
+
+      // KuzuDB path (default)
       const kuzuPath = path.join(entry.storagePath, 'kuzu');
       const graph = await withKuzuDb(kuzuPath, async () => buildGraph());
       res.json(graph);
@@ -202,6 +300,23 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
         res.status(404).json({ error: 'Repository not found' });
         return;
       }
+
+      const dbConfig = getDbConfigFromEntry(entry);
+
+      // Neptune path
+      if (dbConfig.type === 'neptune') {
+        const adapter = new NeptuneAdapter(dbConfig);
+        try {
+          const result = await adapter.executeQuery(cypher);
+          await adapter.close();
+          return res.json({ result });
+        } catch (err: any) {
+          await adapter.close();
+          return res.status(500).json({ error: err.message || 'Query failed' });
+        }
+      }
+
+      // KuzuDB path (default)
       const kuzuPath = path.join(entry.storagePath, 'kuzu');
       const result = await withKuzuDb(kuzuPath, () => executeQuery(cypher));
       res.json({ result });
@@ -224,12 +339,35 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
         res.status(404).json({ error: 'Repository not found' });
         return;
       }
-      const kuzuPath = path.join(entry.storagePath, 'kuzu');
+
       const parsedLimit = Number(req.body.limit ?? 10);
       const limit = Number.isFinite(parsedLimit)
         ? Math.max(1, Math.min(100, Math.trunc(parsedLimit)))
         : 10;
 
+      const dbConfig = getDbConfigFromEntry(entry);
+
+      // Neptune path — text-predicate fallback (no FTS indexes)
+      if (dbConfig.type === 'neptune') {
+        const adapter = new NeptuneAdapter(dbConfig);
+        try {
+          const rows = await adapter.executeParameterized(`
+            MATCH (n)
+            WHERE n.name CONTAINS $q OR n.filePath CONTAINS $q
+            RETURN n.id AS id, n.name AS name, labels(n)[0] AS type,
+                   n.filePath AS filePath, n.startLine AS startLine
+            LIMIT toInteger($limit)
+          `, { q: query, limit });
+          await adapter.close();
+          return res.json({ results: rows });
+        } catch (err: any) {
+          await adapter.close();
+          return res.status(500).json({ error: err.message || 'Search failed' });
+        }
+      }
+
+      // KuzuDB path (default)
+      const kuzuPath = path.join(entry.storagePath, 'kuzu');
       const results = await withKuzuDb(kuzuPath, async () => {
         const { isEmbedderReady } = await import('../core/embeddings/embedder.js');
         if (isEmbedderReady()) {

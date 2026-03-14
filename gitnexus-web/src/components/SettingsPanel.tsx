@@ -7,7 +7,8 @@ import {
   fetchOpenRouterModels,
 } from '../core/llm/settings-service';
 import type { LLMSettings, LLMProvider } from '../core/llm/types';
-import { testBedrockConnection, getBackendUrl } from '../services/backend';
+import { testBedrockConnection, testDbConnection, getBackendUrl } from '../services/backend';
+import { CypherConsole } from './CypherConsole';
 
 interface SettingsPanelProps {
   isOpen: boolean;
@@ -226,13 +227,29 @@ export const SettingsPanel = ({ isOpen, onClose, onSettingsSaved, backendUrl, is
   // Bedrock connection test state
   const [bedrockTestStatus, setBedrockTestStatus] = useState<'idle' | 'testing' | 'success' | 'error'>('idle');
   const [bedrockTestMessage, setBedrockTestMessage] = useState('');
+  // Database settings state
+  const [dbType, setDbType] = useState<'kuzu' | 'neptune'>('kuzu');
+  const [neptuneEndpoint, setNeptuneEndpoint] = useState('');
+  const [neptuneRegion, setNeptuneRegion] = useState('');
+  const [neptunePort, setNeptunePort] = useState('8182');
+  const [dbTestStatus, setDbTestStatus] = useState<'idle' | 'testing' | 'ok' | 'error'>('idle');
+  const [dbTestMessage, setDbTestMessage] = useState('');
+  const [showCypherConsole, setShowCypherConsole] = useState(false);
 
   // Load settings when panel opens
   useEffect(() => {
     if (isOpen) {
-      setSettings(loadSettings());
+      const s = loadSettings();
+      setSettings(s);
       setSaveStatus('idle');
       setOllamaError(null);
+      // Sync database state from persisted settings
+      setDbType(s.database?.type ?? 'kuzu');
+      setNeptuneEndpoint(s.database?.neptuneEndpoint ?? '');
+      setNeptuneRegion(s.database?.neptuneRegion ?? '');
+      setNeptunePort(String(s.database?.neptunePort ?? '8182'));
+      setDbTestStatus('idle');
+      setDbTestMessage('');
     }
   }, [isOpen]);
 
@@ -270,12 +287,49 @@ export const SettingsPanel = ({ isOpen, onClose, onSettingsSaved, backendUrl, is
 
   const handleSave = () => {
     try {
-      saveSettings(settings);
+      saveSettings({
+        ...settings,
+        database: {
+          type: dbType,
+          ...(dbType === 'neptune' ? {
+            neptuneEndpoint,
+            neptuneRegion,
+            neptunePort: parseInt(neptunePort) || 8182,
+          } : {}),
+        },
+      });
       setSaveStatus('saved');
       onSettingsSaved?.();
       setTimeout(() => setSaveStatus('idle'), 2000);
     } catch {
       setSaveStatus('error');
+    }
+  };
+
+  const handleTestNeptune = async () => {
+    if (!neptuneEndpoint || !neptuneRegion) {
+      setDbTestStatus('error');
+      setDbTestMessage('Endpoint and region are required');
+      return;
+    }
+    setDbTestStatus('testing');
+    setDbTestMessage('');
+    try {
+      const result = await testDbConnection({
+        neptuneEndpoint,
+        neptuneRegion,
+        neptunePort: parseInt(neptunePort) || 8182,
+      });
+      if (result.ok) {
+        setDbTestStatus('ok');
+        setDbTestMessage(`Connected (${result.latencyMs}ms)`);
+      } else {
+        setDbTestStatus('error');
+        setDbTestMessage(result.error || 'Connection failed');
+      }
+    } catch {
+      setDbTestStatus('error');
+      setDbTestMessage('Connection failed');
     }
   };
 
@@ -1074,6 +1128,109 @@ export const SettingsPanel = ({ isOpen, onClose, onSettingsSaved, backendUrl, is
               </div>
             </div>
           )}
+
+          {/* ── Database Backend ───────────────────────────────────────── */}
+          <div className="mt-6 pt-6 border-t border-border-subtle">
+            <h3 className="text-sm font-semibold text-text-primary mb-4">Database Backend</h3>
+
+            {/* DB Type selector */}
+            <div className="flex gap-2 mb-4">
+              <button
+                onClick={() => setDbType('kuzu')}
+                className={`flex-1 px-4 py-2.5 rounded-xl border-2 text-sm font-medium transition-all
+                  ${dbType === 'kuzu'
+                    ? 'border-accent bg-accent/10 text-text-primary'
+                    : 'border-border-subtle bg-elevated hover:border-accent/50 text-text-secondary'
+                  }`}
+              >
+                KuzuDB (Local)
+              </button>
+              <button
+                onClick={() => setDbType('neptune')}
+                className={`flex-1 px-4 py-2.5 rounded-xl border-2 text-sm font-medium transition-all
+                  ${dbType === 'neptune'
+                    ? 'border-accent bg-accent/10 text-text-primary'
+                    : 'border-border-subtle bg-elevated hover:border-accent/50 text-text-secondary'
+                  }`}
+              >
+                Neptune (AWS)
+              </button>
+            </div>
+
+            {/* Neptune config */}
+            {dbType === 'neptune' && (
+              <div className="space-y-3 animate-fade-in">
+                <div className="space-y-2">
+                  <label className="text-sm font-medium text-text-secondary">Neptune Endpoint</label>
+                  <input
+                    type="text"
+                    value={neptuneEndpoint}
+                    onChange={e => setNeptuneEndpoint(e.target.value)}
+                    placeholder="mydb.cluster-xxxxx.us-east-1.neptune.amazonaws.com"
+                    className="w-full px-4 py-3 bg-elevated border border-border-subtle rounded-xl text-text-primary placeholder:text-text-muted focus:border-accent focus:ring-2 focus:ring-accent/20 outline-none transition-all font-mono text-sm"
+                  />
+                </div>
+                <div className="grid grid-cols-2 gap-3">
+                  <div className="space-y-2">
+                    <label className="text-sm font-medium text-text-secondary">AWS Region</label>
+                    <input
+                      type="text"
+                      value={neptuneRegion}
+                      onChange={e => setNeptuneRegion(e.target.value)}
+                      placeholder="us-east-1"
+                      className="w-full px-4 py-3 bg-elevated border border-border-subtle rounded-xl text-text-primary placeholder:text-text-muted focus:border-accent focus:ring-2 focus:ring-accent/20 outline-none transition-all font-mono text-sm"
+                    />
+                  </div>
+                  <div className="space-y-2">
+                    <label className="text-sm font-medium text-text-secondary">Port</label>
+                    <input
+                      type="text"
+                      value={neptunePort}
+                      onChange={e => setNeptunePort(e.target.value)}
+                      placeholder="8182"
+                      className="w-full px-4 py-3 bg-elevated border border-border-subtle rounded-xl text-text-primary placeholder:text-text-muted focus:border-accent focus:ring-2 focus:ring-accent/20 outline-none transition-all font-mono text-sm"
+                    />
+                  </div>
+                </div>
+
+                {/* Test Connection */}
+                <div className="flex items-center gap-3">
+                  <button
+                    onClick={handleTestNeptune}
+                    disabled={dbTestStatus === 'testing' || !neptuneEndpoint || !neptuneRegion}
+                    className="px-4 py-2 bg-accent hover:bg-accent/80 disabled:opacity-50 text-white text-sm rounded-xl font-medium transition-colors"
+                  >
+                    {dbTestStatus === 'testing' ? 'Testing...' : 'Test Connection'}
+                  </button>
+                  {dbTestStatus === 'ok' && (
+                    <span className="text-green-400 text-sm">{dbTestMessage}</span>
+                  )}
+                  {dbTestStatus === 'error' && (
+                    <span className="text-red-400 text-sm">{dbTestMessage}</span>
+                  )}
+                </div>
+
+                {/* Graph Explorer info */}
+                <div className="p-3 bg-blue-500/10 border border-blue-500/30 rounded-xl mt-2">
+                  <p className="text-xs text-blue-300 leading-relaxed">
+                    <strong>AWS Graph Explorer:</strong> Deploy the open-source Graph Explorer alongside Neptune
+                    for visual graph exploration. See docs/neptune-setup.md for instructions.
+                  </p>
+                </div>
+              </div>
+            )}
+
+            {/* Cypher Console button */}
+            <button
+              onClick={() => setShowCypherConsole(true)}
+              className="mt-4 px-4 py-2 bg-elevated border border-border-subtle hover:border-accent/50 text-text-secondary hover:text-text-primary text-sm rounded-xl font-medium transition-all"
+            >
+              Open Cypher Console
+            </button>
+          </div>
+
+          {/* Cypher Console Modal */}
+          {showCypherConsole && <CypherConsole onClose={() => setShowCypherConsole(false)} />}
 
           {/* Privacy Note */}
           <div className="p-4 bg-elevated/50 border border-border-subtle rounded-xl">

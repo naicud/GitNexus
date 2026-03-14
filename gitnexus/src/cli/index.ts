@@ -28,6 +28,10 @@ program
   .option('--embeddings', 'Enable embedding generation for semantic search (off by default)')
   .option('--skills', 'Generate repo-specific skill files from detected communities')
    .option('-v, --verbose', 'Enable verbose ingestion warnings (default: false)')
+   .option('--db <type>', 'Database backend: kuzu (default) or neptune')
+   .option('--neptune-endpoint <host>', 'Neptune cluster endpoint hostname')
+   .option('--neptune-region <region>', 'AWS region for Neptune')
+   .option('--neptune-port <port>', 'Neptune HTTP port (default: 8182)')
    .action(createLazyAction(() => import('./analyze.js'), 'analyzeCommand'));
 
 program

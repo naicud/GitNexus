@@ -9,6 +9,7 @@
 import fs from 'fs/promises';
 import path from 'path';
 import os from 'os';
+import type { DbConfig } from '../core/db/interfaces.js';
 
 export interface RepoMeta {
   repoPath: string;
@@ -42,6 +43,8 @@ export interface RegistryEntry {
   indexedAt: string;
   lastCommit: string;
   stats?: RepoMeta['stats'];
+  /** DB backend config. If absent, defaults to KuzuDB at storagePath/kuzu (backwards compat) */
+  db?: DbConfig;
 }
 
 const GITNEXUS_DIR = '.gitnexus';
@@ -64,6 +67,18 @@ export const getStoragePaths = (repoPath: string) => {
     storagePath,
     kuzuPath: path.join(storagePath, 'kuzu'),
     metaPath: path.join(storagePath, 'meta.json'),
+  };
+};
+
+/**
+ * Get the database config for a registry entry.
+ * Falls back to KuzuDB at the standard path for old entries that predate Neptune support.
+ */
+export const getDbConfig = (entry: RegistryEntry): DbConfig => {
+  if (entry.db) return entry.db;
+  return {
+    type: 'kuzu',
+    kuzuPath: path.join(entry.storagePath, 'kuzu'),
   };
 };
 
@@ -195,7 +210,7 @@ const writeRegistry = async (entries: RegistryEntry[]): Promise<void> => {
  * Register (add or update) a repo in the global registry.
  * Called after `gitnexus analyze` completes.
  */
-export const registerRepo = async (repoPath: string, meta: RepoMeta): Promise<void> => {
+export const registerRepo = async (repoPath: string, meta: RepoMeta, db?: DbConfig): Promise<void> => {
   const resolved = path.resolve(repoPath);
   const name = path.basename(resolved);
   const { storagePath } = getStoragePaths(resolved);
@@ -216,6 +231,7 @@ export const registerRepo = async (repoPath: string, meta: RepoMeta): Promise<vo
     indexedAt: meta.indexedAt,
     lastCommit: meta.lastCommit,
     stats: meta.stats,
+    ...(db ? { db } : {}),
   };
 
   if (existing >= 0) {

@@ -19,6 +19,8 @@ import { getCurrentCommit, isGitRepo, getGitRoot } from '../storage/git.js';
 import { generateAIContextFiles } from './ai-context.js';
 import { generateSkillFiles, type GeneratedSkillInfo } from './skill-gen.js';
 import fs from 'fs/promises';
+import type { DbConfig, NeptuneDbConfig } from '../core/db/interfaces.js';
+import { loadGraphToNeptune, getNeptuneStats } from '../core/db/neptune/neptune-ingest.js';
 
 
 const HEAP_MB = 8192;
@@ -48,6 +50,10 @@ export interface AnalyzeOptions {
   embeddings?: boolean;
   skills?: boolean;
   verbose?: boolean;
+  db?: string;               // 'kuzu' | 'neptune'
+  neptuneEndpoint?: string;
+  neptuneRegion?: string;
+  neptunePort?: string;
 }
 
 /** Threshold: auto-skip embeddings for repos with more nodes than this */
@@ -64,10 +70,36 @@ const PHASE_LABELS: Record<string, string> = {
   processes: 'Detecting processes',
   complete: 'Pipeline complete',
   kuzu: 'Loading into KuzuDB',
+  neptune: 'Loading into Neptune',
   fts: 'Creating search indexes',
   embeddings: 'Generating embeddings',
   done: 'Done',
 };
+
+/**
+ * Resolve Neptune config from CLI options + env vars.
+ * Throws with a clear error if required fields are missing.
+ */
+function resolveNeptuneConfig(options: AnalyzeOptions): NeptuneDbConfig {
+  const endpoint = options.neptuneEndpoint
+    ?? process.env.GITNEXUS_NEPTUNE_ENDPOINT;
+  const region = options.neptuneRegion
+    ?? process.env.GITNEXUS_NEPTUNE_REGION
+    ?? process.env.AWS_REGION;
+  const port = parseInt(options.neptunePort ?? process.env.GITNEXUS_NEPTUNE_PORT ?? '8182', 10);
+
+  if (!endpoint) {
+    throw new Error(
+      'Neptune endpoint is required. Use --neptune-endpoint <host> or set GITNEXUS_NEPTUNE_ENDPOINT.'
+    );
+  }
+  if (!region) {
+    throw new Error(
+      'AWS region is required for Neptune. Use --neptune-region <region> or set AWS_REGION.'
+    );
+  }
+  return { type: 'neptune', endpoint, region, port };
+}
 
 export const analyzeCommand = async (
   inputPath?: string,
@@ -100,6 +132,26 @@ export const analyzeCommand = async (
     return;
   }
 
+  // Resolve DB backend
+  const dbTypeRaw = options?.db ?? process.env.GITNEXUS_DB_TYPE ?? 'kuzu';
+  const isNeptune = dbTypeRaw === 'neptune';
+  let neptuneConfig: NeptuneDbConfig | null = null;
+
+  if (isNeptune) {
+    try {
+      neptuneConfig = resolveNeptuneConfig(options ?? {});
+    } catch (e: any) {
+      console.log(`  ${e.message}\n`);
+      process.exitCode = 1;
+      return;
+    }
+  }
+
+  // Warn: embeddings not supported with Neptune in v1
+  if (isNeptune && options?.embeddings) {
+    console.log('  Warning: --embeddings is not supported with --db neptune in v1. Skipping embeddings.\n');
+  }
+
   const { storagePath, kuzuPath } = getStoragePaths(repoPath);
   const currentCommit = getCurrentCommit(repoPath);
   const existingMeta = await loadMeta(storagePath);
@@ -130,7 +182,7 @@ export const analyzeCommand = async (
     aborted = true;
     bar.stop();
     console.log('\n  Interrupted — cleaning up...');
-    closeKuzu().catch(() => {}).finally(() => process.exit(130));
+    (isNeptune ? Promise.resolve() : closeKuzu()).catch(() => {}).finally(() => process.exit(130));
   };
   process.on('SIGINT', sigintHandler);
 
@@ -181,7 +233,7 @@ export const analyzeCommand = async (
   let cachedEmbeddingNodeIds = new Set<string>();
   let cachedEmbeddings: Array<{ nodeId: string; embedding: number[] }> = [];
 
-  if (options?.embeddings && existingMeta && !options?.force) {
+  if (!isNeptune && options?.embeddings && existingMeta && !options?.force) {
     try {
       updateBar(0, 'Caching embeddings...');
       await initKuzu(kuzuPath);
@@ -209,43 +261,67 @@ export const analyzeCommand = async (
     updateBar(scaled, phaseLabel, detail);
   });
 
-  // ── Phase 2: KuzuDB (60–85%) ──────────────────────────────────────
-  updateBar(60, 'Loading into KuzuDB...');
+  // ── Phase 2: DB Loading (60–85%) ──────────────────────────────────
+  let dbTime: string;
+  let dbWarnings: string[] = [];
 
-  await closeKuzu();
-  const kuzuFiles = [kuzuPath, `${kuzuPath}.wal`, `${kuzuPath}.lock`];
-  for (const f of kuzuFiles) {
-    try { await fs.rm(f, { recursive: true, force: true }); } catch {}
+  const dbLabel = isNeptune ? 'Loading into Neptune...' : 'Loading into KuzuDB...';
+  updateBar(60, dbLabel);
+
+  if (isNeptune && neptuneConfig) {
+    // ── Neptune path ──────────────────────────────────────────────
+    const t0Neptune = Date.now();
+    let neptuneMsgCount = 0;
+    const neptuneResult = await loadGraphToNeptune(
+      pipelineResult.graph,
+      neptuneConfig,
+      (msg) => {
+        neptuneMsgCount++;
+        const progress = Math.min(84, 60 + Math.round((neptuneMsgCount / (neptuneMsgCount + 10)) * 24));
+        updateBar(progress, msg);
+      },
+    );
+    dbTime = ((Date.now() - t0Neptune) / 1000).toFixed(1);
+    dbWarnings = neptuneResult.warnings;
+  } else {
+    // ── KuzuDB path (existing, unchanged) ─────────────────────────
+    await closeKuzu();
+    const kuzuFiles = [kuzuPath, `${kuzuPath}.wal`, `${kuzuPath}.lock`];
+    for (const f of kuzuFiles) {
+      try { await fs.rm(f, { recursive: true, force: true }); } catch {}
+    }
+
+    const t0Kuzu = Date.now();
+    await initKuzu(kuzuPath);
+    let kuzuMsgCount = 0;
+    const kuzuResult = await loadGraphToKuzu(pipelineResult.graph, pipelineResult.repoPath, storagePath, (msg) => {
+      kuzuMsgCount++;
+      const progress = Math.min(84, 60 + Math.round((kuzuMsgCount / (kuzuMsgCount + 10)) * 24));
+      updateBar(progress, msg);
+    });
+    dbTime = ((Date.now() - t0Kuzu) / 1000).toFixed(1);
+    dbWarnings = kuzuResult.warnings;
   }
-
-  const t0Kuzu = Date.now();
-  await initKuzu(kuzuPath);
-  let kuzuMsgCount = 0;
-  const kuzuResult = await loadGraphToKuzu(pipelineResult.graph, pipelineResult.repoPath, storagePath, (msg) => {
-    kuzuMsgCount++;
-    const progress = Math.min(84, 60 + Math.round((kuzuMsgCount / (kuzuMsgCount + 10)) * 24));
-    updateBar(progress, msg);
-  });
-  const kuzuTime = ((Date.now() - t0Kuzu) / 1000).toFixed(1);
-  const kuzuWarnings = kuzuResult.warnings;
 
   // ── Phase 3: FTS (85–90%) ─────────────────────────────────────────
-  updateBar(85, 'Creating search indexes...');
-
   const t0Fts = Date.now();
-  try {
-    await createFTSIndex('File', 'file_fts', ['name', 'content']);
-    await createFTSIndex('Function', 'function_fts', ['name', 'content']);
-    await createFTSIndex('Class', 'class_fts', ['name', 'content']);
-    await createFTSIndex('Method', 'method_fts', ['name', 'content']);
-    await createFTSIndex('Interface', 'interface_fts', ['name', 'content']);
-  } catch (e: any) {
-    // Non-fatal — FTS is best-effort
+  if (!isNeptune) {
+    updateBar(85, 'Creating search indexes...');
+
+    try {
+      await createFTSIndex('File', 'file_fts', ['name', 'content']);
+      await createFTSIndex('Function', 'function_fts', ['name', 'content']);
+      await createFTSIndex('Class', 'class_fts', ['name', 'content']);
+      await createFTSIndex('Method', 'method_fts', ['name', 'content']);
+      await createFTSIndex('Interface', 'interface_fts', ['name', 'content']);
+    } catch (e: any) {
+      // Non-fatal — FTS is best-effort
+    }
   }
-  const ftsTime = ((Date.now() - t0Fts) / 1000).toFixed(1);
+  const ftsTime = isNeptune ? 'n/a' : ((Date.now() - t0Fts) / 1000).toFixed(1);
 
   // ── Phase 3.5: Re-insert cached embeddings ────────────────────────
-  if (cachedEmbeddings.length > 0) {
+  if (!isNeptune && cachedEmbeddings.length > 0) {
     updateBar(88, `Restoring ${cachedEmbeddings.length} cached embeddings...`);
     const EMBED_BATCH = 200;
     for (let i = 0; i < cachedEmbeddings.length; i += EMBED_BATCH) {
@@ -261,10 +337,16 @@ export const analyzeCommand = async (
   }
 
   // ── Phase 4: Embeddings (90–98%) ──────────────────────────────────
-  const stats = await getKuzuStats();
+  const stats = isNeptune && neptuneConfig
+    ? await getNeptuneStats(neptuneConfig)
+    : await getKuzuStats();
   let embeddingTime = '0.0';
   let embeddingSkipped = true;
   let embeddingSkipReason = 'off (use --embeddings to enable)';
+
+  if (isNeptune) {
+    embeddingSkipReason = 'not supported with Neptune (v1)';
+  }
 
   if (options?.embeddings) {
     if (stats.nodes > EMBEDDING_NODE_LIMIT) {
@@ -297,10 +379,12 @@ export const analyzeCommand = async (
 
   // Count embeddings in the index (cached + newly generated)
   let embeddingCount = 0;
-  try {
-    const embResult = await executeQuery(`MATCH (e:CodeEmbedding) RETURN count(e) AS cnt`);
-    embeddingCount = embResult?.[0]?.cnt ?? 0;
-  } catch { /* table may not exist if embeddings never ran */ }
+  if (!isNeptune) {
+    try {
+      const embResult = await executeQuery(`MATCH (e:CodeEmbedding) RETURN count(e) AS cnt`);
+      embeddingCount = embResult?.[0]?.cnt ?? 0;
+    } catch { /* table may not exist if embeddings never ran */ }
+  }
 
   const meta = {
     repoPath,
@@ -316,7 +400,10 @@ export const analyzeCommand = async (
     },
   };
   await saveMeta(storagePath, meta);
-  await registerRepo(repoPath, meta);
+  const dbConfig: DbConfig = isNeptune && neptuneConfig
+    ? neptuneConfig
+    : { type: 'kuzu', kuzuPath };
+  await registerRepo(repoPath, meta, dbConfig);
   await addToGitignore(repoPath);
 
   const projectName = path.basename(repoPath);
@@ -346,7 +433,9 @@ export const analyzeCommand = async (
     processes: pipelineResult.processResult?.stats.totalProcesses,
   }, generatedSkills);
 
-  await closeKuzu();
+  if (!isNeptune) {
+    await closeKuzu();
+  }
   // Note: we intentionally do NOT call disposeEmbedder() here.
   // ONNX Runtime's native cleanup segfaults on macOS and some Linux configs.
   // Since the process exits immediately after, Node.js reclaims everything.
@@ -367,7 +456,8 @@ export const analyzeCommand = async (
   const embeddingsCached = cachedEmbeddings.length > 0;
   console.log(`\n  Repository indexed successfully (${totalTime}s)${embeddingsCached ? ` [${cachedEmbeddings.length} embeddings cached]` : ''}\n`);
   console.log(`  ${stats.nodes.toLocaleString()} nodes | ${stats.edges.toLocaleString()} edges | ${pipelineResult.communityResult?.stats.totalCommunities || 0} clusters | ${pipelineResult.processResult?.stats.totalProcesses || 0} flows`);
-  console.log(`  KuzuDB ${kuzuTime}s | FTS ${ftsTime}s | Embeddings ${embeddingSkipped ? embeddingSkipReason : embeddingTime + 's'}`);
+  const dbLabel2 = isNeptune ? 'Neptune' : 'KuzuDB';
+  console.log(`  ${dbLabel2} ${dbTime}s | FTS ${ftsTime}s | Embeddings ${embeddingSkipped ? embeddingSkipReason : embeddingTime + 's'}`);
   console.log(`  ${repoPath}`);
 
   if (aiContext.files.length > 0) {
@@ -375,12 +465,12 @@ export const analyzeCommand = async (
   }
 
   // Show a quiet summary if some edge types needed fallback insertion
-  if (kuzuWarnings.length > 0) {
-    const totalFallback = kuzuWarnings.reduce((sum, w) => {
+  if (dbWarnings.length > 0) {
+    const totalFallback = dbWarnings.reduce((sum, w) => {
       const m = w.match(/\((\d+) edges\)/);
       return sum + (m ? parseInt(m[1]) : 0);
     }, 0);
-    console.log(`  Note: ${totalFallback} edges across ${kuzuWarnings.length} types inserted via fallback (schema will be updated in next release)`);
+    console.log(`  Note: ${totalFallback} edges across ${dbWarnings.length} types inserted via fallback (schema will be updated in next release)`);
   }
 
   try {

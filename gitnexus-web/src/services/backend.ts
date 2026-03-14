@@ -250,3 +250,32 @@ export const testBedrockConnection = async (config: {
   );
   return response.json() as Promise<{ ok: boolean; error?: string; model?: string; region?: string }>;
 };
+
+/**
+ * Test Neptune connection. Called from Settings panel.
+ */
+export const testDbConnection = async (params: {
+  neptuneEndpoint: string;
+  neptuneRegion: string;
+  neptunePort?: number;
+}): Promise<{ ok: boolean; latencyMs?: number; error?: string }> => {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 15_000);
+  try {
+    const res = await fetch(`${backendUrl}/api/db/test`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(params),
+      signal: controller.signal,
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ error: `HTTP ${res.status}` }));
+      return { ok: false, error: err.error ?? `HTTP ${res.status}` };
+    }
+    return res.json();
+  } catch (err: unknown) {
+    return { ok: false, error: err instanceof Error ? err.message : 'Connection failed' };
+  } finally {
+    clearTimeout(timeout);
+  }
+};
