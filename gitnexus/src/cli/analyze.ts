@@ -60,6 +60,7 @@ export interface AnalyzeOptions {
   embedDims?: string;
   embedEndpoint?: string;
   embedApiKey?: string;
+  yes?: boolean;
 }
 
 const PHASE_LABELS: Record<string, string> = {
@@ -142,6 +143,26 @@ export const analyzeCommand = async (
   inputPath?: string,
   options?: AnalyzeOptions
 ) => {
+  // ── TUI Wizard (runs before heap re-exec) ─────────────────────────
+  if (options && !(options as Record<string, unknown>)._tuiMerged) {
+    const { shouldRunInteractive, serializeToEnv, deserializeFromEnv } = await import('./tui/shared.js');
+
+    if (shouldRunInteractive(options as Record<string, unknown>)) {
+      const { runAnalyzeWizard } = await import('./tui/analyze-wizard.js');
+      const result = await runAnalyzeWizard(inputPath, options);
+      if (!result) return;
+      options = { ...options, ...result.options };
+      inputPath = result.path ?? inputPath;
+      serializeToEnv(result);
+    } else if (process.env.GITNEXUS_TUI_DONE === '1') {
+      // Re-exec child: merge wizard choices from env
+      const fromEnv = deserializeFromEnv();
+      if (fromEnv.tuiPath) inputPath = fromEnv.tuiPath;
+      options = { ...options, ...fromEnv };
+      (options as Record<string, unknown>)._tuiMerged = true;
+    }
+  }
+
   if (ensureHeap()) return;
 
   if (options?.verbose) {

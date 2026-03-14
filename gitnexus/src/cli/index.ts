@@ -37,6 +37,7 @@ program
    .option('--neptune-endpoint <host>', 'Neptune cluster endpoint hostname')
    .option('--neptune-region <region>', 'AWS region for Neptune')
    .option('--neptune-port <port>', 'Neptune HTTP port (default: 8182)')
+   .option('-y, --yes', 'Skip interactive prompts, use defaults/flags')
    .action(createLazyAction(() => import('./analyze.js'), 'analyzeCommand'));
 
 program
@@ -77,6 +78,7 @@ program
   .option('--api-key <key>', 'LLM API key (saved to ~/.gitnexus/config.json)')
   .option('--concurrency <n>', 'Parallel LLM calls (default: 3)', '3')
   .option('--gist', 'Publish wiki as a public GitHub Gist after generation')
+  .option('-y, --yes', 'Skip interactive prompts, use defaults/flags')
   .action(createLazyAction(() => import('./wiki.js'), 'wikiCommand'));
 
 program

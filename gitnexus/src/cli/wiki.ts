@@ -21,6 +21,7 @@ export interface WikiCommandOptions {
   apiKey?: string;
   concurrency?: string;
   gist?: boolean;
+  yes?: boolean;
 }
 
 /**
@@ -78,6 +79,19 @@ export const wikiCommand = async (
   inputPath?: string,
   options?: WikiCommandOptions,
 ) => {
+  // ── TUI Wizard ────────────────────────────────────────────────────
+  let wizardLLMConfig: { baseUrl: string; model: string; apiKey: string } | null = null;
+  {
+    const { shouldRunInteractive } = await import('./tui/shared.js');
+    if (options && shouldRunInteractive(options as Record<string, unknown>)) {
+      const { runWikiWizard } = await import('./tui/wiki-wizard.js');
+      const result = await runWikiWizard(inputPath, options);
+      if (!result) return;
+      options = { ...options, ...result.options };
+      wizardLLMConfig = result.llmConfig;
+    }
+  }
+
   console.log('\n  GitNexus Wiki Generator\n');
 
   // ── Resolve repo path ───────────────────────────────────────────────
@@ -127,15 +141,16 @@ export const wikiCommand = async (
   const hasSavedConfig = !!(savedConfig.apiKey && savedConfig.baseUrl);
   const hasCLIOverrides = !!(options?.apiKey || options?.model || options?.baseUrl);
 
-  let llmConfig = await resolveLLMConfig({
-    model: options?.model,
-    baseUrl: options?.baseUrl,
-    apiKey: options?.apiKey,
-  });
+  let llmConfig = wizardLLMConfig
+    ? { ...await resolveLLMConfig({}), ...wizardLLMConfig }
+    : await resolveLLMConfig({
+        model: options?.model,
+        baseUrl: options?.baseUrl,
+        apiKey: options?.apiKey,
+      });
 
-  // Run interactive setup if no saved config and no CLI flags provided
-  // (even if env vars exist — let user explicitly choose their provider)
-  if (!hasSavedConfig && !hasCLIOverrides) {
+  // Run interactive setup if no saved config, no CLI flags, and wizard didn't run
+  if (!wizardLLMConfig && !hasSavedConfig && !hasCLIOverrides) {
     if (!process.stdin.isTTY) {
       if (!llmConfig.apiKey) {
         console.log('  Error: No LLM API key found.');

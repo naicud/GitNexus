@@ -49,6 +49,7 @@
   },
   "dependencies": {
     "@aws-sdk/client-neptunedata": "^3.0.0",
+    "@clack/prompts": "^1.1.0",
     "@huggingface/transformers": "^3.0.0",
     "@modelcontextprotocol/sdk": "^1.0.0",
     "aws4fetch": "^1.0.20",
@@ -64,6 +65,7 @@
     "lru-cache": "^11.0.0",
     "mnemonist": "^0.39.0",
     "pandemonium": "^2.4.0",
+    "picocolors": "^1.1.1",
     "tree-sitter": "^0.21.0",
     "tree-sitter-c": "^0.21.0",
     "tree-sitter-c-sharp": "^0.21.0",
