@@ -122,6 +122,66 @@ Or use environment variables: `GITNEXUS_DB_TYPE=neptune`, `GITNEXUS_NEPTUNE_ENDP
 
 See [Neptune setup guide](../docs/neptune-setup.md) for full AWS configuration (VPC, IAM, security groups, SSH tunneling).
 
+## Semantic Search (Embeddings)
+
+By default, GitNexus uses BM25 full-text search. Add `--embeddings` to generate vector embeddings for semantic search — finds conceptually similar code, not just keyword matches.
+
+```bash
+gitnexus analyze --embeddings
+```
+
+### Embedding Providers
+
+| Provider | Model (default) | Dims | Requires |
+|----------|----------------|------|----------|
+| `local` | `snowflake-arctic-embed-xs` | 384 | Nothing (runs locally via transformers.js) |
+| `ollama` | `nomic-embed-text` | 768 | Ollama running locally or remotely |
+| `openai` | `text-embedding-3-small` | 1536 | API key |
+| `cohere` | `embed-english-light-v3.0` | 384 | API key |
+
+### Configuration
+
+CLI flags take priority over environment variables, which take priority over defaults.
+
+```bash
+# Local (default) — zero config, ~90MB model download on first run
+gitnexus analyze --embeddings
+
+# Ollama
+gitnexus analyze --embeddings \
+  --embed-provider ollama \
+  --embed-model nomic-embed-text \
+  --embed-dims 768
+
+# OpenAI
+gitnexus analyze --embeddings \
+  --embed-provider openai \
+  --embed-model text-embedding-3-small \
+  --embed-dims 1536 \
+  --embed-api-key sk-xxx
+
+# Cohere
+gitnexus analyze --embeddings \
+  --embed-provider cohere \
+  --embed-model embed-english-light-v3.0 \
+  --embed-dims 384 \
+  --embed-api-key xxx
+```
+
+### Environment Variables
+
+| Variable | Description |
+|----------|-------------|
+| `GITNEXUS_EMBED_PROVIDER` | Provider type: `local`, `ollama`, `openai`, `cohere` |
+| `GITNEXUS_EMBED_MODEL` | Model name |
+| `GITNEXUS_EMBED_DIMS` | Vector dimensions (must match the model) |
+| `GITNEXUS_EMBED_ENDPOINT` | API endpoint URL (override default) |
+| `GITNEXUS_EMBED_API_KEY` | API key (also reads `OPENAI_API_KEY` / `COHERE_API_KEY`) |
+
+See the [embeddings guide](../docs/embeddings.md) for detailed provider setup, GPU acceleration, and troubleshooting.
+
+> **Note:** Neptune does not support embeddings in v1. Embeddings are stored in KuzuDB only.
+
 ## MCP Tools
 
 Your AI agent gets these tools automatically:
@@ -164,6 +224,10 @@ gitnexus setup                    # Configure MCP for your editors (one-time)
 gitnexus analyze [path]           # Index a repository (or update stale index)
 gitnexus analyze --force          # Force full re-index
 gitnexus analyze --embeddings     # Enable embedding generation (slower, better search)
+gitnexus analyze --embeddings \   # Use a specific embedding provider
+  --embed-provider ollama \       #   ollama | openai | cohere | local
+  --embed-model nomic-embed-text \#   Model name
+  --embed-dims 768                #   Vector dimensions (must match model)
 gitnexus analyze --verbose        # Log skipped files when parsers are unavailable
 gitnexus analyze --db neptune \   # Use AWS Neptune backend
   --neptune-endpoint <host> \     # Neptune cluster endpoint
