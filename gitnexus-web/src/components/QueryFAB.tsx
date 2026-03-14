@@ -26,7 +26,7 @@ const EXAMPLE_QUERIES = [
 ];
 
 export const QueryFAB = () => {
-  const { setHighlightedNodeIds, setQueryResult, queryResult, clearQueryHighlights, graph, runQuery, isDatabaseReady } = useAppState();
+  const { setHighlightedNodeIds, setQueryResult, queryResult, clearQueryHighlights, graph, runQuery, isDatabaseReady, generateCypherQuery } = useAppState();
 
   const [isExpanded, setIsExpanded] = useState(false);
   const [query, setQuery] = useState('');
@@ -34,8 +34,12 @@ export const QueryFAB = () => {
   const [error, setError] = useState<string | null>(null);
   const [showExamples, setShowExamples] = useState(false);
   const [showResults, setShowResults] = useState(true);
+  const [showAIInput, setShowAIInput] = useState(false);
+  const [aiQuestion, setAIQuestion] = useState('');
+  const [isGenerating, setIsGenerating] = useState(false);
 
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const aiInputRef = useRef<HTMLInputElement>(null);
   const panelRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -43,6 +47,12 @@ export const QueryFAB = () => {
       textareaRef.current.focus();
     }
   }, [isExpanded]);
+
+  useEffect(() => {
+    if (showAIInput && aiInputRef.current) {
+      aiInputRef.current.focus();
+    }
+  }, [showAIInput]);
 
   useEffect(() => {
     const handleClickOutside = (e: MouseEvent) => {
@@ -151,9 +161,28 @@ export const QueryFAB = () => {
     textareaRef.current?.focus();
   };
 
+  const handleGenerateQuery = useCallback(async () => {
+    if (!aiQuestion.trim() || isGenerating) return;
+    setIsGenerating(true);
+    setError(null);
+
+    const result = await generateCypherQuery(aiQuestion.trim());
+
+    if ('error' in result) {
+      setError(result.error);
+    } else {
+      setQuery(result.query);
+      setShowAIInput(false);
+      setAIQuestion('');
+      textareaRef.current?.focus();
+    }
+    setIsGenerating(false);
+  }, [aiQuestion, isGenerating, generateCypherQuery]);
+
   const handleClose = () => {
     setIsExpanded(false);
     setShowExamples(false);
+    setShowAIInput(false);
     clearQueryHighlights();
     setError(null);
   };
@@ -244,46 +273,103 @@ export const QueryFAB = () => {
           />
         </div>
 
-        <div className="flex items-center justify-between mt-3">
-          <div className="relative">
-            <button
-              onClick={() => setShowExamples(!showExamples)}
+        {showAIInput && (
+          <div className="flex items-center gap-2 mt-2">
+            <input
+              ref={aiInputRef}
+              value={aiQuestion}
+              onChange={(e) => setAIQuestion(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleGenerateQuery(); }
+                if (e.key === 'Escape') { setShowAIInput(false); setAIQuestion(''); }
+              }}
+              placeholder="e.g. find all classes that extend BaseService"
+              disabled={isGenerating}
               className="
-                flex items-center gap-1.5 px-3 py-1.5
-                text-xs text-text-secondary
-                hover:text-text-primary hover:bg-hover
-                rounded-md transition-colors
+                flex-1 px-3 py-1.5
+                bg-surface border border-purple-500/30 rounded-lg
+                text-sm text-text-primary
+                placeholder:text-text-muted
+                focus:border-purple-500/50 focus:ring-2 focus:ring-purple-500/20
+                outline-none
+                disabled:opacity-50
+                transition-all
+              "
+            />
+            <button
+              onClick={handleGenerateQuery}
+              disabled={!aiQuestion.trim() || isGenerating}
+              className="
+                flex items-center gap-1 px-3 py-1.5
+                bg-gradient-to-r from-purple-500 to-pink-500
+                rounded-md text-white text-xs font-medium
+                shadow-[0_0_10px_rgba(168,85,247,0.3)]
+                hover:shadow-[0_0_15px_rgba(168,85,247,0.5)]
+                disabled:opacity-50 disabled:cursor-not-allowed disabled:shadow-none
+                transition-all
               "
             >
-              <Sparkles className="w-3.5 h-3.5" />
-              <span>Examples</span>
-              <ChevronDown className={`w-3.5 h-3.5 transition-transform ${showExamples ? 'rotate-180' : ''}`} />
+              {isGenerating ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Sparkles className="w-3.5 h-3.5" />}
             </button>
+          </div>
+        )}
 
-            {showExamples && (
-              <div className="
-                absolute bottom-full left-0 mb-2
-                w-64 py-1
-                bg-surface border border-border-subtle rounded-lg
-                shadow-xl
-                animate-fade-in
-              ">
-                {EXAMPLE_QUERIES.map((example) => (
-                  <button
-                    key={example.label}
-                    onClick={() => handleSelectExample(example.query)}
-                    className="
-                      w-full px-3 py-2 text-left
-                      text-sm text-text-secondary
-                      hover:bg-hover hover:text-text-primary
-                      transition-colors
-                    "
-                  >
-                    {example.label}
-                  </button>
-                ))}
-              </div>
-            )}
+        <div className="flex items-center justify-between mt-3">
+          <div className="flex items-center gap-1">
+            <div className="relative">
+              <button
+                onClick={() => { setShowExamples(!showExamples); setShowAIInput(false); }}
+                className="
+                  flex items-center gap-1.5 px-3 py-1.5
+                  text-xs text-text-secondary
+                  hover:text-text-primary hover:bg-hover
+                  rounded-md transition-colors
+                "
+              >
+                <ChevronDown className={`w-3.5 h-3.5 transition-transform ${showExamples ? 'rotate-180' : ''}`} />
+                <span>Examples</span>
+              </button>
+
+              {showExamples && (
+                <div className="
+                  absolute bottom-full left-0 mb-2
+                  w-64 py-1
+                  bg-surface border border-border-subtle rounded-lg
+                  shadow-xl
+                  animate-fade-in
+                ">
+                  {EXAMPLE_QUERIES.map((example) => (
+                    <button
+                      key={example.label}
+                      onClick={() => handleSelectExample(example.query)}
+                      className="
+                        w-full px-3 py-2 text-left
+                        text-sm text-text-secondary
+                        hover:bg-hover hover:text-text-primary
+                        transition-colors
+                      "
+                    >
+                      {example.label}
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            <button
+              onClick={() => { setShowAIInput(!showAIInput); setShowExamples(false); }}
+              className={`
+                flex items-center gap-1.5 px-3 py-1.5
+                text-xs
+                rounded-md transition-colors
+                ${showAIInput
+                  ? 'text-purple-400 bg-purple-500/10'
+                  : 'text-text-secondary hover:text-text-primary hover:bg-hover'}
+              `}
+            >
+              <Sparkles className="w-3.5 h-3.5" />
+              <span>AI</span>
+            </button>
           </div>
 
           <div className="flex items-center gap-2">

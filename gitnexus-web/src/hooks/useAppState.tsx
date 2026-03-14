@@ -160,6 +160,7 @@ interface AppState {
   sendChatMessage: (message: string) => Promise<void>;
   stopChatResponse: () => void;
   clearChat: () => void;
+  generateCypherQuery: (question: string) => Promise<{ query: string; explanation: string } | { error: string }>;
 
   // Code References Panel
   codeReferences: CodeReference[];
@@ -585,8 +586,11 @@ export const AppStateProvider = ({ children }: { children: ReactNode }) => {
       return;
     }
 
-    // Resolve effective backend URL (explicit override takes priority over state)
-    const effectiveBackendUrl = overrideBackendUrl ?? serverBaseUrl ?? undefined;
+    // Resolve effective backend URL (explicit override takes priority over state).
+    // normalizeServerUrl() appends "/api" for server-connection.ts calls (e.g. baseUrl + "/repos"),
+    // but the worker constructs full paths itself (e.g. backendUrl + "/api/search"),
+    // so we must strip the trailing "/api" to avoid double-prefix "/api/api/...".
+    const effectiveBackendUrl = (overrideBackendUrl ?? serverBaseUrl ?? '').replace(/\/api$/, '') || undefined;
 
     // Bedrock CANNOT be called directly from the browser (AWS blocks CORS).
     // Always route through the backend proxy. Use the connected server URL if available,
@@ -1017,6 +1021,12 @@ export const AppStateProvider = ({ children }: { children: ReactNode }) => {
     setAgentError(null);
   }, []);
 
+  const generateCypherQuery = useCallback(async (question: string): Promise<{ query: string; explanation: string } | { error: string }> => {
+    const api = apiRef.current;
+    if (!api) return { error: 'Worker not initialized' };
+    return api.generateCypherQuery(question);
+  }, []);
+
   // Switch to a different repo on the connected server
   const switchRepo = useCallback(async (repoName: string) => {
     if (!serverBaseUrl) return;
@@ -1214,6 +1224,7 @@ export const AppStateProvider = ({ children }: { children: ReactNode }) => {
     sendChatMessage,
     stopChatResponse,
     clearChat,
+    generateCypherQuery,
     // Code References Panel
     codeReferences,
     isCodePanelOpen,

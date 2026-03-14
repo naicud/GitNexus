@@ -56,22 +56,22 @@ interface BedrockTool {
 // ─── Message format conversion ──────────────────────────────────────────────
 
 function toBedrockMessages(messages: BaseMessage[]): {
-  system: Array<{ type: 'text'; text: string }>;
+  system: Array<{ text: string }>;
   messages: any[];
 } {
-  const system: Array<{ type: 'text'; text: string }> = [];
+  const system: Array<{ text: string }> = [];
   const out: any[] = [];
 
   for (const msg of messages) {
     const type = msg._getType();
 
     if (type === 'system') {
-      system.push({ type: 'text', text: String(msg.content) });
+      system.push({ text: String(msg.content) });
       continue;
     }
 
     if (type === 'human') {
-      const textBlock = { type: 'text' as const, text: String(msg.content) };
+      const textBlock = { text: String(msg.content) };
       const last = out[out.length - 1];
       if (last?.role === 'user') {
         // Merge into the previous user turn — Bedrock requires strictly alternating roles.
@@ -89,16 +89,17 @@ function toBedrockMessages(messages: BaseMessage[]): {
 
       // Text part
       if (ai.content && typeof ai.content === 'string' && ai.content.trim()) {
-        content.push({ type: 'text', text: ai.content });
+        content.push({ text: ai.content });
       }
 
-      // Tool calls → toolUse blocks
+      // Tool calls → nested toolUse blocks (Converse API format)
       for (const tc of ai.tool_calls ?? []) {
         content.push({
-          type: 'toolUse',
-          toolUseId: tc.id,
-          name: tc.name,
-          input: tc.args,
+          toolUse: {
+            toolUseId: tc.id,
+            name: tc.name,
+            input: tc.args,
+          },
         });
       }
 
@@ -110,12 +111,13 @@ function toBedrockMessages(messages: BaseMessage[]): {
 
     if (type === 'tool') {
       const tm = msg as ToolMessage;
-      // Bedrock expects tool results as a user message with toolResult blocks
+      // Bedrock expects tool results as a user message with nested toolResult blocks
       const last = out[out.length - 1];
       const resultBlock = {
-        type: 'toolResult',
-        toolUseId: tm.tool_call_id,
-        content: [{ type: 'text', text: String(tm.content) }],
+        toolResult: {
+          toolUseId: tm.tool_call_id,
+          content: [{ text: String(tm.content) }],
+        },
       };
       if (last?.role === 'user') {
         last.content.push(resultBlock);
@@ -147,12 +149,13 @@ function fromBedrockMessage(msg: any): AIMessage {
   const tool_calls: any[] = [];
 
   for (const block of msg.content ?? []) {
-    if (block.type === 'text') text += block.text;
-    if (block.type === 'toolUse') {
+    // Converse API uses nested format: { text: '...' } or { toolUse: { ... } }
+    if (block.text) text += block.text;
+    if (block.toolUse) {
       tool_calls.push({
-        id: block.toolUseId,
-        name: block.name,
-        args: block.input,
+        id: block.toolUse.toolUseId,
+        name: block.toolUse.name,
+        args: block.toolUse.input,
         type: 'tool_call' as const,
       });
     }
@@ -262,15 +265,31 @@ async function* parseNDJSON(
       for (const line of lines) {
         if (line.trim()) {
           try {
-            yield JSON.parse(line);
-          } catch { /* skip malformed line */ }
+            const parsed = JSON.parse(line);
+            // Handle error frames forwarded by the proxy server
+            if (parsed.__error) {
+              throw new Error(`Bedrock: ${parsed.__error.message || parsed.__error.type || 'stream error'}`);
+            }
+            yield parsed;
+          } catch (e) {
+            // Re-throw Bedrock errors, skip malformed JSON
+            if (e instanceof Error && e.message.startsWith('Bedrock:')) throw e;
+          }
         }
       }
     }
 
     // Process any remaining data
     if (buffer.trim()) {
-      try { yield JSON.parse(buffer); } catch { /* skip */ }
+      try {
+        const parsed = JSON.parse(buffer);
+        if (parsed.__error) {
+          throw new Error(`Bedrock: ${parsed.__error.message || parsed.__error.type || 'stream error'}`);
+        }
+        yield parsed;
+      } catch (e) {
+        if (e instanceof Error && e.message.startsWith('Bedrock:')) throw e;
+      }
     }
   } finally {
     reader.releaseLock();
@@ -285,7 +304,6 @@ export class ChatBedrockBrowser extends BaseChatModel {
   private modelId: string;
   private temperature: number;
   private maxTokens?: number;
-  private boundTools?: BedrockTool[];
   private credentials: BedrockCredentials;
   private proxyBaseUrl?: string;
   readonly streaming: boolean;
@@ -312,13 +330,11 @@ export class ChatBedrockBrowser extends BaseChatModel {
     return 'bedrock';
   }
 
-  bindTools(tools: StructuredToolInterface[]): this {
-    const bound = Object.create(this) as this;
-    (bound as any).boundTools = toBedrockTools(tools);
-    return bound;
+  bindTools(tools: StructuredToolInterface[]) {
+    return this.withConfig({ tools: toBedrockTools(tools) } as any);
   }
 
-  private buildBody(messages: BaseMessage[]): string {
+  private buildBody(messages: BaseMessage[], tools?: BedrockTool[]): string {
     const { system, messages: bedrockMessages } = toBedrockMessages(messages);
     const body: any = {
       messages: bedrockMessages,
@@ -328,31 +344,44 @@ export class ChatBedrockBrowser extends BaseChatModel {
       },
     };
     if (system.length > 0) body.system = system;
-    if (this.boundTools && this.boundTools.length > 0) {
-      body.toolConfig = { tools: this.boundTools };
+    if (tools && tools.length > 0) {
+      body.toolConfig = { tools };
     }
     return JSON.stringify(body);
   }
 
   private async proxyFetch(endpoint: 'converse' | 'converse-stream', bodyJson: string): Promise<Response> {
-    return fetch(`${this.proxyBaseUrl}/api/bedrock/${endpoint}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        region: this.region,
-        credentials: this.credentials,
-        model: this.modelId,
-        body: JSON.parse(bodyJson),
-      }),
-    });
+    // Timeout for getting initial response headers (not the stream body)
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 180_000); // 3 minutes
+    try {
+      const resp = await fetch(`${this.proxyBaseUrl}/api/bedrock/${endpoint}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          region: this.region,
+          credentials: this.credentials,
+          model: this.modelId,
+          body: JSON.parse(bodyJson),
+        }),
+        signal: controller.signal,
+      });
+      clearTimeout(timeout);
+      return resp;
+    } catch (err: any) {
+      clearTimeout(timeout);
+      if (err.name === 'AbortError') throw new Error('Bedrock proxy request timed out');
+      throw err;
+    }
   }
 
   async _generate(
     messages: BaseMessage[],
-    _options: BaseChatModelCallOptions,
+    options: BaseChatModelCallOptions,
     _runManager?: CallbackManagerForLLMRun
   ): Promise<ChatResult> {
-    const bodyJson = this.buildBody(messages);
+    const tools = (options as any).tools as BedrockTool[] | undefined;
+    const bodyJson = this.buildBody(messages, tools);
     let resp: Response;
 
     if (this.proxyBaseUrl) {
@@ -382,10 +411,11 @@ export class ChatBedrockBrowser extends BaseChatModel {
 
   async *_streamResponseChunks(
     messages: BaseMessage[],
-    _options: BaseChatModelCallOptions,
+    options: BaseChatModelCallOptions,
     runManager?: CallbackManagerForLLMRun
   ): AsyncGenerator<ChatGenerationChunk> {
-    const bodyJson = this.buildBody(messages);
+    const tools = (options as any).tools as BedrockTool[] | undefined;
+    const bodyJson = this.buildBody(messages, tools);
     let resp: Response;
 
     if (this.proxyBaseUrl) {
@@ -416,7 +446,7 @@ export class ChatBedrockBrowser extends BaseChatModel {
       if (event.contentBlockDelta?.delta?.text) {
         const text: string = event.contentBlockDelta.delta.text;
         await runManager?.handleLLMNewToken(text);
-        yield new ChatGenerationChunk({ text, message: new AIMessageChunk(text) });
+        yield new ChatGenerationChunk({ text, message: new AIMessageChunk({ content: text }) });
 
       } else if (event.contentBlockStart?.start?.toolUse) {
         const { contentBlockIndex } = event.contentBlockStart;
@@ -433,13 +463,21 @@ export class ChatBedrockBrowser extends BaseChatModel {
         const idx = event.contentBlockStop.contentBlockIndex;
         const acc = toolAccumulator[idx];
         if (acc) {
-          let args: Record<string, unknown> = {};
-          try { args = JSON.parse(acc.input); } catch { /* ignore */ }
-          const tool_calls = [{ id: acc.id, name: acc.name, args, type: 'tool_call' as const }];
-          yield new ChatGenerationChunk({
+          // Use tool_call_chunks (not tool_calls) so AIMessageChunk.concat() preserves them.
+          // tool_call_chunks use string args; the constructor converts to parsed tool_calls.
+          const tool_call_chunks = [{
+            id: acc.id,
+            name: acc.name,
+            args: acc.input,
+            index: idx,
+            type: 'tool_call_chunk' as const,
+          }];
+          const toolChunk = new ChatGenerationChunk({
             text: '',
-            message: new AIMessageChunk({ content: '', tool_calls }),
+            message: new AIMessageChunk({ content: '', tool_call_chunks }),
           });
+          await runManager?.handleLLMNewToken('', undefined, undefined, undefined, undefined, { chunk: toolChunk });
+          yield toolChunk;
           delete toolAccumulator[idx];
         }
 

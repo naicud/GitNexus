@@ -759,6 +759,96 @@ const workerApi = {
   },
 
   /**
+   * Generate a Cypher query from a natural language question using the current LLM
+   */
+  async generateCypherQuery(naturalLanguage: string): Promise<{ query: string; explanation: string } | { error: string }> {
+    if (!currentProviderConfig) {
+      return { error: 'No LLM provider configured. Please configure one in Settings.' };
+    }
+
+    try {
+      const model = createChatModel(currentProviderConfig);
+
+      const prompt = `You are a Cypher query generator for a code knowledge graph.
+
+## Graph Schema
+Nodes: File, Folder, Function, Class, Interface, Method, Community, Process
+- All nodes have: id (string), name (string), filePath (string)
+- Function/Method/Class also have: startLine (int), endLine (int)
+- Community has: heuristicLabel, cohesion, symbolCount, description, keywords
+
+Relations: CodeRelation with \`type\` property:
+- CONTAINS: Folder→File, File→Function/Class/Method
+- DEFINES: File→Function/Class/Interface
+- IMPORTS: File→File
+- CALLS: Function/Method→Function/Method (includes constructor injection)
+- EXTENDS: Class→Class
+- IMPLEMENTS: Class→Interface
+- MEMBER_OF: Function/Class→Community
+- STEP_IN_PROCESS: Function/Method→Process
+
+## Example Queries
+- All functions: MATCH (n:Function) RETURN n.name, n.filePath LIMIT 50
+- Function calls: MATCH (a)-[r:CodeRelation {type: 'CALLS'}]->(b) RETURN a.name AS caller, b.name AS callee LIMIT 50
+- Import deps: MATCH (a:File)-[r:CodeRelation {type: 'IMPORTS'}]->(b:File) RETURN a.name AS from, b.name AS imports LIMIT 50
+- Classes extending: MATCH (a:Class)-[r:CodeRelation {type: 'EXTENDS'}]->(b:Class) RETURN a.name AS child, b.name AS parent
+- Find by name: MATCH (n) WHERE n.name CONTAINS 'Auth' RETURN labels(n)[0] AS type, n.name, n.filePath
+
+## Rules
+- Return ONLY valid Cypher. No markdown fences.
+- Use CodeRelation with {type: '...'} for edge filtering.
+- Default LIMIT 50 unless the user asks for more.
+- First line: the Cypher query
+- Second line: empty
+- Third line onwards: brief explanation (1-2 sentences)
+
+## Question
+${naturalLanguage}`;
+
+      const response = await model.invoke([
+        { role: 'user', content: prompt },
+      ]);
+
+      const text = typeof response.content === 'string'
+        ? response.content
+        : Array.isArray(response.content)
+          ? response.content.filter((b: any) => typeof b === 'string' || b.type === 'text').map((b: any) => typeof b === 'string' ? b : b.text).join('')
+          : String(response.content);
+
+      // Parse: first non-empty block is query, rest is explanation
+      const lines = text.trim().split('\n');
+      const queryLines: string[] = [];
+      const explanationLines: string[] = [];
+      let foundGap = false;
+
+      for (const line of lines) {
+        // Strip markdown code fences if LLM wraps them anyway
+        const stripped = line.replace(/^```\w*$/, '').replace(/^```$/, '');
+        if (!foundGap && stripped.trim() === '' && queryLines.length > 0) {
+          foundGap = true;
+          continue;
+        }
+        if (!foundGap) {
+          if (stripped.trim()) queryLines.push(stripped);
+        } else {
+          explanationLines.push(stripped);
+        }
+      }
+
+      const query = queryLines.join('\n').trim();
+      const explanation = explanationLines.join('\n').trim() || 'Generated Cypher query';
+
+      if (!query) {
+        return { error: 'LLM returned empty query. Try rephrasing your question.' };
+      }
+
+      return { query, explanation };
+    } catch (err: any) {
+      return { error: err.message || 'Failed to generate query' };
+    }
+  },
+
+  /**
    * Enrich community clusters using LLM
    */
   async enrichCommunities(
