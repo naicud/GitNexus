@@ -96,7 +96,31 @@ GitNexus builds a complete knowledge graph of your codebase through a multi-phas
 5. **Processes** — Traces execution flows from entry points through call chains
 6. **Search** — Builds hybrid search indexes for fast retrieval
 
-The result is a **KuzuDB graph database** stored locally in `.gitnexus/` with full-text search and semantic embeddings.
+The result is a **KuzuDB graph database** stored locally in `.gitnexus/` with full-text search and semantic embeddings. Alternatively, you can use [AWS Neptune](#database-backends) as a managed cloud backend.
+
+## Database Backends
+
+| | KuzuDB (default) | AWS Neptune |
+|---|---|---|
+| **Storage** | Local `.gitnexus/` directory | Managed AWS cluster |
+| **Setup** | Zero config | VPC, IAM, cluster provisioning |
+| **Full-text search** | BM25 indexes | CONTAINS predicate (no FTS indexes) |
+| **Semantic search** | Embeddings supported | Not supported (v1) |
+| **Multi-repo** | Automatic via registry | One cluster per repo (v1) |
+| **Cost** | Free | AWS Neptune pricing |
+
+KuzuDB is the default and recommended for most users. Neptune is for teams that need a managed, always-on graph database in AWS.
+
+```bash
+# Index with Neptune backend
+gitnexus analyze --db neptune \
+  --neptune-endpoint your-cluster.us-east-1.neptune.amazonaws.com \
+  --neptune-region us-east-1
+```
+
+Or use environment variables: `GITNEXUS_DB_TYPE=neptune`, `GITNEXUS_NEPTUNE_ENDPOINT`, `GITNEXUS_NEPTUNE_REGION`.
+
+See [Neptune setup guide](../docs/neptune-setup.md) for full AWS configuration (VPC, IAM, security groups, SSH tunneling).
 
 ## MCP Tools
 
@@ -141,6 +165,9 @@ gitnexus analyze [path]           # Index a repository (or update stale index)
 gitnexus analyze --force          # Force full re-index
 gitnexus analyze --embeddings     # Enable embedding generation (slower, better search)
 gitnexus analyze --verbose        # Log skipped files when parsers are unavailable
+gitnexus analyze --db neptune \   # Use AWS Neptune backend
+  --neptune-endpoint <host> \     # Neptune cluster endpoint
+  --neptune-region <region>       # AWS region
 gitnexus mcp                     # Start MCP server (stdio) — serves all indexed repos
 gitnexus serve                   # Start local HTTP server (multi-repo) for web UI
 gitnexus list                    # List all indexed repositories
@@ -154,6 +181,8 @@ gitnexus wiki --model <model>    # Wiki with custom LLM model (default: gpt-4o-m
 ## Multi-Repo Support
 
 GitNexus supports indexing multiple repositories. Each `gitnexus analyze` registers the repo in a global registry (`~/.gitnexus/registry.json`). The MCP server serves all indexed repos automatically.
+
+> **Neptune:** v1 supports one cluster per repository. Multi-repo requires separate Neptune clusters.
 
 ## Supported Languages
 
@@ -197,8 +226,8 @@ Installed automatically by both `gitnexus analyze` (per-repo) and `gitnexus setu
 
 ## Privacy
 
-- All processing happens locally on your machine
-- No code is sent to any server
+- **KuzuDB (default):** All processing happens locally on your machine. No code is sent to any server.
+- **Neptune:** Code metadata (symbol names, file paths, relationships) is sent to your AWS Neptune cluster. Source code content is not stored in the graph.
 - Index stored in `.gitnexus/` inside your repo (gitignored)
 - Global registry at `~/.gitnexus/` stores only paths and metadata
 

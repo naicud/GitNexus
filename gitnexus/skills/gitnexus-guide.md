@@ -62,3 +62,20 @@ Lightweight reads (~100-500 tokens) for navigation:
 MATCH (caller)-[:CodeRelation {type: 'CALLS'}]->(f:Function {name: "myFunc"})
 RETURN caller.name, caller.filePath
 ```
+
+## Backend Differences
+
+The backend (KuzuDB or Neptune) is selected at index time via `--db`. Once indexed, all MCP tools work transparently — you don't need to change queries.
+
+| Capability       | KuzuDB (default)                        | Neptune                                  |
+| ---------------- | --------------------------------------- | ---------------------------------------- |
+| `query` tool     | BM25 + semantic hybrid search           | CONTAINS predicate (no FTS indexes)      |
+| `cypher` tool    | KuzuDB Cypher dialect                   | openCypher (Neptune-compatible subset)   |
+| `context`        | Identical                               | Identical                                |
+| `impact`         | Identical                               | Identical                                |
+| `rename`         | Identical                               | Identical                                |
+| `detect_changes` | Identical                               | Identical                                |
+| Latency          | Local disk (~ms)                        | Network round-trip (~10-50ms)            |
+| Embeddings       | Supported                               | Not supported (v1)                       |
+
+See [Neptune setup guide](../docs/neptune-setup.md) for configuration details.
