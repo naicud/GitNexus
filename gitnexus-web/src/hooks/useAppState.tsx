@@ -121,6 +121,14 @@ interface AppState {
   setAvailableRepos: (repos: RepoSummary[]) => void;
   switchRepo: (repoName: string) => Promise<void>;
 
+  // LOD (Level-of-Detail) graph state
+  graphViewMode: 'full' | 'summary';
+  setGraphViewMode: (mode: 'full' | 'summary') => void;
+  expandedGroups: Map<string, string[]>; // groupId -> expanded node IDs
+  setExpandedGroups: (groups: Map<string, string[]>) => void;
+  graphSummary: import('../services/graph-lod').GraphSummary | null;
+  setGraphSummary: (s: import('../services/graph-lod').GraphSummary | null) => void;
+
   // Worker API (shared across app)
   runPipeline: (file: File, onProgress: (p: PipelineProgress) => void, clusteringConfig?: ProviderConfig) => Promise<PipelineResult>;
   runPipelineFromFiles: (files: FileEntry[], onProgress: (p: PipelineProgress) => void, clusteringConfig?: ProviderConfig) => Promise<PipelineResult>;
@@ -286,6 +294,11 @@ export const AppStateProvider = ({ children }: { children: ReactNode }) => {
   // Multi-repo switching
   const [serverBaseUrl, setServerBaseUrl] = useState<string | null>(null);
   const [availableRepos, setAvailableRepos] = useState<RepoSummary[]>([]);
+
+  // LOD state
+  const [graphViewMode, setGraphViewMode] = useState<'full' | 'summary'>('full');
+  const [expandedGroups, setExpandedGroups] = useState<Map<string, string[]>>(new Map());
+  const [graphSummary, setGraphSummary] = useState<import('../services/graph-lod').GraphSummary | null>(null);
 
   // Embedding state
   const [embeddingStatus, setEmbeddingStatus] = useState<EmbeddingStatus>('idle');

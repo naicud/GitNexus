@@ -7,7 +7,7 @@ import {
   fetchOpenRouterModels,
 } from '../core/llm/settings-service';
 import type { LLMSettings, LLMProvider } from '../core/llm/types';
-import { testBedrockConnection, testDbConnection, getBackendUrl } from '../services/backend';
+import { testBedrockConnection, testDbConnection, updateRepoDbConfig, getBackendUrl } from '../services/backend';
 import { CypherConsole } from './CypherConsole';
 
 interface SettingsPanelProps {
@@ -17,6 +17,8 @@ interface SettingsPanelProps {
   backendUrl?: string;
   isBackendConnected?: boolean;
   onBackendUrlChange?: (url: string) => void;
+  onReloadGraph?: () => void;
+  currentRepo?: string;
 }
 
 /**
@@ -214,7 +216,7 @@ const checkOllamaStatus = async (baseUrl: string): Promise<{ ok: boolean; error:
   }
 };
 
-export const SettingsPanel = ({ isOpen, onClose, onSettingsSaved, backendUrl, isBackendConnected, onBackendUrlChange }: SettingsPanelProps) => {
+export const SettingsPanel = ({ isOpen, onClose, onSettingsSaved, backendUrl, isBackendConnected, onBackendUrlChange, onReloadGraph, currentRepo }: SettingsPanelProps) => {
   const [settings, setSettings] = useState<LLMSettings>(loadSettings);
   const [showApiKey, setShowApiKey] = useState<Record<string, boolean>>({});
   const [saveStatus, setSaveStatus] = useState<'idle' | 'saved' | 'error'>('idle');
@@ -235,6 +237,10 @@ export const SettingsPanel = ({ isOpen, onClose, onSettingsSaved, backendUrl, is
   const [dbTestStatus, setDbTestStatus] = useState<'idle' | 'testing' | 'ok' | 'error'>('idle');
   const [dbTestMessage, setDbTestMessage] = useState('');
   const [showCypherConsole, setShowCypherConsole] = useState(false);
+  // DB change tracking
+  const [dbChanged, setDbChanged] = useState(false);
+  const [dbSaving, setDbSaving] = useState(false);
+  const originalDbType = useRef<'kuzu' | 'neptune'>('kuzu');
 
   // Load settings when panel opens
   useEffect(() => {
@@ -244,7 +250,9 @@ export const SettingsPanel = ({ isOpen, onClose, onSettingsSaved, backendUrl, is
       setSaveStatus('idle');
       setOllamaError(null);
       // Sync database state from persisted settings
-      setDbType(s.database?.type ?? 'kuzu');
+      const loadedDbType = s.database?.type ?? 'kuzu';
+      setDbType(loadedDbType);
+      originalDbType.current = loadedDbType;
       setNeptuneEndpoint(s.database?.neptuneEndpoint ?? '');
       setNeptuneRegion(s.database?.neptuneRegion ?? '');
       setNeptunePort(String(s.database?.neptunePort ?? '8182'));
@@ -285,7 +293,7 @@ export const SettingsPanel = ({ isOpen, onClose, onSettingsSaved, backendUrl, is
     setSettings(prev => ({ ...prev, activeProvider: provider }));
   };
 
-  const handleSave = () => {
+  const handleSave = async () => {
     try {
       saveSettings({
         ...settings,
@@ -298,6 +306,31 @@ export const SettingsPanel = ({ isOpen, onClose, onSettingsSaved, backendUrl, is
           } : {}),
         },
       });
+
+      // Persist DB config to the server
+      if (currentRepo) {
+        setDbSaving(true);
+        try {
+          const dbPayload = dbType === 'neptune'
+            ? { type: 'neptune' as const, endpoint: neptuneEndpoint, region: neptuneRegion, port: parseInt(neptunePort) || 8182 }
+            : { type: 'kuzu' as const };
+          const result = await updateRepoDbConfig(currentRepo, dbPayload);
+          if (!result.ok) {
+            console.warn('Failed to persist DB config to server:', result.error);
+          }
+        } catch (err) {
+          console.warn('Failed to persist DB config to server:', err);
+        } finally {
+          setDbSaving(false);
+        }
+      }
+
+      // Track if the DB type changed so we can show the reload banner
+      if (dbType !== originalDbType.current) {
+        setDbChanged(true);
+        originalDbType.current = dbType;
+      }
+
       setSaveStatus('saved');
       onSettingsSaved?.();
       setTimeout(() => setSaveStatus('idle'), 2000);
@@ -1227,6 +1260,22 @@ export const SettingsPanel = ({ isOpen, onClose, onSettingsSaved, backendUrl, is
             >
               Open Cypher Console
             </button>
+
+            {/* Reload banner after DB backend change */}
+            {dbChanged && (
+              <div className="mt-3 p-3 bg-yellow-500/10 border border-yellow-500/30 rounded-xl flex items-center justify-between">
+                <p className="text-sm text-yellow-300">
+                  Database backend changed. Reload the graph to apply.
+                </p>
+                <button
+                  onClick={() => { onReloadGraph?.(); setDbChanged(false); }}
+                  className="flex items-center gap-1.5 px-3 py-1.5 bg-accent hover:bg-accent/80 text-white text-sm rounded-lg font-medium transition-colors"
+                >
+                  <RefreshCw size={14} />
+                  Reload Graph
+                </button>
+              </div>
+            )}
           </div>
 
           {/* Cypher Console Modal */}
@@ -1271,9 +1320,10 @@ export const SettingsPanel = ({ isOpen, onClose, onSettingsSaved, backendUrl, is
             </button>
             <button
               onClick={handleSave}
-              className="px-5 py-2 bg-accent text-white text-sm font-medium rounded-lg hover:bg-accent-dim transition-colors"
+              disabled={dbSaving || (dbType === 'neptune' && (!neptuneEndpoint || !neptuneRegion))}
+              className="px-5 py-2 bg-accent text-white text-sm font-medium rounded-lg hover:bg-accent-dim disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
             >
-              Save Settings
+              {dbSaving ? 'Saving...' : 'Save Settings'}
             </button>
           </div>
         </div>

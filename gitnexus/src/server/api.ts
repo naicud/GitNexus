@@ -13,7 +13,7 @@ import cors from 'cors';
 import path from 'path';
 import fs from 'fs/promises';
 import { AwsClient } from 'aws4fetch';
-import { loadMeta, listRegisteredRepos } from '../storage/repo-manager.js';
+import { loadMeta, listRegisteredRepos, updateRepoDb } from '../storage/repo-manager.js';
 import { executeQuery, closeKuzu, withKuzuDb } from '../core/kuzu/kuzu-adapter.js';
 import { NODE_TABLES } from '../core/kuzu/schema.js';
 import { GraphNode, GraphRelationship } from '../core/graph/types.js';
@@ -170,6 +170,36 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
     }
   });
 
+  // ── PATCH /api/repo/db — Update DB backend for a repo ────────────────
+  app.patch('/api/repo/db', async (req, res) => {
+    try {
+      const { repo, db } = req.body ?? {};
+
+      if (!repo || typeof repo !== 'string') {
+        return res.status(400).json({ error: '"repo" is required and must be a string' });
+      }
+
+      if (!db || typeof db !== 'object' || (db.type !== 'kuzu' && db.type !== 'neptune')) {
+        return res.status(400).json({ error: '"db.type" must be "kuzu" or "neptune"' });
+      }
+
+      if (db.type === 'neptune') {
+        if (!db.endpoint || typeof db.endpoint !== 'string') {
+          return res.status(400).json({ error: '"db.endpoint" is required for Neptune' });
+        }
+        if (!db.region || typeof db.region !== 'string') {
+          return res.status(400).json({ error: '"db.region" is required for Neptune' });
+        }
+      }
+
+      await updateRepoDb(repo, db);
+      return res.json({ ok: true });
+    } catch (err: any) {
+      const status = err.message?.includes('not found') ? 404 : 500;
+      return res.status(status).json({ error: err.message || 'Failed to update DB config' });
+    }
+  });
+
   // List all registered repos
   app.get('/api/repos', async (_req, res) => {
     try {
@@ -200,6 +230,257 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
       });
     } catch (err: any) {
       res.status(500).json({ error: err.message || 'Failed to get repo info' });
+    }
+  });
+
+  // ── LOD: Graph info (auto-detection) ────────────────────────────────
+  app.get('/api/graph/info', async (req, res) => {
+    try {
+      const entry = await resolveRepo(requestedRepo(req));
+      if (!entry) {
+        res.status(404).json({ error: 'Repository not found' });
+        return;
+      }
+      const meta = await loadMeta(entry.storagePath);
+      const totalNodes = meta?.stats?.nodes ?? 0;
+      const totalEdges = meta?.stats?.edges ?? 0;
+
+      let hasSummary = false;
+      try {
+        await fs.access(path.join(entry.storagePath, 'graph-summary.json'));
+        hasSummary = true;
+      } catch { /* no summary file */ }
+
+      const mode = (totalNodes > 50000 && hasSummary) ? 'summary' : 'full';
+      res.json({ totalNodes, totalEdges, hasSummary, mode });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message || 'Failed to get graph info' });
+    }
+  });
+
+  // ── LOD: Graph summary (cluster overview) ─────────────────────────
+  app.get('/api/graph/summary', async (req, res) => {
+    try {
+      const entry = await resolveRepo(requestedRepo(req));
+      if (!entry) {
+        res.status(404).json({ error: 'Repository not found' });
+        return;
+      }
+
+      const summaryPath = path.join(entry.storagePath, 'graph-summary.json');
+      try {
+        const data = await fs.readFile(summaryPath, 'utf-8');
+        res.setHeader('Content-Type', 'application/json');
+        res.send(data);
+        return;
+      } catch {
+        // No precomputed summary — compute on-the-fly from KuzuDB
+      }
+
+      const dbConfig = getDbConfigFromEntry(entry);
+      if (dbConfig.type === 'neptune') {
+        res.status(501).json({ error: 'On-the-fly summary not supported for Neptune. Re-index to generate.' });
+        return;
+      }
+
+      const kuzuPath = path.join(entry.storagePath, 'kuzu');
+      const summary = await withKuzuDb(kuzuPath, async () => {
+        // Query communities
+        const commRows = await executeQuery(
+          `MATCH (c:Community) RETURN c.id AS id, c.heuristicLabel AS heuristicLabel, c.symbolCount AS symbolCount, c.cohesion AS cohesion`
+        );
+
+        // Aggregate into cluster groups
+        const groupMap = new Map<string, { ids: string[]; totalSymbols: number; weightedCohesion: number }>();
+        for (const c of commRows) {
+          const label = c.heuristicLabel || 'Unknown';
+          const symbols = c.symbolCount || 0;
+          const cohesion = c.cohesion || 0;
+          const existing = groupMap.get(label);
+          if (!existing) {
+            groupMap.set(label, { ids: [c.id], totalSymbols: symbols, weightedCohesion: cohesion * symbols });
+          } else {
+            existing.ids.push(c.id);
+            existing.totalSymbols += symbols;
+            existing.weightedCohesion += cohesion * symbols;
+          }
+        }
+
+        const clusterGroups = Array.from(groupMap.entries())
+          .map(([label, g]) => ({
+            id: `cg_${label}`,
+            label,
+            symbolCount: g.totalSymbols,
+            cohesion: g.totalSymbols > 0 ? g.weightedCohesion / g.totalSymbols : 0,
+            subCommunityIds: g.ids,
+            subCommunityCount: g.ids.length,
+          }))
+          .filter(c => c.symbolCount >= 5)
+          .sort((a, b) => b.symbolCount - a.symbolCount);
+
+        // Query inter-group edges
+        let interGroupEdges: any[] = [];
+        try {
+          const edgeRows = await executeQuery(`
+            MATCH (a)-[r:CodeRelation]->(b),
+                  (a)-[:CodeRelation {type: 'MEMBER_OF'}]->(ca:Community),
+                  (b)-[:CodeRelation {type: 'MEMBER_OF'}]->(cb:Community)
+            WHERE ca.id <> cb.id AND r.type <> 'MEMBER_OF' AND r.type <> 'STEP_IN_PROCESS'
+            RETURN ca.heuristicLabel AS srcLabel, cb.heuristicLabel AS tgtLabel, r.type AS relType, count(*) AS cnt
+          `);
+
+          const edgeMap = new Map<string, { count: number; types: Record<string, number> }>();
+          for (const row of edgeRows) {
+            const key = `cg_${row.srcLabel}|||cg_${row.tgtLabel}`;
+            const existing = edgeMap.get(key);
+            if (existing) {
+              existing.count += (row.cnt || 1);
+              existing.types[row.relType] = (existing.types[row.relType] || 0) + (row.cnt || 1);
+            } else {
+              edgeMap.set(key, { count: row.cnt || 1, types: { [row.relType]: row.cnt || 1 } });
+            }
+          }
+
+          interGroupEdges = Array.from(edgeMap.entries()).map(([key, data]) => {
+            const [src, tgt] = key.split('|||');
+            return { sourceGroupId: src, targetGroupId: tgt, count: data.count, types: data.types };
+          }).sort((a, b) => b.count - a.count);
+        } catch {
+          // Inter-group edge query may fail on some schemas — non-fatal
+        }
+
+        const meta = await loadMeta(entry.storagePath);
+        return {
+          version: 1,
+          generatedAt: new Date().toISOString(),
+          totalNodes: meta?.stats?.nodes ?? 0,
+          totalEdges: meta?.stats?.edges ?? 0,
+          clusterGroups,
+          interGroupEdges,
+        };
+      });
+
+      res.json(summary);
+    } catch (err: any) {
+      res.status(500).json({ error: err.message || 'Failed to get graph summary' });
+    }
+  });
+
+  // ── LOD: Expand cluster group ─────────────────────────────────────
+  app.get('/api/graph/expand', async (req, res) => {
+    try {
+      const entry = await resolveRepo(requestedRepo(req));
+      if (!entry) {
+        res.status(404).json({ error: 'Repository not found' });
+        return;
+      }
+
+      const groupLabel = String(req.query.group ?? '').trim();
+      if (!groupLabel) {
+        res.status(400).json({ error: 'Missing "group" query parameter' });
+        return;
+      }
+
+      const limit = Math.max(1, Math.min(10000, parseInt(String(req.query.limit ?? '5000'), 10) || 5000));
+      const dbConfig = getDbConfigFromEntry(entry);
+
+      if (dbConfig.type === 'neptune') {
+        res.status(501).json({ error: 'Group expansion not yet supported for Neptune' });
+        return;
+      }
+
+      const kuzuPath = path.join(entry.storagePath, 'kuzu');
+      const result = await withKuzuDb(kuzuPath, async () => {
+        // Get symbols in group's communities
+        const nodeRows = await executeQuery(`
+          MATCH (n)-[:CodeRelation {type: 'MEMBER_OF'}]->(c:Community)
+          WHERE c.heuristicLabel = '${groupLabel.replace(/'/g, "\\'")}'
+          RETURN n.id AS id, n.name AS name, n.filePath AS filePath,
+                 n.startLine AS startLine, n.endLine AS endLine,
+                 labels(n)[0] AS nodeLabel
+          LIMIT ${limit}
+        `);
+
+        const nodes: GraphNode[] = nodeRows.map(row => ({
+          id: row.id,
+          label: (row.nodeLabel || 'CodeElement') as GraphNode['label'],
+          properties: {
+            name: row.name || '',
+            filePath: row.filePath || '',
+            startLine: row.startLine,
+            endLine: row.endLine,
+          },
+        }));
+
+        const nodeIdSet = new Set(nodes.map(n => n.id));
+
+        // Get internal edges (both endpoints in this group)
+        const relRows = await executeQuery(`
+          MATCH (a)-[r:CodeRelation]->(b),
+                (a)-[:CodeRelation {type: 'MEMBER_OF'}]->(ca:Community),
+                (b)-[:CodeRelation {type: 'MEMBER_OF'}]->(cb:Community)
+          WHERE ca.heuristicLabel = '${groupLabel.replace(/'/g, "\\'")}'
+            AND cb.heuristicLabel = '${groupLabel.replace(/'/g, "\\'")}'
+            AND r.type <> 'MEMBER_OF' AND r.type <> 'STEP_IN_PROCESS'
+          RETURN a.id AS sourceId, b.id AS targetId, r.type AS type, r.confidence AS confidence
+        `);
+
+        const relationships: GraphRelationship[] = relRows
+          .filter(row => nodeIdSet.has(row.sourceId) && nodeIdSet.has(row.targetId))
+          .map(row => ({
+            id: `${row.sourceId}_${row.type}_${row.targetId}`,
+            type: row.type,
+            sourceId: row.sourceId,
+            targetId: row.targetId,
+            confidence: row.confidence ?? 1,
+            reason: '',
+          }));
+
+        // Get cross-edges (source in group, target in other group)
+        const crossRows = await executeQuery(`
+          MATCH (a)-[r:CodeRelation]->(b),
+                (a)-[:CodeRelation {type: 'MEMBER_OF'}]->(ca:Community),
+                (b)-[:CodeRelation {type: 'MEMBER_OF'}]->(cb:Community)
+          WHERE ca.heuristicLabel = '${groupLabel.replace(/'/g, "\\'")}'
+            AND cb.heuristicLabel <> '${groupLabel.replace(/'/g, "\\'")}'
+            AND r.type <> 'MEMBER_OF' AND r.type <> 'STEP_IN_PROCESS'
+          RETURN a.id AS sourceId, b.id AS targetId, r.type AS type, cb.heuristicLabel AS targetGroup
+          LIMIT 500
+        `);
+
+        const crossEdges = crossRows
+          .filter(row => nodeIdSet.has(row.sourceId))
+          .map(row => ({
+            sourceId: row.sourceId,
+            targetId: row.targetId,
+            type: row.type,
+            targetGroup: row.targetGroup,
+          }));
+
+        // Count total available (may be more than limit)
+        let totalAvailable = nodes.length;
+        try {
+          const countRows = await executeQuery(`
+            MATCH (n)-[:CodeRelation {type: 'MEMBER_OF'}]->(c:Community)
+            WHERE c.heuristicLabel = '${groupLabel.replace(/'/g, "\\'")}'
+            RETURN count(n) AS cnt
+          `);
+          totalAvailable = countRows[0]?.cnt ?? nodes.length;
+        } catch { /* use nodes.length as fallback */ }
+
+        return {
+          groupLabel,
+          nodes,
+          relationships,
+          crossEdges,
+          truncated: nodes.length < totalAvailable,
+          totalAvailable,
+        };
+      });
+
+      res.json(result);
+    } catch (err: any) {
+      res.status(500).json({ error: err.message || 'Failed to expand group' });
     }
   });
 

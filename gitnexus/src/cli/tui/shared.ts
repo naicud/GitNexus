@@ -56,6 +56,17 @@ export function shouldRunInteractive(options: Record<string, unknown>): boolean 
   return true;
 }
 
+/**
+ * Generic version of shouldRunInteractive for any command.
+ * Only checks TTY, CI, and --yes flag (no analyze-specific env checks).
+ */
+export function shouldRunInteractiveGeneric(options: Record<string, unknown>): boolean {
+  if (!process.stdout.isTTY) return false;
+  if (process.env.CI === 'true' || process.env.CI === '1') return false;
+  if (options.yes) return false;
+  return true;
+}
+
 // ─── Env serialization (analyze wizard → heap re-exec) ───────────────
 
 const ENV_MAP: Record<string, string> = {

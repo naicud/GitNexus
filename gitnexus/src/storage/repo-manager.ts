@@ -257,6 +257,27 @@ export const registerRepo = async (
 };
 
 /**
+ * Update the database backend config for a registered repo.
+ * If db is undefined or db.type === 'kuzu', the db field is removed (falls back to KuzuDB default).
+ * Throws if the repo is not found in the registry.
+ */
+export const updateRepoDb = async (repoName: string, db?: DbConfig): Promise<void> => {
+  const entries = await readRegistry();
+  const entry = entries.find((e) => e.name === repoName);
+  if (!entry) {
+    throw new Error(`Repository "${repoName}" not found in registry`);
+  }
+
+  if (!db || db.type === 'kuzu') {
+    delete entry.db;
+  } else {
+    entry.db = db;
+  }
+
+  await writeRegistry(entries);
+};
+
+/**
  * Remove a repo from the global registry.
  * Called after `gitnexus clean`.
  */

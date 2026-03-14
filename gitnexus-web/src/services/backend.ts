@@ -252,6 +252,22 @@ export const testBedrockConnection = async (config: {
 };
 
 /**
+ * Update the DB config (kuzu / neptune) for a repository on the server.
+ * Called from Settings panel after Save.
+ */
+export const updateRepoDbConfig = async (
+  repo: string,
+  db: { type: 'kuzu' } | { type: 'neptune'; endpoint: string; region: string; port?: number },
+): Promise<{ ok: boolean; error?: string }> => {
+  const response = await fetchWithTimeout(`${backendUrl}/api/repo/db`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ repo, db }),
+  });
+  return response.json();
+};
+
+/**
  * Test Neptune connection. Called from Settings panel.
  */
 export const testDbConnection = async (params: {

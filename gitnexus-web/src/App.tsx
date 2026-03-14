@@ -22,6 +22,7 @@ const AppContent = () => {
     setGraph,
     setFileContents,
     setProgress,
+    projectName,
     setProjectName,
     progress,
     isRightPanelOpen,
@@ -301,6 +302,8 @@ const AppContent = () => {
         isOpen={isSettingsPanelOpen}
         onClose={() => setSettingsPanelOpen(false)}
         onSettingsSaved={handleSettingsSaved}
+        onReloadGraph={() => switchRepo(projectName)}
+        currentRepo={projectName}
       />
 
     </div>

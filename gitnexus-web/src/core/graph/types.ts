@@ -15,7 +15,9 @@ export type NodeLabel =
   | 'Type'
   | 'CodeElement'
   | 'Community'
-  | 'Process';
+  | 'Process'
+  // Frontend-only (LOD visualization)
+  | 'ClusterGroup';
 
 
 export type NodeProperties = {

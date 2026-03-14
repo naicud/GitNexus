@@ -7,7 +7,6 @@
 import path from 'path';
 import { execFileSync } from 'child_process';
 import v8 from 'v8';
-import cliProgress from 'cli-progress';
 import { runPipelineFromRepo } from '../core/ingestion/pipeline.js';
 import { initKuzu, loadGraphToKuzu, getKuzuStats, executeQuery, executeWithReusedStatement, closeKuzu, createFTSIndex, loadCachedEmbeddings } from '../core/kuzu/kuzu-adapter.js';
 // Embedding imports are lazy (dynamic import) so onnxruntime-node is never
@@ -21,6 +20,7 @@ import { generateSkillFiles, type GeneratedSkillInfo } from './skill-gen.js';
 import fs from 'fs/promises';
 import type { DbConfig, NeptuneDbConfig } from '../core/db/interfaces.js';
 import { loadGraphToNeptune, getNeptuneStats } from '../core/db/neptune/neptune-ingest.js';
+import { generateGraphSummary } from '../core/ingestion/graph-summary.js';
 import type { EmbeddingProviderConfig, EmbeddingProviderType } from '../core/embeddings/providers/types.js';
 
 
@@ -217,71 +217,26 @@ export const analyzeCommand = async (
     return;
   }
 
-  // Single progress bar for entire pipeline
-  const bar = new cliProgress.SingleBar({
-    format: '  {bar} {percentage}% | {phase}',
-    barCompleteChar: '\u2588',
-    barIncompleteChar: '\u2591',
-    hideCursor: true,
-    barGlue: '',
-    autopadding: true,
-    clearOnComplete: false,
-    stopOnComplete: false,
-  }, cliProgress.Presets.shades_grey);
-
-  bar.start(100, 0, { phase: 'Initializing...' });
+  // Multi-phase progress display
+  const { createMultiProgress } = await import('./tui/components/multi-progress.js');
+  const mp = createMultiProgress([
+    { name: 'pipeline', label: 'Running pipeline', weight: 60 },
+    { name: 'db', label: isNeptune ? 'Loading into Neptune' : 'Loading into KuzuDB', weight: 25 },
+    { name: 'fts', label: 'Creating search indexes', weight: 5 },
+    { name: 'embeddings', label: 'Generating embeddings', weight: 8 },
+    { name: 'finalize', label: 'Finalizing', weight: 2 },
+  ]);
 
   // Graceful SIGINT handling — clean up resources and exit
   let aborted = false;
   const sigintHandler = () => {
     if (aborted) process.exit(1); // Second Ctrl-C: force exit
     aborted = true;
-    bar.stop();
+    mp.stop();
     console.log('\n  Interrupted — cleaning up...');
     (isNeptune ? Promise.resolve() : closeKuzu()).catch(() => {}).finally(() => process.exit(130));
   };
   process.on('SIGINT', sigintHandler);
-
-  // Route all console output through bar.log() so the bar doesn't stamp itself
-  // multiple times when other code writes to stdout/stderr mid-render.
-  const origLog = console.log.bind(console);
-  const origWarn = console.warn.bind(console);
-  const origError = console.error.bind(console);
-  const barLog = (...args: any[]) => {
-    // Clear the bar line, print the message, then let the next bar.update redraw
-    process.stdout.write('\x1b[2K\r');
-    origLog(args.map(a => (typeof a === 'string' ? a : String(a))).join(' '));
-  };
-  console.log = barLog;
-  console.warn = barLog;
-  console.error = barLog;
-
-  // Track elapsed time per phase — both updateBar and the interval use the
-  // same format so they don't flicker against each other.
-  let lastPhaseLabel = 'Initializing...';
-  let phaseStart = Date.now();
-  let lastDetail = '';
-
-  /** Update bar with phase label + optional detail + elapsed seconds (shown after 3s). */
-  const updateBar = (value: number, phaseLabel: string, detail?: string) => {
-    if (phaseLabel !== lastPhaseLabel) { lastPhaseLabel = phaseLabel; phaseStart = Date.now(); lastDetail = ''; }
-    if (detail !== undefined) { lastDetail = detail; }
-    const elapsed = Math.round((Date.now() - phaseStart) / 1000);
-    const detailPart = lastDetail ? ` | ${lastDetail}` : '';
-    const display = elapsed >= 3 ? `${phaseLabel}${detailPart} (${elapsed}s)` : `${phaseLabel}${detailPart}`;
-    bar.update(value, { phase: display });
-  };
-
-  // Tick elapsed seconds for phases with infrequent progress callbacks
-  // (e.g. CSV streaming, FTS indexing). Uses the same display format as
-  // updateBar so there's no flickering.
-  const elapsedTimer = setInterval(() => {
-    const elapsed = Math.round((Date.now() - phaseStart) / 1000);
-    if (elapsed >= 3) {
-      const detailPart = lastDetail ? ` | ${lastDetail}` : '';
-      bar.update({ phase: `${lastPhaseLabel}${detailPart} (${elapsed}s)` });
-    }
-  }, 1000);
 
   const t0Global = Date.now();
 
@@ -299,7 +254,7 @@ export const analyzeCommand = async (
 
   if (!isNeptune && options?.embeddings && existingMeta && !options?.force && !dimsChanged && !providerChanged) {
     try {
-      updateBar(0, 'Caching embeddings...');
+      mp.update(0, 'Caching embeddings...');
       await initKuzu(kuzuPath, embedConfig.dimensions);
       const cached = await loadCachedEmbeddings();
       cachedEmbeddingNodeIds = cached.embeddingNodeIds;
@@ -310,10 +265,10 @@ export const analyzeCommand = async (
     }
   }
 
-  // ── Phase 1: Full Pipeline (0–60%) ─────────────────────────────────
+  // ── Phase 1: Full Pipeline ──────────────────────────────────────────
+  mp.setPhase('pipeline');
   const pipelineResult = await runPipelineFromRepo(repoPath, (progress) => {
     const phaseLabel = PHASE_LABELS[progress.phase] || progress.phase;
-    const scaled = Math.round(progress.percent * 0.6);
     const detail =
       progress.phase === 'parsing' && (progress.stats?.totalFiles ?? 0) > 0
         ? `${progress.stats!.filesProcessed}/${progress.stats!.totalFiles} files${
@@ -322,15 +277,13 @@ export const analyzeCommand = async (
               : ''
           }`
         : undefined;
-    updateBar(scaled, phaseLabel, detail);
+    mp.update(progress.percent, detail || phaseLabel);
   });
 
-  // ── Phase 2: DB Loading (60–85%) ──────────────────────────────────
+  // ── Phase 2: DB Loading ─────────────────────────────────────────────
+  mp.setPhase('db');
   let dbTime: string;
   let dbWarnings: string[] = [];
-
-  const dbLabel = isNeptune ? 'Loading into Neptune...' : 'Loading into KuzuDB...';
-  updateBar(60, dbLabel);
 
   if (isNeptune && neptuneConfig) {
     // ── Neptune path ──────────────────────────────────────────────
@@ -341,8 +294,8 @@ export const analyzeCommand = async (
       neptuneConfig,
       (msg) => {
         neptuneMsgCount++;
-        const progress = Math.min(84, 60 + Math.round((neptuneMsgCount / (neptuneMsgCount + 10)) * 24));
-        updateBar(progress, msg);
+        const progress = Math.min(100, Math.round((neptuneMsgCount / (neptuneMsgCount + 10)) * 100));
+        mp.update(progress, msg);
       },
     );
     dbTime = ((Date.now() - t0Neptune) / 1000).toFixed(1);
@@ -360,17 +313,17 @@ export const analyzeCommand = async (
     let kuzuMsgCount = 0;
     const kuzuResult = await loadGraphToKuzu(pipelineResult.graph, pipelineResult.repoPath, storagePath, (msg) => {
       kuzuMsgCount++;
-      const progress = Math.min(84, 60 + Math.round((kuzuMsgCount / (kuzuMsgCount + 10)) * 24));
-      updateBar(progress, msg);
+      const progress = Math.min(100, Math.round((kuzuMsgCount / (kuzuMsgCount + 10)) * 100));
+      mp.update(progress, msg);
     });
     dbTime = ((Date.now() - t0Kuzu) / 1000).toFixed(1);
     dbWarnings = kuzuResult.warnings;
   }
 
-  // ── Phase 3: FTS (85–90%) ─────────────────────────────────────────
+  // ── Phase 3: FTS ───────────────────────────────────────────────────
+  mp.setPhase('fts');
   const t0Fts = Date.now();
   if (!isNeptune) {
-    updateBar(85, 'Creating search indexes...');
 
     try {
       await createFTSIndex('File', 'file_fts', ['name', 'content']);
@@ -386,7 +339,7 @@ export const analyzeCommand = async (
 
   // ── Phase 3.5: Re-insert cached embeddings ────────────────────────
   if (!isNeptune && cachedEmbeddings.length > 0) {
-    updateBar(88, `Restoring ${cachedEmbeddings.length} cached embeddings...`);
+    mp.update(50, `Restoring ${cachedEmbeddings.length} cached embeddings...`);
     const EMBED_BATCH = 200;
     for (let i = 0; i < cachedEmbeddings.length; i += EMBED_BATCH) {
       const batch = cachedEmbeddings.slice(i, i + EMBED_BATCH);
@@ -400,7 +353,8 @@ export const analyzeCommand = async (
     }
   }
 
-  // ── Phase 4: Embeddings (90–98%) ──────────────────────────────────
+  // ── Phase 4: Embeddings ─────────────────────────────────────────────
+  mp.setPhase('embeddings');
   const stats = isNeptune && neptuneConfig
     ? await getNeptuneStats(neptuneConfig)
     : await getKuzuStats();
@@ -409,7 +363,7 @@ export const analyzeCommand = async (
   let embeddingSkipReason = 'off (use --embeddings to enable)';
 
   if (!embeddingSkipped) {
-    updateBar(90, `Loading embedding provider (${embedConfig.provider})...`);
+    mp.update(0, `Loading embedding provider (${embedConfig.provider})...`);
     const t0Emb = Date.now();
 
     const { createEmbeddingProvider } = await import('../core/embeddings/providers/factory.js');
@@ -445,11 +399,10 @@ export const analyzeCommand = async (
         },
         collectInsert,
         (progress) => {
-          const scaled = 90 + Math.round((progress.percent / 100) * 8);
           const label = progress.phase === 'loading-model'
             ? `Loading ${embedConfig.provider} model...`
             : `Embedding ${progress.nodesProcessed || 0}/${progress.totalNodes || '?'}`;
-          updateBar(scaled, label);
+          mp.update(progress.percent, label);
         },
         provider,
         {},
@@ -459,9 +412,9 @@ export const analyzeCommand = async (
 
       // Store embeddings to Neptune
       if (neptuneEmbeddings.length > 0) {
-        updateBar(97, `Storing ${neptuneEmbeddings.length} embeddings to Neptune...`);
+        mp.update(95, `Storing ${neptuneEmbeddings.length} embeddings to Neptune...`);
         const { loadEmbeddingsToNeptune } = await import('../core/db/neptune/neptune-ingest.js');
-        await loadEmbeddingsToNeptune(neptuneConfig, neptuneEmbeddings, (msg) => updateBar(97, msg));
+        await loadEmbeddingsToNeptune(neptuneConfig, neptuneEmbeddings, (msg) => mp.update(97, msg));
       }
     } else {
       // KuzuDB path
@@ -469,11 +422,10 @@ export const analyzeCommand = async (
         executeQuery,
         executeWithReusedStatement,
         (progress) => {
-          const scaled = 90 + Math.round((progress.percent / 100) * 8);
           const label = progress.phase === 'loading-model'
             ? `Loading ${embedConfig.provider} model...`
             : `Embedding ${progress.nodesProcessed || 0}/${progress.totalNodes || '?'}`;
-          updateBar(scaled, label);
+          mp.update(progress.percent, label);
         },
         provider,
         {},
@@ -484,8 +436,9 @@ export const analyzeCommand = async (
     embeddingTime = ((Date.now() - t0Emb) / 1000).toFixed(1);
   }
 
-  // ── Phase 5: Finalize (98–100%) ───────────────────────────────────
-  updateBar(98, 'Saving metadata...');
+  // ── Phase 5: Finalize ──────────────────────────────────────────────
+  mp.setPhase('finalize');
+  mp.update(0, 'Saving metadata...');
 
   // Count embeddings in the index (cached + newly generated)
   let embeddingCount = 0;
@@ -519,6 +472,15 @@ export const analyzeCommand = async (
   await registerRepo(repoPath, meta, dbConfig, embeddingMeta);
   await addToGitignore(repoPath);
 
+  // Generate LOD graph summary for large-codebase visualization
+  if (pipelineResult.communityResult) {
+    try {
+      await generateGraphSummary(pipelineResult.graph, pipelineResult.communityResult, storagePath);
+    } catch {
+      // Non-fatal — summary is best-effort
+    }
+  }
+
   const projectName = path.basename(repoPath);
   let aggregatedClusterCount = 0;
   if (pipelineResult.communityResult?.communities) {
@@ -532,7 +494,7 @@ export const analyzeCommand = async (
 
   let generatedSkills: GeneratedSkillInfo[] = [];
   if (options?.skills && pipelineResult.communityResult) {
-    updateBar(99, 'Generating skill files...');
+    mp.update(50, 'Generating skill files...');
     const skillResult = await generateSkillFiles(repoPath, projectName, pipelineResult);
     generatedSkills = skillResult.skills;
   }
@@ -555,23 +517,25 @@ export const analyzeCommand = async (
 
   const totalTime = ((Date.now() - t0Global) / 1000).toFixed(1);
 
-  clearInterval(elapsedTimer);
   process.removeListener('SIGINT', sigintHandler);
-
-  console.log = origLog;
-  console.warn = origWarn;
-  console.error = origError;
-
-  bar.update(100, { phase: 'Done' });
-  bar.stop();
 
   // ── Summary ───────────────────────────────────────────────────────
   const embeddingsCached = cachedEmbeddings.length > 0;
-  console.log(`\n  Repository indexed successfully (${totalTime}s)${embeddingsCached ? ` [${cachedEmbeddings.length} embeddings cached]` : ''}\n`);
-  console.log(`  ${stats.nodes.toLocaleString()} nodes | ${stats.edges.toLocaleString()} edges | ${pipelineResult.communityResult?.stats.totalCommunities || 0} clusters | ${pipelineResult.processResult?.stats.totalProcesses || 0} flows`);
-  const dbLabel2 = isNeptune ? 'Neptune' : 'KuzuDB';
-  console.log(`  ${dbLabel2} ${dbTime}s | FTS ${ftsTime}s | Embeddings ${embeddingSkipped ? embeddingSkipReason : embeddingTime + 's'}`);
-  console.log(`  ${repoPath}`);
+  const resultLabel = embeddingsCached
+    ? `Indexed successfully (${totalTime}s) [${cachedEmbeddings.length} embeddings cached]`
+    : `Indexed successfully (${totalTime}s)`;
+
+  mp.complete({
+    'Result': resultLabel,
+    'Nodes': stats.nodes.toLocaleString(),
+    'Edges': stats.edges.toLocaleString(),
+    'Clusters': String(pipelineResult.communityResult?.stats.totalCommunities || 0),
+    'Flows': String(pipelineResult.processResult?.stats.totalProcesses || 0),
+    'Database': `${isNeptune ? 'Neptune' : 'KuzuDB'} (${dbTime}s)`,
+    'FTS': ftsTime + 's',
+    'Embeddings': embeddingSkipped ? embeddingSkipReason : embeddingTime + 's',
+    'Path': repoPath,
+  });
 
   if (aiContext.files.length > 0) {
     console.log(`  Context: ${aiContext.files.join(', ')}`);

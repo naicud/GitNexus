@@ -42,7 +42,13 @@ export async function queryCommand(queryText: string, options?: {
   limit?: string;
   content?: boolean;
 }): Promise<void> {
+  // Interactive mode: no query text + TTY
   if (!queryText?.trim()) {
+    const { shouldRunInteractiveGeneric } = await import('./tui/shared.js');
+    if (shouldRunInteractiveGeneric({})) {
+      const { runQueryTUI } = await import('./tui/interactive/query-tui.js');
+      return runQueryTUI(options);
+    }
     console.error('Usage: gitnexus query <search_query>');
     process.exit(1);
   }
@@ -56,7 +62,14 @@ export async function queryCommand(queryText: string, options?: {
     include_content: options?.content ?? false,
     repo: options?.repo,
   });
-  output(result);
+
+  // Use formatted output if TTY, raw JSON otherwise
+  if (process.stderr.isTTY) {
+    const { renderQueryResults } = await import('./tui/interactive/query-tui.js');
+    renderQueryResults(result);
+  } else {
+    output(result);
+  }
 }
 
 export async function contextCommand(name: string, options?: {
@@ -66,6 +79,11 @@ export async function contextCommand(name: string, options?: {
   content?: boolean;
 }): Promise<void> {
   if (!name?.trim() && !options?.uid) {
+    const { shouldRunInteractiveGeneric } = await import('./tui/shared.js');
+    if (shouldRunInteractiveGeneric({})) {
+      const { runContextTUI } = await import('./tui/interactive/context-tui.js');
+      return runContextTUI(options);
+    }
     console.error('Usage: gitnexus context <symbol_name> [--uid <uid>] [--file <path>]');
     process.exit(1);
   }
@@ -78,7 +96,13 @@ export async function contextCommand(name: string, options?: {
     include_content: options?.content ?? false,
     repo: options?.repo,
   });
-  output(result);
+
+  if (process.stderr.isTTY) {
+    const { renderContextResults } = await import('./tui/interactive/context-tui.js');
+    renderContextResults(result);
+  } else {
+    output(result);
+  }
 }
 
 export async function impactCommand(target: string, options?: {
@@ -88,6 +112,11 @@ export async function impactCommand(target: string, options?: {
   includeTests?: boolean;
 }): Promise<void> {
   if (!target?.trim()) {
+    const { shouldRunInteractiveGeneric } = await import('./tui/shared.js');
+    if (shouldRunInteractiveGeneric({})) {
+      const { runImpactTUI } = await import('./tui/interactive/impact-tui.js');
+      return runImpactTUI(options);
+    }
     console.error('Usage: gitnexus impact <symbol_name> [--direction upstream|downstream]');
     process.exit(1);
   }
@@ -100,13 +129,24 @@ export async function impactCommand(target: string, options?: {
     includeTests: options?.includeTests ?? false,
     repo: options?.repo,
   });
-  output(result);
+
+  if (process.stderr.isTTY) {
+    const { renderImpactResults } = await import('./tui/interactive/impact-tui.js');
+    renderImpactResults(result);
+  } else {
+    output(result);
+  }
 }
 
 export async function cypherCommand(query: string, options?: {
   repo?: string;
 }): Promise<void> {
   if (!query?.trim()) {
+    const { shouldRunInteractiveGeneric } = await import('./tui/shared.js');
+    if (shouldRunInteractiveGeneric({})) {
+      const { runCypherTUI } = await import('./tui/interactive/cypher-tui.js');
+      return runCypherTUI(options);
+    }
     console.error('Usage: gitnexus cypher <cypher_query>');
     process.exit(1);
   }
@@ -116,5 +156,11 @@ export async function cypherCommand(query: string, options?: {
     query,
     repo: options?.repo,
   });
-  output(result);
+
+  if (process.stderr.isTTY) {
+    const { renderCypherResults } = await import('./tui/interactive/cypher-tui.js');
+    renderCypherResults(result);
+  } else {
+    output(result);
+  }
 }
