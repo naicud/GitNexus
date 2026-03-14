@@ -12,7 +12,6 @@ import express from 'express';
 import cors from 'cors';
 import path from 'path';
 import fs from 'fs/promises';
-import { Readable } from 'node:stream';
 import { AwsClient } from 'aws4fetch';
 import { loadMeta, listRegisteredRepos } from '../storage/repo-manager.js';
 import { executeQuery, closeKuzu, withKuzuDb } from '../core/kuzu/kuzu-adapter.js';
@@ -419,7 +418,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
     }
   });
 
-  /** Streaming Converse proxy — pipes raw AWS Event Stream binary back to client */
+  /** Streaming Converse proxy — parses AWS Event Stream binary and forwards as NDJSON */
   app.post('/api/bedrock/converse-stream', async (req, res) => {
     try {
       const { region, credentials, model, body } = req.body;
@@ -449,14 +448,97 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
         return;
       }
 
-      res.setHeader('Content-Type', awsResp.headers.get('content-type') || 'application/vnd.amazon.eventstream');
+      if (!awsResp.body) {
+        res.status(502).json({ error: 'No response body from Bedrock' });
+        return;
+      }
+
+      // Stream as NDJSON — parse AWS Event Stream binary server-side,
+      // extract event type from binary headers and wrap the payload.
+      // Output format matches what boto3/SDKs return: {"eventType": {payload}}
+      res.setHeader('Content-Type', 'application/x-ndjson');
       res.setHeader('Cache-Control', 'no-cache');
-      res.flushHeaders(); // Send headers immediately so the browser starts reading the stream
-      // Pipe raw binary stream — frontend's parseEventStream() handles it as-is
-      const readable = Readable.fromWeb(awsResp.body as any);
-      readable.pipe(res);
+      res.setHeader('X-Accel-Buffering', 'no'); // disable nginx buffering if present
+      res.flushHeaders();
+
+      const reader = (awsResp.body as ReadableStream<Uint8Array>).getReader();
+      const decoder = new TextDecoder();
+      let buf = new Uint8Array(0);
+
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+
+          const merged = new Uint8Array(buf.length + value.length);
+          merged.set(buf);
+          merged.set(value, buf.length);
+          buf = merged;
+
+          // Parse complete AWS Event Stream frames
+          // Binary framing: [4B totalLen][4B headersLen][4B preludeCRC][headers][payload][4B msgCRC]
+          while (buf.length >= 12) {
+            const view = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+            const totalLen = view.getUint32(0);
+            if (buf.length < totalLen) break;
+
+            const headersLen = view.getUint32(4);
+            const headersStart = 12;
+            const payloadStart = 12 + headersLen;
+            const payloadLen = totalLen - headersLen - 16;
+
+            // Parse binary headers to extract :event-type
+            let eventType = '';
+            let offset = headersStart;
+            const headersEnd = headersStart + headersLen;
+            while (offset < headersEnd) {
+              const nameLen = buf[offset]; offset += 1;
+              const name = decoder.decode(buf.slice(offset, offset + nameLen)); offset += nameLen;
+              const valueType = buf[offset]; offset += 1;
+              if (valueType === 7) { // string
+                const valLen = (buf[offset] << 8) | buf[offset + 1]; offset += 2;
+                const val = decoder.decode(buf.slice(offset, offset + valLen)); offset += valLen;
+                if (name === ':event-type') eventType = val;
+              } else if (valueType === 6) { // bytes
+                const valLen = (buf[offset] << 8) | buf[offset + 1]; offset += 2;
+                offset += valLen;
+              } else if (valueType === 0 || valueType === 1) { // bool
+                // no value bytes
+              } else if (valueType === 2) { offset += 1;  // byte
+              } else if (valueType === 3) { offset += 2;  // short
+              } else if (valueType === 4) { offset += 4;  // int
+              } else if (valueType === 5 || valueType === 8) { offset += 8; // long / timestamp
+              } else {
+                break; // unknown type, stop parsing headers
+              }
+            }
+
+            if (payloadLen > 0) {
+              const payload = buf.slice(payloadStart, payloadStart + payloadLen);
+              try {
+                const data = JSON.parse(decoder.decode(payload));
+                // Wrap payload with event type to match SDK format:
+                // {"contentBlockDelta": {"delta": {"text": "..."}, "contentBlockIndex": 0}}
+                const wrapped = eventType ? { [eventType]: data } : data;
+                res.write(JSON.stringify(wrapped) + '\n');
+              } catch { /* skip malformed frame */ }
+            }
+
+            buf = buf.slice(totalLen);
+          }
+        }
+      } finally {
+        reader.releaseLock();
+      }
+
+      res.end();
     } catch (err: any) {
-      res.status(500).json({ error: err.message || 'Bedrock stream failed' });
+      // If headers already sent, we can't change the status code
+      if (!res.headersSent) {
+        res.status(500).json({ error: err.message || 'Bedrock stream failed' });
+      } else {
+        res.end();
+      }
     }
   });
 

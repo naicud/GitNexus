@@ -161,8 +161,38 @@ function fromBedrockMessage(msg: any): AIMessage {
   return new AIMessage({ content: text, tool_calls });
 }
 
-// ─── AWS Event Stream parser ─────────────────────────────────────────────────
+// ─── AWS Event Stream parser (binary) ────────────────────────────────────────
 // Binary framing: [4B totalLen][4B headersLen][4B preludeCRC][headers][payload][4B msgCRC]
+// Extracts :event-type from binary headers and wraps the JSON payload:
+//   {"contentBlockDelta": { "delta": {"text":"..."}, "contentBlockIndex": 0 }}
+// Used for direct Bedrock calls (no proxy).
+
+function parseEventStreamHeaders(buf: Uint8Array, start: number, end: number): Record<string, string> {
+  const headers: Record<string, string> = {};
+  const decoder = new TextDecoder();
+  let offset = start;
+  while (offset < end) {
+    const nameLen = buf[offset]; offset += 1;
+    const name = decoder.decode(buf.slice(offset, offset + nameLen)); offset += nameLen;
+    const valueType = buf[offset]; offset += 1;
+    if (valueType === 7) { // string
+      const valLen = (buf[offset] << 8) | buf[offset + 1]; offset += 2;
+      headers[name] = decoder.decode(buf.slice(offset, offset + valLen)); offset += valLen;
+    } else if (valueType === 6) { // bytes
+      const valLen = (buf[offset] << 8) | buf[offset + 1]; offset += 2;
+      offset += valLen;
+    } else if (valueType === 0 || valueType === 1) { // bool
+      // no value bytes
+    } else if (valueType === 2) { offset += 1;  // byte
+    } else if (valueType === 3) { offset += 2;  // short
+    } else if (valueType === 4) { offset += 4;  // int
+    } else if (valueType === 5 || valueType === 8) { offset += 8; // long / timestamp
+    } else {
+      break; // unknown type
+    }
+  }
+  return headers;
+}
 
 async function* parseEventStream(
   stream: ReadableStream<Uint8Array>
@@ -189,15 +219,58 @@ async function* parseEventStream(
         const payloadStart = 12 + headersLen;
         const payloadLen = totalLen - headersLen - 16; // prelude(12) + trailingCRC(4)
 
+        // Extract event type from binary headers
+        const headers = parseEventStreamHeaders(buf, 12, 12 + headersLen);
+        const eventType = headers[':event-type'] || '';
+
         if (payloadLen > 0) {
           const payload = buf.slice(payloadStart, payloadStart + payloadLen);
           try {
-            yield JSON.parse(new TextDecoder().decode(payload));
+            const data = JSON.parse(new TextDecoder().decode(payload));
+            // Wrap with event type to match SDK format
+            yield eventType ? { [eventType]: data } : data;
           } catch { /* skip malformed frame */ }
         }
 
         buf = buf.slice(totalLen);
       }
+    }
+  } finally {
+    reader.releaseLock();
+  }
+}
+
+// ─── NDJSON parser ───────────────────────────────────────────────────────────
+// Used when going through the proxy (which converts binary event stream → NDJSON).
+
+async function* parseNDJSON(
+  stream: ReadableStream<Uint8Array>
+): AsyncGenerator<Record<string, any>> {
+  const reader = stream.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop() || ''; // keep incomplete line in buffer
+
+      for (const line of lines) {
+        if (line.trim()) {
+          try {
+            yield JSON.parse(line);
+          } catch { /* skip malformed line */ }
+        }
+      }
+    }
+
+    // Process any remaining data
+    if (buffer.trim()) {
+      try { yield JSON.parse(buffer); } catch { /* skip */ }
     }
   } finally {
     reader.releaseLock();
@@ -336,7 +409,10 @@ export class ChatBedrockBrowser extends BaseChatModel {
     // Accumulate tool use inputs per content block index
     const toolAccumulator: Record<number, { id: string; name: string; input: string }> = {};
 
-    for await (const event of parseEventStream(resp.body)) {
+    // Proxy returns NDJSON (text), direct calls return AWS Event Stream (binary)
+    const eventSource = this.proxyBaseUrl ? parseNDJSON(resp.body) : parseEventStream(resp.body);
+
+    for await (const event of eventSource) {
       if (event.contentBlockDelta?.delta?.text) {
         const text: string = event.contentBlockDelta.delta.text;
         await runManager?.handleLLMNewToken(text);
