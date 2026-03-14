@@ -45,6 +45,13 @@ export interface RegistryEntry {
   stats?: RepoMeta['stats'];
   /** DB backend config. If absent, defaults to KuzuDB at storagePath/kuzu (backwards compat) */
   db?: DbConfig;
+  /** Embedding config used during indexing. If absent, defaults to local/snowflake-arctic-embed-xs/384. */
+  embedding?: {
+    provider: string;
+    model: string;
+    dimensions: number;
+    endpoint?: string;
+  };
 }
 
 const GITNEXUS_DIR = '.gitnexus';
@@ -210,7 +217,12 @@ const writeRegistry = async (entries: RegistryEntry[]): Promise<void> => {
  * Register (add or update) a repo in the global registry.
  * Called after `gitnexus analyze` completes.
  */
-export const registerRepo = async (repoPath: string, meta: RepoMeta, db?: DbConfig): Promise<void> => {
+export const registerRepo = async (
+  repoPath: string,
+  meta: RepoMeta,
+  db?: DbConfig,
+  embedding?: RegistryEntry['embedding'],
+): Promise<void> => {
   const resolved = path.resolve(repoPath);
   const name = path.basename(resolved);
   const { storagePath } = getStoragePaths(resolved);
@@ -232,6 +244,7 @@ export const registerRepo = async (repoPath: string, meta: RepoMeta, db?: DbConf
     lastCommit: meta.lastCommit,
     stats: meta.stats,
     ...(db ? { db } : {}),
+    ...(embedding ? { embedding } : {}),
   };
 
   if (existing >= 0) {

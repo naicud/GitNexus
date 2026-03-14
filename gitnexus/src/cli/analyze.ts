@@ -21,6 +21,7 @@ import { generateSkillFiles, type GeneratedSkillInfo } from './skill-gen.js';
 import fs from 'fs/promises';
 import type { DbConfig, NeptuneDbConfig } from '../core/db/interfaces.js';
 import { loadGraphToNeptune, getNeptuneStats } from '../core/db/neptune/neptune-ingest.js';
+import type { EmbeddingProviderConfig, EmbeddingProviderType } from '../core/embeddings/providers/types.js';
 
 
 const HEAP_MB = 8192;
@@ -54,10 +55,12 @@ export interface AnalyzeOptions {
   neptuneEndpoint?: string;
   neptuneRegion?: string;
   neptunePort?: string;
+  embedProvider?: string;
+  embedModel?: string;
+  embedDims?: string;
+  embedEndpoint?: string;
+  embedApiKey?: string;
 }
-
-/** Threshold: auto-skip embeddings for repos with more nodes than this */
-const EMBEDDING_NODE_LIMIT = 50_000;
 
 const PHASE_LABELS: Record<string, string> = {
   extracting: 'Scanning files',
@@ -99,6 +102,40 @@ function resolveNeptuneConfig(options: AnalyzeOptions): NeptuneDbConfig {
     );
   }
   return { type: 'neptune', endpoint, region, port };
+}
+
+/**
+ * Resolve embedding provider config from CLI options + env vars.
+ * Priority: CLI flags > env vars > defaults.
+ */
+function resolveEmbeddingConfig(options: AnalyzeOptions): EmbeddingProviderConfig {
+  const provider = (options.embedProvider
+    ?? process.env.GITNEXUS_EMBED_PROVIDER
+    ?? 'local') as EmbeddingProviderType;
+
+  const defaultModel = provider === 'local'
+    ? 'Snowflake/snowflake-arctic-embed-xs'
+    : provider === 'ollama' ? 'nomic-embed-text'
+    : provider === 'cohere' ? 'embed-english-light-v3.0'
+    : 'text-embedding-3-small';
+
+  const model = options.embedModel
+    ?? process.env.GITNEXUS_EMBED_MODEL
+    ?? defaultModel;
+
+  const dimensions = parseInt(
+    options.embedDims ?? process.env.GITNEXUS_EMBED_DIMS ?? '384', 10,
+  );
+
+  const endpoint = options.embedEndpoint
+    ?? process.env.GITNEXUS_EMBED_ENDPOINT
+    ?? undefined;
+
+  const apiKey = options.embedApiKey
+    ?? process.env.GITNEXUS_EMBED_API_KEY
+    ?? undefined;
+
+  return { provider, model, dimensions, endpoint, apiKey };
 }
 
 export const analyzeCommand = async (
@@ -147,10 +184,8 @@ export const analyzeCommand = async (
     }
   }
 
-  // Warn: embeddings not supported with Neptune in v1
-  if (isNeptune && options?.embeddings) {
-    console.log('  Warning: --embeddings is not supported with --db neptune in v1. Skipping embeddings.\n');
-  }
+  // Resolve embedding config (always, even if --embeddings not set, for registry persistence)
+  const embedConfig = resolveEmbeddingConfig(options ?? {});
 
   const { storagePath, kuzuPath } = getStoragePaths(repoPath);
   const currentCommit = getCurrentCommit(repoPath);
@@ -233,10 +268,18 @@ export const analyzeCommand = async (
   let cachedEmbeddingNodeIds = new Set<string>();
   let cachedEmbeddings: Array<{ nodeId: string; embedding: number[] }> = [];
 
-  if (!isNeptune && options?.embeddings && existingMeta && !options?.force) {
+  // Check dimension mismatch: if provider/model/dims changed, invalidate cache
+  const existingRegistry = await import('../storage/repo-manager.js').then(m => m.readRegistry());
+  const existingEntry = existingRegistry.find((e: any) => path.resolve(e.path) === path.resolve(repoPath));
+  const prevDims = existingEntry?.embedding?.dimensions ?? 384;
+  const dimsChanged = options?.embeddings && prevDims !== embedConfig.dimensions;
+  const providerChanged = options?.embeddings && existingEntry?.embedding &&
+    (existingEntry.embedding.provider !== embedConfig.provider || existingEntry.embedding.model !== embedConfig.model);
+
+  if (!isNeptune && options?.embeddings && existingMeta && !options?.force && !dimsChanged && !providerChanged) {
     try {
       updateBar(0, 'Caching embeddings...');
-      await initKuzu(kuzuPath);
+      await initKuzu(kuzuPath, embedConfig.dimensions);
       const cached = await loadCachedEmbeddings();
       cachedEmbeddingNodeIds = cached.embeddingNodeIds;
       cachedEmbeddings = cached.embeddings;
@@ -292,7 +335,7 @@ export const analyzeCommand = async (
     }
 
     const t0Kuzu = Date.now();
-    await initKuzu(kuzuPath);
+    await initKuzu(kuzuPath, options?.embeddings ? embedConfig.dimensions : undefined);
     let kuzuMsgCount = 0;
     const kuzuResult = await loadGraphToKuzu(pipelineResult.graph, pipelineResult.repoPath, storagePath, (msg) => {
       kuzuMsgCount++;
@@ -341,36 +384,82 @@ export const analyzeCommand = async (
     ? await getNeptuneStats(neptuneConfig)
     : await getKuzuStats();
   let embeddingTime = '0.0';
-  let embeddingSkipped = true;
+  let embeddingSkipped = !options?.embeddings;
   let embeddingSkipReason = 'off (use --embeddings to enable)';
 
-  if (isNeptune) {
-    embeddingSkipReason = 'not supported with Neptune (v1)';
-  }
-
-  if (options?.embeddings) {
-    if (stats.nodes > EMBEDDING_NODE_LIMIT) {
-      embeddingSkipReason = `skipped (${stats.nodes.toLocaleString()} nodes > ${EMBEDDING_NODE_LIMIT.toLocaleString()} limit)`;
-    } else {
-      embeddingSkipped = false;
-    }
-  }
-
   if (!embeddingSkipped) {
-    updateBar(90, 'Loading embedding model...');
+    updateBar(90, `Loading embedding provider (${embedConfig.provider})...`);
     const t0Emb = Date.now();
-    const { runEmbeddingPipeline } = await import('../core/embeddings/embedding-pipeline.js');
-    await runEmbeddingPipeline(
-      executeQuery,
-      executeWithReusedStatement,
-      (progress) => {
-        const scaled = 90 + Math.round((progress.percent / 100) * 8);
-        const label = progress.phase === 'loading-model' ? 'Loading embedding model...' : `Embedding ${progress.nodesProcessed || 0}/${progress.totalNodes || '?'}`;
-        updateBar(scaled, label);
-      },
-      {},
-      cachedEmbeddingNodeIds.size > 0 ? cachedEmbeddingNodeIds : undefined,
-    );
+
+    const { createEmbeddingProvider } = await import('../core/embeddings/providers/factory.js');
+    const { runEmbeddingPipeline, getEmbeddableLabels } = await import('../core/embeddings/embedding-pipeline.js');
+
+    const provider = await createEmbeddingProvider(embedConfig);
+    const labels = getEmbeddableLabels(stats.nodes);
+
+    if (isNeptune && neptuneConfig) {
+      // Neptune path: run pipeline collecting embeddings in-memory, then bulk-store
+      const neptuneEmbeddings: Array<{ nodeId: string; embedding: number[] }> = [];
+      // Create a lightweight in-memory collector instead of KuzuDB insert
+      const collectInsert = async (_cypher: string, paramsList: Array<Record<string, any>>) => {
+        for (const p of paramsList) {
+          neptuneEmbeddings.push({ nodeId: p.nodeId as string, embedding: p.embedding as number[] });
+        }
+      };
+
+      await runEmbeddingPipeline(
+        // For Neptune, we need to query Neptune to get node lists
+        async (cypher: string) => {
+          const { NeptunedataClient, ExecuteOpenCypherQueryCommand } = await import('@aws-sdk/client-neptunedata');
+          const client = new NeptunedataClient({
+            endpoint: `https://${neptuneConfig.endpoint}:${neptuneConfig.port}`,
+            region: neptuneConfig.region,
+          });
+          try {
+            const res = await client.send(new ExecuteOpenCypherQueryCommand({ openCypherQuery: cypher }));
+            return (res.results as Record<string, unknown>[]) ?? [];
+          } finally {
+            client.destroy();
+          }
+        },
+        collectInsert,
+        (progress) => {
+          const scaled = 90 + Math.round((progress.percent / 100) * 8);
+          const label = progress.phase === 'loading-model'
+            ? `Loading ${embedConfig.provider} model...`
+            : `Embedding ${progress.nodesProcessed || 0}/${progress.totalNodes || '?'}`;
+          updateBar(scaled, label);
+        },
+        provider,
+        {},
+        cachedEmbeddingNodeIds.size > 0 ? cachedEmbeddingNodeIds : undefined,
+        labels,
+      );
+
+      // Store embeddings to Neptune
+      if (neptuneEmbeddings.length > 0) {
+        updateBar(97, `Storing ${neptuneEmbeddings.length} embeddings to Neptune...`);
+        const { loadEmbeddingsToNeptune } = await import('../core/db/neptune/neptune-ingest.js');
+        await loadEmbeddingsToNeptune(neptuneConfig, neptuneEmbeddings, (msg) => updateBar(97, msg));
+      }
+    } else {
+      // KuzuDB path
+      await runEmbeddingPipeline(
+        executeQuery,
+        executeWithReusedStatement,
+        (progress) => {
+          const scaled = 90 + Math.round((progress.percent / 100) * 8);
+          const label = progress.phase === 'loading-model'
+            ? `Loading ${embedConfig.provider} model...`
+            : `Embedding ${progress.nodesProcessed || 0}/${progress.totalNodes || '?'}`;
+          updateBar(scaled, label);
+        },
+        provider,
+        {},
+        cachedEmbeddingNodeIds.size > 0 ? cachedEmbeddingNodeIds : undefined,
+        labels,
+      );
+    }
     embeddingTime = ((Date.now() - t0Emb) / 1000).toFixed(1);
   }
 
@@ -403,7 +492,10 @@ export const analyzeCommand = async (
   const dbConfig: DbConfig = isNeptune && neptuneConfig
     ? neptuneConfig
     : { type: 'kuzu', kuzuPath };
-  await registerRepo(repoPath, meta, dbConfig);
+  const embeddingMeta = options?.embeddings
+    ? { provider: embedConfig.provider, model: embedConfig.model, dimensions: embedConfig.dimensions, endpoint: embedConfig.endpoint }
+    : undefined;
+  await registerRepo(repoPath, meta, dbConfig, embeddingMeta);
   await addToGitignore(repoPath);
 
   const projectName = path.basename(repoPath);

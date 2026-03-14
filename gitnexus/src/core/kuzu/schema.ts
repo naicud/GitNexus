@@ -416,12 +416,14 @@ CREATE REL TABLE ${REL_TABLE_NAME} (
 // Separate table for vector storage to avoid copy-on-write overhead
 // ============================================================================
 
-export const EMBEDDING_SCHEMA = `
+export const getEmbeddingSchema = (dims: number = 384): string => `
 CREATE NODE TABLE ${EMBEDDING_TABLE_NAME} (
   nodeId STRING,
-  embedding FLOAT[384],
+  embedding FLOAT[${dims}],
   PRIMARY KEY (nodeId)
 )`;
+
+export const EMBEDDING_SCHEMA = getEmbeddingSchema(384);
 
 /**
  * Create vector index for semantic search

@@ -88,6 +88,8 @@ interface RepoHandle {
   stats?: RegistryEntry['stats'];
   /** DB backend config — present when repo has a non-default DB (e.g. Neptune) */
   db?: { type: 'kuzu' | 'neptune'; endpoint?: string; region?: string; port?: number; kuzuPath?: string };
+  /** Embedding config used during indexing — for query-time provider matching */
+  embedding?: { provider: string; model: string; dimensions: number; endpoint?: string };
 }
 
 export class LocalBackend {
@@ -132,6 +134,7 @@ export class LocalBackend {
         lastCommit: entry.lastCommit,
         stats: entry.stats,
         db: (entry as any).db,
+        embedding: entry.embedding,
       };
 
       this.repos.set(id, handle);
@@ -639,17 +642,27 @@ export class LocalBackend {
    */
   private async semanticSearch(repo: RepoHandle, query: string, limit: number): Promise<any[]> {
     try {
-      // Check if embedding table exists before loading the model (avoids heavy model init when embeddings are off)
+      // Neptune path: use app-side cosine similarity search
+      if (repo.db?.type === 'neptune') {
+        const { embedQuery, getEmbeddingDims } = await import('../core/embedder.js');
+        const queryVec = await embedQuery(query, repo.embedding);
+        const { neptuneSemanticSearch } = await import('../../core/db/neptune/neptune-vector-search.js');
+        const adapter = neptuneAdapters.get(repo.id);
+        if (!adapter) return [];
+        return neptuneSemanticSearch(adapter, queryVec, limit);
+      }
+
+      // KuzuDB path: use vector index
       const tableCheck = await this.runQuery(repo.id, `MATCH (e:CodeEmbedding) RETURN COUNT(*) AS cnt LIMIT 1`);
       if (!tableCheck.length || (tableCheck[0].cnt ?? tableCheck[0][0]) === 0) return [];
 
       const { embedQuery, getEmbeddingDims } = await import('../core/embedder.js');
-      const queryVec = await embedQuery(query);
-      const dims = getEmbeddingDims();
+      const queryVec = await embedQuery(query, repo.embedding);
+      const dims = getEmbeddingDims(repo.embedding);
       const queryVecStr = `[${queryVec.join(',')}]`;
-      
+
       const vectorQuery = `
-        CALL QUERY_VECTOR_INDEX('CodeEmbedding', 'code_embedding_idx', 
+        CALL QUERY_VECTOR_INDEX('CodeEmbedding', 'code_embedding_idx',
           CAST(${queryVecStr} AS FLOAT[${dims}]), ${limit})
         YIELD node AS emb, distance
         WITH emb, distance
@@ -657,23 +670,22 @@ export class LocalBackend {
         RETURN emb.nodeId AS nodeId, distance
         ORDER BY distance
       `;
-      
+
       const embResults = await this.runQuery(repo.id, vectorQuery);
-      
+
       if (embResults.length === 0) return [];
-      
+
       const results: any[] = [];
-      
+
       for (const embRow of embResults) {
         const nodeId = embRow.nodeId ?? embRow[0];
         const distance = embRow.distance ?? embRow[1];
-        
+
         const labelEndIdx = nodeId.indexOf(':');
         const label = labelEndIdx > 0 ? nodeId.substring(0, labelEndIdx) : 'Unknown';
-        
-        // Validate label against known node types to prevent Cypher injection
+
         if (!VALID_NODE_LABELS.has(label)) continue;
-        
+
         try {
           const nodeQuery = label === 'File'
             ? `MATCH (n:File {id: $nodeId}) RETURN n.name AS name, n.filePath AS filePath`
@@ -694,7 +706,7 @@ export class LocalBackend {
           }
         } catch {}
       }
-      
+
       return results;
     } catch {
       // Expected when embeddings are disabled — silently fall back to BM25-only

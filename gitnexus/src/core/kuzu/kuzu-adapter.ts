@@ -10,6 +10,7 @@ import {
   SCHEMA_QUERIES,
   EMBEDDING_TABLE_NAME,
   NodeTableName,
+  getEmbeddingSchema,
 } from './schema.js';
 import { streamAllCSVsToDisk } from './csv-generator.js';
 
@@ -39,8 +40,8 @@ const runWithSessionLock = async <T>(operation: () => Promise<T>): Promise<T> =>
 
 const normalizeCopyPath = (filePath: string): string => filePath.replace(/\\/g, '/');
 
-export const initKuzu = async (dbPath: string) => {
-  return runWithSessionLock(() => ensureKuzuInitialized(dbPath));
+export const initKuzu = async (dbPath: string, embeddingDims?: number) => {
+  return runWithSessionLock(() => ensureKuzuInitialized(dbPath, embeddingDims));
 };
 
 /**
@@ -54,15 +55,15 @@ export const withKuzuDb = async <T>(dbPath: string, operation: () => Promise<T>)
   });
 };
 
-const ensureKuzuInitialized = async (dbPath: string) => {
+const ensureKuzuInitialized = async (dbPath: string, embeddingDims?: number) => {
   if (conn && currentDbPath === dbPath) {
     return { db, conn };
   }
-  await doInitKuzu(dbPath);
+  await doInitKuzu(dbPath, embeddingDims);
   return { db, conn };
 };
 
-const doInitKuzu = async (dbPath: string) => {
+const doInitKuzu = async (dbPath: string, embeddingDims?: number) => {
   // Different database requested — close the old one first
   if (conn || db) {
     try { if (conn) await conn.close(); } catch {}
@@ -100,7 +101,12 @@ const doInitKuzu = async (dbPath: string) => {
   db = new kuzu.Database(dbPath);
   conn = new kuzu.Connection(db);
 
-  for (const schemaQuery of SCHEMA_QUERIES) {
+  // Build schema queries with configurable embedding dimensions
+  const schemaQueries = embeddingDims && embeddingDims !== 384
+    ? [...SCHEMA_QUERIES.filter(q => !q.includes(EMBEDDING_TABLE_NAME)), getEmbeddingSchema(embeddingDims)]
+    : SCHEMA_QUERIES;
+
+  for (const schemaQuery of schemaQueries) {
     try {
       await conn.query(schemaQuery);
     } catch (err) {

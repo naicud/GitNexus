@@ -146,6 +146,56 @@ export async function loadGraphToNeptune(
 }
 
 /**
+ * Store embedding vectors as node properties in Neptune.
+ *
+ * For each embedding, matches the node by id and sets n.embedding = float[].
+ * Uses UNWIND batches of 200 (smaller than BATCH_SIZE because embedding arrays
+ * are large payloads).
+ *
+ * @param config      Neptune connection config
+ * @param embeddings  Array of { nodeId, embedding } pairs
+ * @param onProgress  Optional callback for progress messages
+ */
+export async function loadEmbeddingsToNeptune(
+  config: NeptuneDbConfig,
+  embeddings: Array<{ nodeId: string; embedding: number[] }>,
+  onProgress?: (msg: string) => void,
+): Promise<void> {
+  if (embeddings.length === 0) {
+    onProgress?.('No embeddings to load — skipping');
+    return;
+  }
+
+  const EMBEDDING_BATCH_SIZE = 200;
+  const client = new NeptunedataClient({
+    endpoint: `https://${config.endpoint}:${config.port}`,
+    region: config.region,
+  });
+
+  try {
+    const totalBatches = Math.ceil(embeddings.length / EMBEDDING_BATCH_SIZE);
+    onProgress?.(`Loading ${embeddings.length} embeddings into Neptune (${totalBatches} batches)...`);
+
+    const cypher = `
+      UNWIND $batch AS row
+      MATCH (n {id: row.nodeId})
+      SET n.embedding = row.embedding
+    `;
+
+    for (let i = 0; i < embeddings.length; i += EMBEDDING_BATCH_SIZE) {
+      const batch = embeddings.slice(i, i + EMBEDDING_BATCH_SIZE);
+      const batchNum = Math.floor(i / EMBEDDING_BATCH_SIZE) + 1;
+      await sendCypher(client, cypher, { batch });
+      onProgress?.(`Embedding batch ${batchNum}/${totalBatches} (${batch.length} vectors)`);
+    }
+
+    onProgress?.(`Neptune embedding loading complete (${embeddings.length} vectors stored)`);
+  } finally {
+    client.destroy();
+  }
+}
+
+/**
  * Fetch node/edge counts from Neptune (equivalent to getKuzuStats).
  */
 export async function getNeptuneStats(
