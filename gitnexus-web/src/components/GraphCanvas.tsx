@@ -1,8 +1,10 @@
 import { useEffect, useCallback, useMemo, useState, forwardRef, useImperativeHandle } from 'react';
-import { ZoomIn, ZoomOut, Maximize2, Focus, RotateCcw, Play, Pause, Lightbulb, LightbulbOff } from 'lucide-react';
+import { ZoomIn, ZoomOut, Maximize2, Focus, RotateCcw, Play, Pause, Lightbulb, LightbulbOff, Minimize2 } from 'lucide-react';
 import { useSigma } from '../hooks/useSigma';
 import { useAppState } from '../hooks/useAppState';
 import { knowledgeGraphToGraphology, filterGraphByDepth, SigmaNodeAttributes, SigmaEdgeAttributes } from '../lib/graph-adapter';
+import { summaryToGraphology, expandGroupInGraph, collapseGroupInGraph } from '../lib/summary-graph-adapter';
+import { fetchGroupExpansion } from '../services/graph-lod';
 import { QueryFAB } from './QueryFAB';
 import Graph from 'graphology';
 
@@ -27,8 +29,15 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle>((_, ref) => {
     isAIHighlightsEnabled,
     toggleAIHighlights,
     animatedNodes,
+    graphViewMode,
+    expandedGroups,
+    setExpandedGroups,
+    graphSummary,
+    serverBaseUrl,
+    projectName,
   } = useAppState();
   const [hoveredNodeName, setHoveredNodeName] = useState<string | null>(null);
+  const [expandingGroup, setExpandingGroup] = useState<string | null>(null);
 
   const effectiveHighlightedNodeIds = useMemo(() => {
     if (!isAIHighlightsEnabled) return highlightedNodeIds;
@@ -75,9 +84,70 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle>((_, ref) => {
     setSelectedNode(null);
   }, [setSelectedNode]);
 
+  // LOD: Handle group expansion on double-click
+  const handleGroupExpand = useCallback(async (groupLabel: string, groupId: string) => {
+    if (!serverBaseUrl || !projectName || !graphSummary || expandingGroup) return;
+    if (expandedGroups.has(groupId)) return; // Already expanded
+
+    setExpandingGroup(groupId);
+    try {
+      const expansion = await fetchGroupExpansion(serverBaseUrl, projectName, groupLabel);
+      const sigmaGraph = sigmaGraphRef.current;
+      if (!sigmaGraph) return;
+
+      const newNodeIds = expandGroupInGraph(sigmaGraph, expansion, groupId, graphSummary);
+
+      // Track expanded group
+      const next = new Map(expandedGroups);
+      next.set(groupId, newNodeIds);
+      setExpandedGroups(next);
+
+      // Restart layout briefly for new nodes
+      if (sigmaInstance.current) {
+        sigmaInstance.current.refresh();
+      }
+      if (newNodeIds.length > 0) {
+        runLayoutFn.current?.(sigmaGraph);
+      }
+    } catch (err) {
+      console.error('Failed to expand group:', err);
+    } finally {
+      setExpandingGroup(null);
+    }
+  }, [serverBaseUrl, projectName, graphSummary, expandedGroups, setExpandedGroups, expandingGroup]);
+
+  // LOD: Handle group collapse
+  const handleGroupCollapse = useCallback((groupId: string) => {
+    if (!graphSummary) return;
+    const nodeIds = expandedGroups.get(groupId);
+    if (!nodeIds) return;
+
+    const sigmaGraph = sigmaGraphRef.current;
+    if (!sigmaGraph) return;
+
+    const groupLabel = groupId.replace(/^cg_/, '');
+    collapseGroupInGraph(sigmaGraph, groupId, groupLabel, graphSummary, nodeIds);
+
+    const next = new Map(expandedGroups);
+    next.delete(groupId);
+    setExpandedGroups(next);
+
+    if (sigmaInstance.current) {
+      sigmaInstance.current.refresh();
+    }
+  }, [graphSummary, expandedGroups, setExpandedGroups]);
+
+  // LOD: Collapse all expanded groups
+  const handleCollapseAll = useCallback(() => {
+    for (const groupId of expandedGroups.keys()) {
+      handleGroupCollapse(groupId);
+    }
+  }, [expandedGroups, handleGroupCollapse]);
+
   const {
     containerRef,
     sigmaRef,
+    graphRef: sigmaGraphRefFromHook,
     setGraph: setSigmaGraph,
     zoomIn,
     zoomOut,
@@ -86,17 +156,24 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle>((_, ref) => {
     isLayoutRunning,
     startLayout,
     stopLayout,
+    runLayout,
     selectedNode: sigmaSelectedNode,
     setSelectedNode: setSigmaSelectedNode,
   } = useSigma({
     onNodeClick: handleNodeClick,
     onNodeHover: handleNodeHover,
     onStageClick: handleStageClick,
+    onGroupExpand: handleGroupExpand,
     highlightedNodeIds: effectiveHighlightedNodeIds,
     blastRadiusNodeIds: effectiveBlastRadiusNodeIds,
     animatedNodes: effectiveAnimatedNodes,
     visibleEdgeTypes,
   });
+
+  // Refs for accessing sigma internals from LOD callbacks (avoids stale closure issues)
+  const sigmaGraphRef = sigmaGraphRefFromHook;
+  const sigmaInstance = sigmaRef;
+  const runLayoutFn = { current: runLayout } as { current: typeof runLayout };
 
   // Expose focusNode to parent via ref
   useImperativeHandle(ref, () => ({
@@ -113,8 +190,16 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle>((_, ref) => {
     }
   }), [focusNode, graph, setSelectedNode, openCodePanel]);
 
-  // Update Sigma graph when KnowledgeGraph changes
+  // Update Sigma graph when KnowledgeGraph or summary changes
   useEffect(() => {
+    // LOD mode: build from summary
+    if (graphViewMode === 'summary' && graphSummary) {
+      const sigmaGraph = summaryToGraphology(graphSummary);
+      setSigmaGraph(sigmaGraph);
+      return;
+    }
+
+    // Full mode: build from KnowledgeGraph
     if (!graph) return;
 
     // Build communityMemberships map from MEMBER_OF relationships
@@ -134,7 +219,7 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle>((_, ref) => {
 
     const sigmaGraph = knowledgeGraphToGraphology(graph, communityMemberships);
     setSigmaGraph(sigmaGraph);
-  }, [graph, setSigmaGraph]);
+  }, [graph, graphViewMode, graphSummary, setSigmaGraph]);
 
   // Update node visibility when filters change
   useEffect(() => {
@@ -288,6 +373,20 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle>((_, ref) => {
             <Play className="w-4 h-4" />
           )}
         </button>
+
+        {/* Collapse All - only in summary mode with expanded groups */}
+        {graphViewMode === 'summary' && expandedGroups.size > 0 && (
+          <>
+            <div className="h-px bg-border-subtle my-1" />
+            <button
+              onClick={handleCollapseAll}
+              className="w-9 h-9 flex items-center justify-center bg-violet-500/20 border border-violet-500/30 rounded-md text-violet-300 hover:bg-violet-500/30 transition-colors"
+              title="Collapse All Groups"
+            >
+              <Minimize2 className="w-4 h-4" />
+            </button>
+          </>
+        )}
       </div>
 
       {/* Layout running indicator */}
@@ -295,6 +394,23 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle>((_, ref) => {
         <div className="absolute bottom-4 left-1/2 -translate-x-1/2 flex items-center gap-2 px-3 py-1.5 bg-emerald-500/20 border border-emerald-500/30 rounded-full backdrop-blur-sm z-10 animate-fade-in">
           <div className="w-2 h-2 bg-emerald-400 rounded-full animate-ping" />
           <span className="text-xs text-emerald-400 font-medium">Layout optimizing...</span>
+        </div>
+      )}
+
+      {/* Expanding group indicator */}
+      {expandingGroup && (
+        <div className="absolute bottom-4 left-1/2 -translate-x-1/2 flex items-center gap-2 px-3 py-1.5 bg-violet-500/20 border border-violet-500/30 rounded-full backdrop-blur-sm z-10 animate-fade-in">
+          <div className="w-2 h-2 bg-violet-400 rounded-full animate-ping" />
+          <span className="text-xs text-violet-400 font-medium">Expanding cluster...</span>
+        </div>
+      )}
+
+      {/* Summary mode indicator */}
+      {graphViewMode === 'summary' && (
+        <div className="absolute bottom-4 left-4 flex items-center gap-2 px-3 py-1.5 bg-violet-500/10 border border-violet-500/20 rounded-lg backdrop-blur-sm z-10">
+          <span className="text-xs text-violet-300 font-medium">
+            LOD View {expandedGroups.size > 0 ? `(${expandedGroups.size} expanded)` : ''} — Double-click to expand
+          </span>
         </div>
       )}
 

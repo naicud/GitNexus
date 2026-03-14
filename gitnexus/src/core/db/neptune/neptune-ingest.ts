@@ -12,7 +12,9 @@ import { NeptunedataClient, ExecuteOpenCypherQueryCommand } from '@aws-sdk/clien
 import type { KnowledgeGraph } from '../../graph/types.js';
 import type { NeptuneDbConfig } from '../interfaces.js';
 
-const BATCH_SIZE = 500;
+const NODE_BATCH_SIZE = 500;
+const EDGE_BATCH_SIZE = 100;
+const MAX_RETRIES = 5;
 
 export interface NeptuneLoadResult {
   nodesInserted: number;
@@ -27,22 +29,37 @@ async function sendCypher(
   cypher: string,
   params?: Record<string, unknown>,
 ): Promise<void> {
-  const command = new ExecuteOpenCypherQueryCommand({
-    openCypherQuery: cypher,
-    ...(params ? { parameters: JSON.stringify(params) } : {}),
-  });
-  await client.send(command);
+  for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+    try {
+      const command = new ExecuteOpenCypherQueryCommand({
+        openCypherQuery: cypher,
+        ...(params ? { parameters: JSON.stringify(params) } : {}),
+      });
+      await client.send(command);
+      return;
+    } catch (err: any) {
+      const retryable = err.name === 'TimeLimitExceededException'
+        || err.name === 'ConcurrentModificationException'
+        || err.$retryable;
+      if (!retryable || attempt === MAX_RETRIES - 1) throw err;
+      const delay = Math.min(1000 * 2 ** attempt, 30000);
+      await new Promise(r => setTimeout(r, delay));
+    }
+  }
 }
 
 async function batchedInsert(
   client: NeptunedataClient,
   items: NeptuneBatchRow[],
   cypher: string,
+  batchSize: number = NODE_BATCH_SIZE,
   paramName: string = 'batch',
+  onBatch?: (done: number, total: number) => void,
 ): Promise<void> {
-  for (let i = 0; i < items.length; i += BATCH_SIZE) {
-    const batch = items.slice(i, i + BATCH_SIZE);
+  for (let i = 0; i < items.length; i += batchSize) {
+    const batch = items.slice(i, i + batchSize);
     await sendCypher(client, cypher, { [paramName]: batch });
+    onBatch?.(Math.min(i + batchSize, items.length), items.length);
   }
 }
 
@@ -100,11 +117,25 @@ export async function loadGraphToNeptune(
         MERGE (n:\`${label}\` {id: row.id})
         SET n += row
       `;
-      await batchedInsert(client, rows, cypher);
+      await batchedInsert(client, rows, cypher, NODE_BATCH_SIZE, 'batch', (done, total) => {
+        onProgress?.(`Inserting ${label} nodes (${labelIdx}/${totalLabels}, ${done}/${total})...`);
+      });
       nodesInserted += rows.length;
     }
 
-    // 4. Insert relationships
+    // 4. Create indexes BEFORE edges — critical for MATCH performance
+    onProgress?.('Creating Neptune indexes...');
+    const indexLabels = ['Function', 'File', 'Class', 'Method', 'Interface', 'Module',
+      'Namespace', 'Variable', 'Property', 'CodeElement'];
+    for (const lbl of indexLabels) {
+      try {
+        await sendCypher(client, `CREATE INDEX ON :\`${lbl}\`(id)`);
+      } catch {
+        // Index may already exist or label may not exist — non-fatal
+      }
+    }
+
+    // 5. Insert relationships (smaller batches — MATCH on two nodes is heavier)
     const relRows: NeptuneBatchRow[] = [];
     graph.forEachRelationship((rel) => {
       relRows.push({
@@ -117,26 +148,17 @@ export async function loadGraphToNeptune(
       });
     });
 
-    onProgress?.(`Inserting ${relRows.length} relationships...`);
+    onProgress?.(`Inserting ${relRows.length} relationships (batch=${EDGE_BATCH_SIZE})...`);
     const relCypher = `
       UNWIND $batch AS row
       MATCH (a {id: row.from}), (b {id: row.to})
       MERGE (a)-[r:CodeRelation {type: row.type}]->(b)
       SET r += row
     `;
-    await batchedInsert(client, relRows, relCypher);
+    await batchedInsert(client, relRows, relCypher, EDGE_BATCH_SIZE, 'batch', (done, total) => {
+      onProgress?.(`Inserting relationships ${done.toLocaleString()}/${total.toLocaleString()}...`);
+    });
     edgesInserted = relRows.length;
-
-    // 5. Create indexes for query performance
-    onProgress?.('Creating Neptune indexes...');
-    const indexLabels = ['Function', 'File', 'Class', 'Method', 'Interface', 'Module'];
-    for (const lbl of indexLabels) {
-      try {
-        await sendCypher(client, `CREATE INDEX ON :\`${lbl}\`(id)`);
-      } catch {
-        // Index may already exist or label may not exist — non-fatal
-      }
-    }
 
     onProgress?.('Neptune loading complete');
     return { nodesInserted, edgesInserted, warnings };

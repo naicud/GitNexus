@@ -53,6 +53,7 @@ interface UseSigmaOptions {
   onNodeClick?: (nodeId: string) => void;
   onNodeHover?: (nodeId: string | null) => void;
   onStageClick?: () => void;
+  onGroupExpand?: (groupLabel: string, groupId: string) => void;
   highlightedNodeIds?: Set<string>;
   blastRadiusNodeIds?: Set<string>;
   animatedNodes?: Map<string, NodeAnimation>;
@@ -62,6 +63,7 @@ interface UseSigmaOptions {
 interface UseSigmaReturn {
   containerRef: React.RefObject<HTMLDivElement>;
   sigmaRef: React.RefObject<Sigma | null>;
+  graphRef: React.RefObject<Graph<SigmaNodeAttributes, SigmaEdgeAttributes> | null>;
   setGraph: (graph: Graph<SigmaNodeAttributes, SigmaEdgeAttributes>) => void;
   zoomIn: () => void;
   zoomOut: () => void;
@@ -70,6 +72,7 @@ interface UseSigmaReturn {
   isLayoutRunning: boolean;
   startLayout: () => void;
   stopLayout: () => void;
+  runLayout: (graph: Graph<SigmaNodeAttributes, SigmaEdgeAttributes>) => void;
   selectedNode: string | null;
   setSelectedNode: (nodeId: string | null) => void;
   refreshHighlights: () => void;
@@ -462,6 +465,18 @@ export const useSigma = (options: UseSigmaOptions = {}): UseSigmaReturn => {
       options.onNodeClick?.(node);
     });
 
+    sigma.on('doubleClickNode', ({ node, event }) => {
+      event.preventSigmaDefault();
+      const graph = graphRef.current;
+      if (!graph || !graph.hasNode(node)) return;
+      const attrs = graph.getNodeAttributes(node);
+      if (attrs.nodeType === 'ClusterGroup') {
+        // Extract the group label from the display label (e.g. "Ingestion (135)" -> "Ingestion")
+        const label = (attrs.label || '').replace(/\s*\(\d+\)$/, '');
+        options.onGroupExpand?.(label, node);
+      }
+    });
+
     sigma.on('clickStage', () => {
       setSelectedNode(null);
       options.onStageClick?.();
@@ -624,6 +639,7 @@ export const useSigma = (options: UseSigmaOptions = {}): UseSigmaReturn => {
   return {
     containerRef,
     sigmaRef,
+    graphRef,
     setGraph,
     zoomIn,
     zoomOut,
@@ -632,6 +648,7 @@ export const useSigma = (options: UseSigmaOptions = {}): UseSigmaReturn => {
     isLayoutRunning,
     startLayout,
     stopLayout,
+    runLayout,
     selectedNode,
     setSelectedNode,
     refreshHighlights,

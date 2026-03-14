@@ -12,7 +12,9 @@ import { CodeReferencesPanel } from './components/CodeReferencesPanel';
 import { FileEntry } from './services/zip';
 import { getActiveProviderConfig } from './core/llm/settings-service';
 import { createKnowledgeGraph } from './core/graph/graph';
-import { connectToServer, fetchRepos, normalizeServerUrl, type ConnectToServerResult } from './services/server-connection';
+import { connectToServer, fetchRepos, fetchRepoInfo, normalizeServerUrl, type ConnectToServerResult } from './services/server-connection';
+import { fetchGraphInfo, fetchGraphSummary } from './services/graph-lod';
+import { summaryToGraphology } from './lib/summary-graph-adapter';
 
 const AppContent = () => {
   const {
@@ -42,6 +44,9 @@ const AppContent = () => {
     availableRepos,
     setAvailableRepos,
     switchRepo,
+    setGraphViewMode,
+    setGraphSummary,
+    setExpandedGroups,
   } = useAppState();
 
   const graphCanvasRef = useRef<GraphCanvasHandle>(null);
@@ -196,41 +201,87 @@ const AppContent = () => {
 
     const baseUrl = normalizeServerUrl(serverUrl);
 
-    connectToServer(serverUrl, (phase, downloaded, total) => {
-      if (phase === 'validating') {
-        setProgress({ phase: 'extracting', percent: 5, message: 'Connecting to server...', detail: 'Validating server' });
-      } else if (phase === 'downloading') {
-        const pct = total ? Math.round((downloaded / total) * 90) + 5 : 50;
-        const mb = (downloaded / (1024 * 1024)).toFixed(1);
-        setProgress({ phase: 'extracting', percent: pct, message: 'Downloading graph...', detail: `${mb} MB downloaded` });
-      } else if (phase === 'extracting') {
-        setProgress({ phase: 'extracting', percent: 97, message: 'Processing...', detail: 'Extracting file contents' });
-      }
-    }).then(async (result) => {
-      handleServerConnect(result, baseUrl);
+    const repoParam = params.get('repo') || undefined;
 
-      // Store server URL and fetch available repos for the repo switcher
-      setServerBaseUrl(baseUrl);
+    // Smart connect: check graph info first to decide LOD vs full mode
+    (async () => {
       try {
-        const repos = await fetchRepos(baseUrl);
-        setAvailableRepos(repos);
-      } catch (e) {
-        console.warn('Failed to fetch repo list:', e);
+        setServerBaseUrl(baseUrl);
+
+        // Fetch repo info for project name
+        const repoInfo = await fetchRepoInfo(baseUrl, repoParam);
+        const name = repoInfo.repoPath.split('/').pop() || 'server-project';
+        setProjectName(name);
+
+        // Check if LOD mode should be used
+        let useLOD = false;
+        try {
+          const graphInfo = await fetchGraphInfo(baseUrl, repoParam || name);
+          useLOD = graphInfo.mode === 'summary';
+        } catch {
+          // Older server without /api/graph/info — fall back to full mode
+        }
+
+        if (useLOD) {
+          // LOD path: fetch summary instead of full graph
+          setProgress({ phase: 'extracting', percent: 50, message: 'Loading graph summary...', detail: 'Fetching cluster overview' });
+          const summary = await fetchGraphSummary(baseUrl, repoParam || name);
+
+          setProgress({ phase: 'extracting', percent: 90, message: 'Building visualization...', detail: `${summary.clusterGroups.length} cluster groups` });
+
+          // Convert summary to Sigma graph (no KnowledgeGraph needed for LOD)
+          // Set an empty KnowledgeGraph so the app doesn't break
+          const emptyGraph = createKnowledgeGraph();
+          setGraph(emptyGraph);
+          setFileContents(new Map());
+          setGraphSummary(summary);
+          setGraphViewMode('summary');
+          setExpandedGroups(new Map());
+          setViewMode('exploring');
+
+          if (getActiveProviderConfig()) {
+            initializeAgent(name, baseUrl);
+          }
+        } else {
+          // Full-graph path: existing behavior
+          const result = await connectToServer(serverUrl, (phase, downloaded, total) => {
+            if (phase === 'validating') {
+              setProgress({ phase: 'extracting', percent: 5, message: 'Connecting to server...', detail: 'Validating server' });
+            } else if (phase === 'downloading') {
+              const pct = total ? Math.round((downloaded / total) * 90) + 5 : 50;
+              const mb = (downloaded / (1024 * 1024)).toFixed(1);
+              setProgress({ phase: 'extracting', percent: pct, message: 'Downloading graph...', detail: `${mb} MB downloaded` });
+            } else if (phase === 'extracting') {
+              setProgress({ phase: 'extracting', percent: 97, message: 'Processing...', detail: 'Extracting file contents' });
+            }
+          }, undefined, repoParam);
+
+          handleServerConnect(result, baseUrl);
+          setGraphViewMode('full');
+        }
+
+        // Fetch available repos for the repo switcher
+        try {
+          const repos = await fetchRepos(baseUrl);
+          setAvailableRepos(repos);
+        } catch (e) {
+          console.warn('Failed to fetch repo list:', e);
+        }
+      } catch (err) {
+        console.error('Auto-connect failed:', err);
+        setProgress({
+          phase: 'error',
+          percent: 0,
+          message: 'Failed to connect to server',
+          detail: err instanceof Error ? err.message : 'Unknown error',
+        });
+        setTimeout(() => {
+          setViewMode('onboarding');
+          setProgress(null);
+        }, 3000);
       }
-    }).catch((err) => {
-      console.error('Auto-connect failed:', err);
-      setProgress({
-        phase: 'error',
-        percent: 0,
-        message: 'Failed to connect to server',
-        detail: err instanceof Error ? err.message : 'Unknown error',
-      });
-      setTimeout(() => {
-        setViewMode('onboarding');
-        setProgress(null);
-      }, 3000);
-    });
-  }, [handleServerConnect, setProgress, setViewMode, setServerBaseUrl, setAvailableRepos]);
+    })();
+  }, [handleServerConnect, setProgress, setViewMode, setServerBaseUrl, setAvailableRepos, setProjectName, setGraph, setFileContents, setGraphSummary, setGraphViewMode, setExpandedGroups, initializeAgent]);
 
   const handleFocusNode = useCallback((nodeId: string) => {
     graphCanvasRef.current?.focusNode(nodeId);

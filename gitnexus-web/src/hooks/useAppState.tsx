@@ -1206,6 +1206,13 @@ export const AppStateProvider = ({ children }: { children: ReactNode }) => {
     availableRepos,
     setAvailableRepos,
     switchRepo,
+    // LOD state
+    graphViewMode,
+    setGraphViewMode,
+    expandedGroups,
+    setExpandedGroups,
+    graphSummary,
+    setGraphSummary,
     runPipeline,
     runPipelineFromFiles,
     runQuery,
