@@ -20,7 +20,8 @@ import {
   ToolMessage,
   SystemMessage,
 } from '@langchain/core/messages';
-import type { ChatResult, ChatGenerationChunk } from '@langchain/core/outputs';
+import type { ChatResult } from '@langchain/core/outputs';
+import { ChatGenerationChunk } from '@langchain/core/outputs';
 import type { CallbackManagerForLLMRun } from '@langchain/core/callbacks/manager';
 import type { StructuredToolInterface } from '@langchain/core/tools';
 import { z } from 'zod';
@@ -70,7 +71,15 @@ function toBedrockMessages(messages: BaseMessage[]): {
     }
 
     if (type === 'human') {
-      out.push({ role: 'user', content: [{ type: 'text', text: String(msg.content) }] });
+      const textBlock = { type: 'text' as const, text: String(msg.content) };
+      const last = out[out.length - 1];
+      if (last?.role === 'user') {
+        // Merge into the previous user turn — Bedrock requires strictly alternating roles.
+        // Consecutive user messages occur when a prior turn failed before producing an assistant reply.
+        last.content.push(textBlock);
+      } else {
+        out.push({ role: 'user', content: [textBlock] });
+      }
       continue;
     }
 
@@ -331,12 +340,11 @@ export class ChatBedrockBrowser extends BaseChatModel {
       if (event.contentBlockDelta?.delta?.text) {
         const text: string = event.contentBlockDelta.delta.text;
         await runManager?.handleLLMNewToken(text);
-        const { ChatGenerationChunk: CGC } = await import('@langchain/core/outputs');
-        yield new CGC({ text, message: new AIMessageChunk(text) });
+        yield new ChatGenerationChunk({ text, message: new AIMessageChunk(text) });
 
-      } else if (event.contentBlockStart?.contentBlock?.type === 'tool_use') {
+      } else if (event.contentBlockStart?.start?.toolUse) {
         const { contentBlockIndex } = event.contentBlockStart;
-        const { toolUseId, name } = event.contentBlockStart.contentBlock;
+        const { toolUseId, name } = event.contentBlockStart.start.toolUse;
         toolAccumulator[contentBlockIndex] = { id: toolUseId, name, input: '' };
 
       } else if (event.contentBlockDelta?.delta?.toolUse?.input != null) {
@@ -352,13 +360,32 @@ export class ChatBedrockBrowser extends BaseChatModel {
           let args: Record<string, unknown> = {};
           try { args = JSON.parse(acc.input); } catch { /* ignore */ }
           const tool_calls = [{ id: acc.id, name: acc.name, args, type: 'tool_call' as const }];
-          const { ChatGenerationChunk: CGC } = await import('@langchain/core/outputs');
-          yield new CGC({
+          yield new ChatGenerationChunk({
             text: '',
             message: new AIMessageChunk({ content: '', tool_calls }),
           });
           delete toolAccumulator[idx];
         }
+
+      } else if (
+        event.internalServerException ||
+        event.modelStreamErrorException ||
+        event.validationException ||
+        event.throttlingException ||
+        event.serviceUnavailableException ||
+        event.modelNotReadyException
+      ) {
+        // In-band Bedrock error — surface as a real error so the caller sees the message
+        // instead of silently swallowing it and causing "Received empty response" from LangChain.
+        const msg =
+          event.internalServerException?.message ||
+          event.modelStreamErrorException?.message ||
+          event.validationException?.message ||
+          event.throttlingException?.message ||
+          event.serviceUnavailableException?.message ||
+          event.modelNotReadyException?.message ||
+          'Bedrock stream error';
+        throw new Error(`Bedrock: ${msg}`);
       }
     }
   }

@@ -133,7 +133,7 @@ const AppContent = () => {
     }
   }, [setViewMode, setGraph, setFileContents, setProgress, setProjectName, runPipelineFromFiles, startEmbeddings, initializeAgent]);
 
-  const handleServerConnect = useCallback((result: ConnectToServerResult) => {
+  const handleServerConnect = useCallback((result: ConnectToServerResult, backendUrl?: string) => {
     // Extract project name from repoPath
     const repoPath = result.repoInfo.repoPath;
     const projectName = repoPath.split('/').pop() || 'server-project';
@@ -159,9 +159,11 @@ const AppContent = () => {
     // Transition directly to exploring view
     setViewMode('exploring');
 
-    // Initialize agent if LLM is configured
+    // Initialize agent if LLM is configured.
+    // Pass backendUrl and fileMap explicitly: React state (serverBaseUrl, fileContents)
+    // may not have updated yet when this callback runs.
     if (getActiveProviderConfig()) {
-      initializeAgent(projectName);
+      initializeAgent(projectName, backendUrl, fileMap);
     }
 
     // Auto-start embeddings
@@ -204,7 +206,7 @@ const AppContent = () => {
         setProgress({ phase: 'extracting', percent: 97, message: 'Processing...', detail: 'Extracting file contents' });
       }
     }).then(async (result) => {
-      handleServerConnect(result);
+      handleServerConnect(result, baseUrl);
 
       // Store server URL and fetch available repos for the repo switcher
       setServerBaseUrl(baseUrl);
@@ -247,9 +249,9 @@ const AppContent = () => {
         onFileSelect={handleFileSelect}
         onGitClone={handleGitClone}
         onServerConnect={async (result, serverUrl) => {
-          handleServerConnect(result);
-          if (serverUrl) {
-            const baseUrl = normalizeServerUrl(serverUrl);
+          const baseUrl = serverUrl ? normalizeServerUrl(serverUrl) : undefined;
+          handleServerConnect(result, baseUrl);
+          if (baseUrl) {
             setServerBaseUrl(baseUrl);
             try {
               const repos = await fetchRepos(baseUrl);

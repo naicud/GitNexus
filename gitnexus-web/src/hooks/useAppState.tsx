@@ -13,6 +13,7 @@ import type { AgentMessage } from '../core/llm/agent';
 import { DEFAULT_VISIBLE_EDGES, type EdgeType } from '../lib/constants';
 import type { RepoSummary, ConnectToServerResult } from '../services/server-connection';
 import { fetchRepos, connectToServer } from '../services/server-connection';
+import { getBackendUrl } from '../services/backend';
 
 export type ViewMode = 'onboarding' | 'loading' | 'exploring';
 export type RightPanelTab = 'code' | 'chat';
@@ -155,7 +156,7 @@ interface AppState {
 
   // LLM methods
   refreshLLMSettings: () => void;
-  initializeAgent: (overrideProjectName?: string) => Promise<void>;
+  initializeAgent: (overrideProjectName?: string, overrideBackendUrl?: string, overrideFileContents?: Map<string, string>) => Promise<void>;
   sendChatMessage: (message: string) => Promise<void>;
   stopChatResponse: () => void;
   clearChat: () => void;
@@ -180,6 +181,8 @@ export const AppStateProvider = ({ children }: { children: ReactNode }) => {
   // Graph data
   const [graph, setGraph] = useState<KnowledgeGraph | null>(null);
   const [fileContents, setFileContents] = useState<Map<string, string>>(new Map());
+  const fileContentsRef = useRef<Map<string, string>>(new Map());
+  useEffect(() => { fileContentsRef.current = fileContents; }, [fileContents]);
 
   // Selection
   const [selectedNode, setSelectedNode] = useState<GraphNode | null>(null);
@@ -565,7 +568,11 @@ export const AppStateProvider = ({ children }: { children: ReactNode }) => {
     setLLMSettings(loadSettings());
   }, []);
 
-  const initializeAgent = useCallback(async (overrideProjectName?: string): Promise<void> => {
+  const initializeAgent = useCallback(async (
+    overrideProjectName?: string,
+    overrideBackendUrl?: string,
+    overrideFileContents?: Map<string, string>,
+  ): Promise<void> => {
     const api = apiRef.current;
     if (!api) {
       setAgentError('Worker not initialized');
@@ -578,9 +585,15 @@ export const AppStateProvider = ({ children }: { children: ReactNode }) => {
       return;
     }
 
-    // Inject proxy URL for Bedrock when backend is connected (bypasses browser CORS/COEP)
-    if (config.provider === 'bedrock' && serverBaseUrl) {
-      (config as import('../core/llm/types').AWSBedrockConfig).proxyBaseUrl = serverBaseUrl;
+    // Resolve effective backend URL (explicit override takes priority over state)
+    const effectiveBackendUrl = overrideBackendUrl ?? serverBaseUrl ?? undefined;
+
+    // Bedrock CANNOT be called directly from the browser (AWS blocks CORS).
+    // Always route through the backend proxy. Use the connected server URL if available,
+    // otherwise fall back to the default local backend (http://localhost:4747).
+    if (config.provider === 'bedrock') {
+      const proxyUrl = effectiveBackendUrl ?? getBackendUrl();
+      (config as import('../core/llm/types').AWSBedrockConfig).proxyBaseUrl = proxyUrl.replace(/\/api$/, '');
     }
 
     setIsAgentInitializing(true);
@@ -589,7 +602,27 @@ export const AppStateProvider = ({ children }: { children: ReactNode }) => {
     try {
       // Use override if provided (for fresh loads), fallback to state (for re-init)
       const effectiveProjectName = overrideProjectName || projectName || 'project';
-      const result = await api.initializeAgent(config, effectiveProjectName);
+
+      let result: { success: boolean; error?: string };
+
+      if (effectiveBackendUrl) {
+        // Backend server mode: agent tools route through HTTP to the gitnexus server.
+        // KuzuDB is not initialized in this mode, so api.initializeAgent() would fail.
+        const fileContentsEntries = Array.from(
+          (overrideFileContents ?? fileContentsRef.current).entries()
+        );
+        result = await api.initializeBackendAgent(
+          config,
+          effectiveBackendUrl,
+          effectiveProjectName,  // repoName used in /api/query and /api/search calls
+          fileContentsEntries,
+          effectiveProjectName,  // display name for codebase context
+        );
+      } else {
+        // Local mode: KuzuDB is initialized by the ingestion pipeline
+        result = await api.initializeAgent(config, effectiveProjectName);
+      }
+
       if (result.success) {
         setIsAgentReady(true);
         setAgentError(null);
@@ -625,6 +658,13 @@ export const AppStateProvider = ({ children }: { children: ReactNode }) => {
       // Try to initialize first
       await initializeAgent();
       if (!apiRef.current) return;
+      // Guard: if init failed, stop here rather than hitting the worker's generic error
+      const ready = await apiRef.current.isAgentReady();
+      if (!ready) {
+        setAgentError('Agent could not be initialized. Check your LLM settings.');
+        setIsChatLoading(false);
+        return;
+      }
     }
 
     // Add user message
@@ -1024,7 +1064,7 @@ export const AppStateProvider = ({ children }: { children: ReactNode }) => {
 
       setViewMode('exploring');
 
-      if (getActiveProviderConfig()) initializeAgent(pName);
+      if (getActiveProviderConfig()) initializeAgent(pName, serverBaseUrl ?? undefined, fileMap);
 
       startEmbeddings().catch((err) => {
         if (err?.name === 'WebGPUNotAvailableError' || err?.message?.includes('WebGPU')) {

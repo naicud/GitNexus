@@ -450,6 +450,8 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
       }
 
       res.setHeader('Content-Type', awsResp.headers.get('content-type') || 'application/vnd.amazon.eventstream');
+      res.setHeader('Cache-Control', 'no-cache');
+      res.flushHeaders(); // Send headers immediately so the browser starts reading the stream
       // Pipe raw binary stream — frontend's parseEventStream() handles it as-is
       const readable = Readable.fromWeb(awsResp.body as any);
       readable.pipe(res);
