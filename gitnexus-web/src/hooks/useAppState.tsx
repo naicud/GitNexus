@@ -160,6 +160,7 @@ interface AppState {
   sendChatMessage: (message: string) => Promise<void>;
   stopChatResponse: () => void;
   clearChat: () => void;
+  generateCypherQuery: (question: string) => Promise<{ query: string; explanation: string } | { error: string }>;
 
   // Code References Panel
   codeReferences: CodeReference[];
@@ -1017,6 +1018,12 @@ export const AppStateProvider = ({ children }: { children: ReactNode }) => {
     setAgentError(null);
   }, []);
 
+  const generateCypherQuery = useCallback(async (question: string): Promise<{ query: string; explanation: string } | { error: string }> => {
+    const api = apiRef.current;
+    if (!api) return { error: 'Worker not initialized' };
+    return api.generateCypherQuery(question);
+  }, []);
+
   // Switch to a different repo on the connected server
   const switchRepo = useCallback(async (repoName: string) => {
     if (!serverBaseUrl) return;
@@ -1214,6 +1221,7 @@ export const AppStateProvider = ({ children }: { children: ReactNode }) => {
     sendChatMessage,
     stopChatResponse,
     clearChat,
+    generateCypherQuery,
     // Code References Panel
     codeReferences,
     isCodePanelOpen,

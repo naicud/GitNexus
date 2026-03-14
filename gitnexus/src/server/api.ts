@@ -420,6 +420,17 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
 
   /** Streaming Converse proxy — parses AWS Event Stream binary and forwards as NDJSON */
   app.post('/api/bedrock/converse-stream', async (req, res) => {
+    let aborted = false;
+    let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
+
+    // Detect client disconnect — abort the AWS stream immediately
+    res.on('close', () => {
+      if (!res.writableEnded) {
+        aborted = true;
+        try { reader?.cancel(); } catch { /* already closed */ }
+      }
+    });
+
     try {
       const { region, credentials, model, body } = req.body;
       if (!region || !credentials?.accessKeyId || !credentials?.secretAccessKey || !model || !body) {
@@ -436,20 +447,29 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
       });
 
       const url = `https://bedrock-runtime.${region}.amazonaws.com/model/${encodeURIComponent(model)}/converse-stream`;
-      const awsResp = await aws.fetch(url, {
+
+      // Timeout for the initial AWS response (model may take time to start generating)
+      const fetchTimeout = 120_000; // 2 minutes
+      const awsRespPromise = aws.fetch(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
       });
+      const timeoutPromise = new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error('Bedrock request timed out')), fetchTimeout)
+      );
+      const awsResp = await Promise.race([awsRespPromise, timeoutPromise]) as Response;
+
+      if (aborted) return;
 
       if (!awsResp.ok) {
         const errBody = await awsResp.text();
-        res.status(awsResp.status).json({ error: errBody });
+        if (!res.headersSent) res.status(awsResp.status).json({ error: errBody });
         return;
       }
 
       if (!awsResp.body) {
-        res.status(502).json({ error: 'No response body from Bedrock' });
+        if (!res.headersSent) res.status(502).json({ error: 'No response body from Bedrock' });
         return;
       }
 
@@ -461,18 +481,25 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
       res.setHeader('X-Accel-Buffering', 'no'); // disable nginx buffering if present
       res.flushHeaders();
 
-      const reader = (awsResp.body as ReadableStream<Uint8Array>).getReader();
+      reader = (awsResp.body as ReadableStream<Uint8Array>).getReader();
       const decoder = new TextDecoder();
       let buf = new Uint8Array(0);
 
-      try {
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
+      // Timeout for individual chunk reads — if Bedrock goes silent for too long, abort
+      const CHUNK_TIMEOUT = 120_000; // 2 minutes between chunks
 
-          const merged = new Uint8Array(buf.length + value.length);
+      try {
+        while (!aborted) {
+          // Race reader.read() against a timeout
+          const chunkTimeoutPromise = new Promise<{ done: true; value: undefined }>((_, reject) =>
+            setTimeout(() => reject(new Error('Bedrock stream chunk timed out')), CHUNK_TIMEOUT)
+          );
+          const { done, value } = await Promise.race([reader.read(), chunkTimeoutPromise]);
+          if (done || aborted) break;
+
+          const merged = new Uint8Array(buf.length + value!.length);
           merged.set(buf);
-          merged.set(value, buf.length);
+          merged.set(value!, buf.length);
           buf = merged;
 
           // Parse complete AWS Event Stream frames
@@ -480,6 +507,11 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
           while (buf.length >= 12) {
             const view = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
             const totalLen = view.getUint32(0);
+            if (totalLen < 16 || totalLen > 16 * 1024 * 1024) {
+              // Invalid frame — corrupted stream, skip remaining buffer
+              buf = new Uint8Array(0);
+              break;
+            }
             if (buf.length < totalLen) break;
 
             const headersLen = view.getUint32(4);
@@ -487,8 +519,10 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
             const payloadStart = 12 + headersLen;
             const payloadLen = totalLen - headersLen - 16;
 
-            // Parse binary headers to extract :event-type
+            // Parse binary headers to extract :event-type, :message-type, :exception-type
             let eventType = '';
+            let messageType = '';
+            let exceptionType = '';
             let offset = headersStart;
             const headersEnd = headersStart + headersLen;
             while (offset < headersEnd) {
@@ -499,6 +533,8 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
                 const valLen = (buf[offset] << 8) | buf[offset + 1]; offset += 2;
                 const val = decoder.decode(buf.slice(offset, offset + valLen)); offset += valLen;
                 if (name === ':event-type') eventType = val;
+                else if (name === ':message-type') messageType = val;
+                else if (name === ':exception-type') exceptionType = val;
               } else if (valueType === 6) { // bytes
                 const valLen = (buf[offset] << 8) | buf[offset + 1]; offset += 2;
                 offset += valLen;
@@ -513,10 +549,19 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
               }
             }
 
-            if (payloadLen > 0) {
+            if (payloadLen > 0 && !aborted) {
               const payload = buf.slice(payloadStart, payloadStart + payloadLen);
               try {
                 const data = JSON.parse(decoder.decode(payload));
+
+                // Handle exception frames — forward as NDJSON error and stop
+                if (messageType === 'exception' || exceptionType) {
+                  const errMsg = data.message || data.Message || exceptionType || 'Bedrock stream exception';
+                  res.write(JSON.stringify({ __error: { type: exceptionType || eventType, message: errMsg } }) + '\n');
+                  aborted = true;
+                  break;
+                }
+
                 // Wrap payload with event type to match SDK format:
                 // {"contentBlockDelta": {"delta": {"text": "..."}, "contentBlockIndex": 0}}
                 const wrapped = eventType ? { [eventType]: data } : data;
@@ -528,16 +573,20 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
           }
         }
       } finally {
-        reader.releaseLock();
+        try { reader.releaseLock(); } catch { /* already released */ }
       }
 
-      res.end();
+      if (!res.writableEnded) res.end();
     } catch (err: any) {
-      // If headers already sent, we can't change the status code
+      if (aborted) return; // client already gone
       if (!res.headersSent) {
         res.status(500).json({ error: err.message || 'Bedrock stream failed' });
       } else {
-        res.end();
+        // Stream already started — send error as NDJSON so client can see it
+        try {
+          res.write(JSON.stringify({ __error: { type: 'proxy_error', message: err.message || 'Bedrock stream failed' } }) + '\n');
+        } catch { /* write failed, client gone */ }
+        if (!res.writableEnded) res.end();
       }
     }
   });

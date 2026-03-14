@@ -261,7 +261,7 @@ export const createChatModel = (config: ProviderConfig): BaseChatModel => {
         maxTokens: bedrockConfig.maxTokens,
         streaming: true,
         proxyBaseUrl: bedrockConfig.proxyBaseUrl,
-      }) as unknown as BaseChatModel;
+      }) as BaseChatModel;
     }
 
     default:
