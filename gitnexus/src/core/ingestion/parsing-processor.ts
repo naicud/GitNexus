@@ -73,7 +73,7 @@ const processParsingWithWorkers = async (
     }
 
     for (const rel of result.relationships) {
-      graph.addRelationship(rel);
+      graph.addRelationship(rel as any);
     }
 
     for (const sym of result.symbols) {
@@ -122,26 +122,276 @@ const processParsingSequential = async (
       const regexResults = extractCobolSymbolsWithRegex(file.content, file.path);
       const fileId = generateId('File', file.path);
 
+      // --- Helper: emit node + DEFINES rel + symbol in one call ---
+      const emitNode = (label: string, nodeId: string, name: string, line: number, opts?: { isExported?: boolean; description?: string }): void => {
+        graph.addNode({
+          id: nodeId, label: label as any,
+          properties: {
+            name, filePath: file.path, startLine: line, endLine: line,
+            language: SupportedLanguages.COBOL,
+            isExported: opts?.isExported ?? false,
+            ...(opts?.description ? { description: opts.description } : {}),
+          },
+        });
+        graph.addRelationship({
+          id: generateId('DEFINES', `${fileId}->${nodeId}`),
+          sourceId: fileId, targetId: nodeId, type: 'DEFINES', confidence: 1.0, reason: '',
+        });
+        symbolTable.add(file.path, name, nodeId, label);
+      };
+
+      // --- Helper: emit a non-DEFINES relationship ---
+      const emitRel = (type: string, sourceId: string, targetId: string, confidence = 1.0, reason = ''): void => {
+        graph.addRelationship({
+          id: generateId(type, `${sourceId}->${targetId}`),
+          sourceId, targetId, type: type as any, confidence, reason,
+        });
+      };
+
+      // --- Helper: build description from key-value pairs ---
+      const buildDesc = (parts: Array<[string, string | number | undefined]>): string =>
+        parts.filter(([, v]) => v !== undefined).map(([k, v]) => `${k}:${v}`).join(' ');
+
+      // --- Helper: node label for a data item by level ---
+      const dataItemLabel = (level: number): string => (level === 1 ? 'Record' : 'Property');
+
+      // Program name → Module node (with metadata)
       if (regexResults.programName) {
         const nodeId = generateId('Module', `${file.path}:${regexResults.programName}`);
-        graph.addNode({ id: nodeId, label: 'Module' as any, properties: { name: regexResults.programName, filePath: file.path, startLine: 0, endLine: 0, language: SupportedLanguages.COBOL, isExported: true } });
-        graph.addRelationship({ id: generateId('DEFINES', `${fileId}->${nodeId}`), sourceId: fileId, targetId: nodeId, type: 'DEFINES', confidence: 1.0, reason: '' });
+        const metaDesc = buildDesc([
+          ['author', regexResults.programMetadata.author],
+          ['date', regexResults.programMetadata.dateWritten],
+        ]);
+        graph.addNode({
+          id: nodeId, label: 'Module' as any,
+          properties: {
+            name: regexResults.programName, filePath: file.path, startLine: 0, endLine: 0,
+            language: SupportedLanguages.COBOL, isExported: true,
+            ...(metaDesc ? { description: metaDesc } : {}),
+          },
+        });
+        graph.addRelationship({
+          id: generateId('DEFINES', `${fileId}->${nodeId}`),
+          sourceId: fileId, targetId: nodeId, type: 'DEFINES', confidence: 1.0, reason: '',
+        });
         symbolTable.add(file.path, regexResults.programName, nodeId, 'Module');
       }
 
+      const moduleId = regexResults.programName
+        ? generateId('Module', `${file.path}:${regexResults.programName}`)
+        : fileId;
+
       for (const para of regexResults.paragraphs) {
         const nodeId = generateId('Function', `${file.path}:${para.name}`);
-        graph.addNode({ id: nodeId, label: 'Function' as any, properties: { name: para.name, filePath: file.path, startLine: para.line, endLine: para.line, language: SupportedLanguages.COBOL, isExported: true } });
-        graph.addRelationship({ id: generateId('DEFINES', `${fileId}->${nodeId}`), sourceId: fileId, targetId: nodeId, type: 'DEFINES', confidence: 1.0, reason: '' });
-        symbolTable.add(file.path, para.name, nodeId, 'Function');
+        emitNode('Function', nodeId, para.name, para.line, { isExported: true });
       }
 
       for (const sec of regexResults.sections) {
         const nodeId = generateId('Namespace', `${file.path}:${sec.name}`);
-        graph.addNode({ id: nodeId, label: 'Namespace' as any, properties: { name: sec.name, filePath: file.path, startLine: sec.line, endLine: sec.line, language: SupportedLanguages.COBOL, isExported: true } });
-        graph.addRelationship({ id: generateId('DEFINES', `${fileId}->${nodeId}`), sourceId: fileId, targetId: nodeId, type: 'DEFINES', confidence: 1.0, reason: '' });
-        symbolTable.add(file.path, sec.name, nodeId, 'Namespace');
+        emitNode('Namespace', nodeId, sec.name, sec.line, { isExported: true });
       }
+
+      // =====================================================================
+      // Deep indexing: data items, file declarations, FD entries
+      // =====================================================================
+
+      // --- Data Items → Record / Property / Const nodes ---
+      // Cap data items per file to prevent copy-expansion explosion:
+      // after COPY expansion a program can have thousands of copybook data
+      // items, all with unique file-scoped IDs, which pushes the in-memory
+      // relationship Map past the 16.7M V8 limit across thousands of files.
+      const MAX_DATA_ITEMS_PER_FILE = 500;
+      const cappedDataItems = regexResults.dataItems.length > MAX_DATA_ITEMS_PER_FILE
+        ? regexResults.dataItems.slice(0, MAX_DATA_ITEMS_PER_FILE)
+        : regexResults.dataItems;
+
+      for (const item of cappedDataItems) {
+        if (item.values) {
+          const nodeId = generateId('Const', `${file.path}:${item.name}`);
+          const desc = `level:88 values:${item.values.join(',')}`;
+          emitNode('Const', nodeId, item.name, item.line, { description: desc });
+        } else if (item.level === 1) {
+          const nodeId = generateId('Record', `${file.path}:${item.name}`);
+          const desc = buildDesc([
+            ['level', '01'], ['pic', item.pic], ['usage', item.usage],
+            ['occurs', item.occurs], ['section', item.section],
+          ]);
+          emitNode('Record', nodeId, item.name, item.line, { description: desc });
+          if (item.redefines) {
+            emitRel('REDEFINES', nodeId, generateId('Record', `${file.path}:${item.redefines}`));
+          }
+        } else {
+          const nodeId = generateId('Property', `${file.path}:${item.name}`);
+          const desc = buildDesc([
+            ['level', String(item.level).padStart(2, '0')], ['pic', item.pic],
+            ['usage', item.usage], ['occurs', item.occurs], ['section', item.section],
+          ]);
+          emitNode('Property', nodeId, item.name, item.line, { description: desc });
+          if (item.redefines) {
+            emitRel('REDEFINES', nodeId, generateId('Property', `${file.path}:${item.redefines}`));
+          }
+        }
+      }
+
+      // --- CONTAINS hierarchy from level structure ---
+      const parentStack: Array<{ level: number; nodeId: string }> = [];
+      for (const item of cappedDataItems) {
+        if (item.values) continue; // 88-level handled separately below
+
+        const label = dataItemLabel(item.level);
+        const nodeId = generateId(label, `${file.path}:${item.name}`);
+
+        while (parentStack.length > 0 && parentStack[parentStack.length - 1].level >= item.level) {
+          parentStack.pop();
+        }
+
+        if (parentStack.length > 0) {
+          emitRel('CONTAINS', parentStack[parentStack.length - 1].nodeId, nodeId);
+        } else {
+          emitRel('CONTAINS', moduleId, nodeId);
+        }
+
+        parentStack.push({ level: item.level, nodeId });
+      }
+
+      // 88-level Const → parent Property/Record via CONTAINS
+      for (let i = 0; i < cappedDataItems.length; i++) {
+        const item = cappedDataItems[i];
+        if (!item.values) continue;
+        for (let j = i - 1; j >= 0; j--) {
+          if (!cappedDataItems[j].values) {
+            const parentLabel = dataItemLabel(cappedDataItems[j].level);
+            const parentId = generateId(parentLabel, `${file.path}:${cappedDataItems[j].name}`);
+            const constId = generateId('Const', `${file.path}:${item.name}`);
+            emitRel('CONTAINS', parentId, constId);
+            break;
+          }
+        }
+      }
+
+      // --- File Declarations → CodeElement nodes ---
+      for (const fd of regexResults.fileDeclarations) {
+        const nodeId = generateId('CodeElement', `${file.path}:SELECT:${fd.selectName}`);
+        const descParts = ['select'];
+        if (fd.organization) descParts.push(`org:${fd.organization}`);
+        if (fd.access) descParts.push(`access:${fd.access}`);
+        if (fd.recordKey) descParts.push(`key:${fd.recordKey}`);
+        if (fd.fileStatus) descParts.push(`status:${fd.fileStatus}`);
+        if (fd.assignTo) descParts.push(`assign:${fd.assignTo}`);
+        emitNode('CodeElement', nodeId, fd.selectName, fd.line, { description: descParts.join(' ') });
+
+        if (fd.recordKey) {
+          emitRel('RECORD_KEY_OF', generateId('Property', `${file.path}:${fd.recordKey}`), nodeId, 0.8, 'select-clause');
+        }
+        if (fd.fileStatus) {
+          emitRel('FILE_STATUS_OF', generateId('Property', `${file.path}:${fd.fileStatus}`), nodeId, 0.8, 'select-clause');
+        }
+      }
+
+      // --- FD Entries → CodeElement nodes ---
+      for (const fd of regexResults.fdEntries) {
+        const nodeId = generateId('CodeElement', `${file.path}:FD:${fd.fdName}`);
+        const fdDescParts = ['fd'];
+        if (fd.recordName) fdDescParts.push(`record:${fd.recordName}`);
+        emitNode('CodeElement', nodeId, fd.fdName, fd.line, { description: fdDescParts.join(' ') });
+
+        if (fd.recordName) {
+          emitRel('CONTAINS', nodeId, generateId('Record', `${file.path}:${fd.recordName}`));
+        }
+        emitRel('CONTAINS', generateId('CodeElement', `${file.path}:SELECT:${fd.fdName}`), nodeId, 0.9, 'fd-select-link');
+      }
+
+      // =====================================================================
+      // Phase 2: EXEC SQL blocks → CodeElement nodes + ACCESSES edges
+      // =====================================================================
+
+      const emittedSqlIds = new Set<string>();
+
+      for (const sql of regexResults.execSqlBlocks) {
+        for (const table of sql.tables) {
+          const tableId = generateId('CodeElement', `${file.path}:sql-table:${table}`);
+          if (!emittedSqlIds.has(tableId)) {
+            emittedSqlIds.add(tableId);
+            emitNode('CodeElement', tableId, table, sql.line, {
+              description: `sql-table op:${sql.operation}`,
+            });
+          }
+          emitRel('ACCESSES', moduleId, tableId, 0.9, 'exec-sql');
+        }
+
+        for (const cursor of sql.cursors) {
+          const cursorId = generateId('CodeElement', `${file.path}:sql-cursor:${cursor}`);
+          if (!emittedSqlIds.has(cursorId)) {
+            emittedSqlIds.add(cursorId);
+            emitNode('CodeElement', cursorId, cursor, sql.line, {
+              description: 'sql-cursor',
+            });
+          }
+          emitRel('ACCESSES', moduleId, cursorId, 0.9, 'exec-sql');
+        }
+      }
+
+      // =====================================================================
+      // Phase 2: EXEC CICS blocks → CodeElement nodes + ACCESSES/CALLS edges
+      // =====================================================================
+
+      const emittedCicsIds = new Set<string>();
+
+      for (const cics of regexResults.execCicsBlocks) {
+        if (cics.mapName) {
+          const mapId = generateId('CodeElement', `${file.path}:cics-map:${cics.mapName}`);
+          if (!emittedCicsIds.has(mapId)) {
+            emittedCicsIds.add(mapId);
+            emitNode('CodeElement', mapId, cics.mapName, cics.line, {
+              description: `cics-map cmd:${cics.command}`,
+            });
+          }
+          emitRel('ACCESSES', moduleId, mapId, 0.9, 'exec-cics');
+        }
+
+        if (cics.programName) {
+          // CICS LINK/XCTL program calls — emit as CALLS relationship directly
+          const calledModuleId = generateId('Module', `${cics.programName}`);
+          emitRel('CALLS', moduleId, calledModuleId, 0.9, 'exec-cics');
+        }
+
+        if (cics.transId) {
+          const transIdNode = generateId('CodeElement', `${file.path}:cics-transid:${cics.transId}`);
+          if (!emittedCicsIds.has(transIdNode)) {
+            emittedCicsIds.add(transIdNode);
+            emitNode('CodeElement', transIdNode, cics.transId, cics.line, {
+              description: `cics-transid cmd:${cics.command}`,
+            });
+          }
+          emitRel('ACCESSES', moduleId, transIdNode, 0.9, 'exec-cics');
+        }
+      }
+
+      // =====================================================================
+      // Phase 3: PROCEDURE DIVISION USING → RECEIVES edges
+      // =====================================================================
+
+      for (const paramName of regexResults.procedureUsing) {
+        const propId = generateId('Property', `${file.path}:${paramName}`);
+        emitRel('RECEIVES', moduleId, propId, 0.8, 'procedure-using');
+      }
+
+      // =====================================================================
+      // Phase 3: ENTRY points → Constructor nodes
+      // =====================================================================
+
+      for (const entry of regexResults.entryPoints) {
+        const entryId = generateId('Constructor', `${file.path}:${entry.name}`);
+        const desc = entry.parameters.length > 0 ? `entry params:${entry.parameters.join(',')}` : 'entry';
+        emitNode('Constructor', entryId, entry.name, entry.line, { description: desc });
+        emitRel('CONTAINS', moduleId, entryId);
+        symbolTable.add(file.path, entry.name, entryId, 'Constructor');
+      }
+
+      // NOTE: DATA_FLOW edges from MOVE statements are intentionally omitted.
+      // They are intra-file (Property → Property with file-scoped IDs), not in
+      // REL_TYPES, and generate O(moves × files) relationships that push the
+      // in-memory Map past V8's 16.7M limit on large COBOL repos.
 
       continue;
     }
