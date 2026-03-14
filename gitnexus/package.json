@@ -76,7 +76,8 @@
     "tree-sitter-rust": "^0.21.0",
     "tree-sitter-typescript": "^0.21.0",
     "uuid": "^13.0.0",
-    "aws4fetch": "^1.0.20"
+    "aws4fetch": "^1.0.20",
+    "@aws-sdk/client-neptunedata": "^3.0.0"
   },
   "optionalDependencies": {
     "tree-sitter-cobol": "^0.0.1",
