@@ -77,6 +77,18 @@ async function batchedInsert(
   }
 }
 
+/** Neptune openCypher only accepts simple literals (string, number, boolean) as property values. */
+function sanitizeForNeptune(props: Record<string, unknown>): Record<string, unknown> {
+  const clean: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(props)) {
+    if (v === null || v === undefined) continue;
+    if (Array.isArray(v)) { clean[k] = v.join(','); continue; }
+    if (typeof v === 'object') { clean[k] = JSON.stringify(v); continue; }
+    clean[k] = v;
+  }
+  return clean;
+}
+
 /**
  * Load a KnowledgeGraph into Neptune.
  *
@@ -126,7 +138,7 @@ export async function loadGraphToNeptune(
       // Flatten node.properties into the batch row alongside the id
       nodesByLabel.get(label)!.push({
         id: node.id,
-        ...node.properties,
+        ...sanitizeForNeptune(node.properties as Record<string, unknown>),
       });
     });
 
@@ -164,14 +176,15 @@ export async function loadGraphToNeptune(
     // 5. Insert relationships (smaller batches — MATCH on two nodes is heavier)
     const relRows: NeptuneBatchRow[] = [];
     graph.forEachRelationship((rel) => {
-      relRows.push({
+      const row: NeptuneBatchRow = {
         from: rel.sourceId,
         to: rel.targetId,
         type: rel.type ?? 'CALLS',
-        confidence: rel.confidence ?? null,
-        reason: rel.reason ?? null,
-        step: rel.step ?? null,
-      });
+        confidence: rel.confidence,
+        reason: rel.reason,
+      };
+      if (rel.step != null) row.step = rel.step;
+      relRows.push(row);
     });
 
     onProgress?.(`Inserting ${relRows.length.toLocaleString()} relationships (batch=${EDGE_BATCH_SIZE})...`);

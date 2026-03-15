@@ -606,13 +606,8 @@ export const processParsing = async (
   workerPool?: WorkerPool,
 ): Promise<WorkerExtractedData | null> => {
   if (workerPool) {
-    try {
-      return await processParsingWithWorkers(graph, files, symbolTable, astCache, workerPool, onFileProgress);
-    } catch (err) {
-      console.warn('Worker pool parsing failed, falling back to sequential:', err instanceof Error ? err.message : err);
-    }
+    return await processParsingWithWorkers(graph, files, symbolTable, astCache, workerPool, onFileProgress);
   }
 
-  // Fallback: sequential parsing — returns COBOL extracted data if present
   return await processParsingSequential(graph, files, symbolTable, astCache, onFileProgress);
 };

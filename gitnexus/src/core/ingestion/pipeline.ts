@@ -387,7 +387,12 @@ export const runPipelineFromRepo = async (
         console.log(`🔧 Worker pool: ${workerPool.size} workers, sub-batch=${cobolSubBatch} (COBOL mode)`);
       }
     } catch (err) {
-      if (isDev) console.warn('Worker pool creation failed, using sequential fallback:', (err as Error).message);
+      const msg = (err as Error).message;
+      if (msg.includes('Worker script not found')) {
+        if (isDev) console.warn('Worker pool: compiled worker not found, using sequential fallback');
+      } else {
+        throw new Error(`Worker pool creation failed: ${msg}`);
+      }
     }
 
     let filesParsedSoFar = 0;

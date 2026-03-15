@@ -34,7 +34,7 @@ const SUB_BATCH_TIMEOUT_MS = Number(process.env.GITNEXUS_WORKER_TIMEOUT_MS) || 1
 /** Time to wait for all workers to signal readiness before giving up.
  *  Workers send { type: 'ready' } after module init (tree-sitter loading etc.).
  *  Configurable via GITNEXUS_WORKER_STARTUP_TIMEOUT_MS. */
-const WORKER_STARTUP_TIMEOUT_MS = Number(process.env.GITNEXUS_WORKER_STARTUP_TIMEOUT_MS) || 60_000;
+const WORKER_STARTUP_TIMEOUT_MS = Number(process.env.GITNEXUS_WORKER_STARTUP_TIMEOUT_MS) || 10_000;
 
 /**
  * Create a pool of worker threads.
@@ -58,26 +58,49 @@ export const createWorkerPool = (workerUrl: URL, poolSize?: number, subBatchSize
     const worker = new Worker(workerUrl);
     workers.push(worker);
 
-    readyPromises.push(new Promise<void>((resolve) => {
+    readyPromises.push(new Promise<void>((resolve, reject) => {
       const onReady = (msg: any) => {
         if (msg && msg.type === 'ready') {
-          worker.removeListener('message', onReady);
+          cleanup();
           resolve();
         }
       };
+      const onError = (err: Error) => {
+        cleanup();
+        reject(new Error(`Worker ${i} failed during startup: ${err.message}`));
+      };
+      const onExit = (code: number) => {
+        cleanup();
+        reject(new Error(`Worker ${i} exited with code ${code} during startup.`));
+      };
+      const cleanup = () => {
+        worker.removeListener('message', onReady);
+        worker.removeListener('error', onError);
+        worker.removeListener('exit', onExit);
+      };
       worker.on('message', onReady);
+      worker.once('error', onError);
+      worker.once('exit', onExit);
     }));
   }
 
-  const allWorkersReady = Promise.race([
-    Promise.all(readyPromises),
-    new Promise<void[]>((_, reject) =>
-      setTimeout(() => reject(new Error(
+  const allWorkersReady = new Promise<void[]>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new Error(
         `Workers failed to become ready within ${WORKER_STARTUP_TIMEOUT_MS / 1000}s. ` +
         `Increase GITNEXUS_WORKER_STARTUP_TIMEOUT_MS or check for native module loading issues.`
-      )), WORKER_STARTUP_TIMEOUT_MS)
-    ),
-  ]);
+      ));
+    }, WORKER_STARTUP_TIMEOUT_MS);
+    if (typeof timer.unref === 'function') timer.unref();
+
+    Promise.all(readyPromises).then(
+      (result) => { clearTimeout(timer); resolve(result); },
+      (err) => { clearTimeout(timer); reject(err); },
+    );
+  });
+
+  // Prevent unhandled rejection if terminate() is called before any dispatch()
+  allWorkersReady.catch(() => {});
 
   const dispatch = <TInput, TResult>(items: TInput[], onProgress?: (filesProcessed: number) => void): Promise<TResult[]> => {
     if (items.length === 0) return Promise.resolve([]);
