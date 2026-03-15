@@ -51,6 +51,10 @@ export function summaryToGraphology(
   const goldenAngle = Math.PI * (3 - Math.sqrt(5));
   const spread = Math.sqrt(groupCount) * 200;
 
+  // Collect nodes for batch import
+  const groupNodeIds = new Set<string>();
+  const batchNodes: Array<{ key: string; attributes: SigmaNodeAttributes }> = [];
+
   summary.clusterGroups.forEach((group, idx) => {
     const angle = idx * goldenAngle;
     const radius = spread * Math.sqrt((idx + 1) / groupCount);
@@ -60,39 +64,55 @@ export function summaryToGraphology(
     const size = Math.max(4, Math.log2(group.symbolCount) * 3);
     const color = getCommunityColor(idx);
 
-    graph.addNode(group.id, {
-      x,
-      y,
-      size,
-      color,
-      label: `${group.label} (${group.symbolCount})`,
-      nodeType: 'ClusterGroup' as NodeLabel,
-      filePath: '',
-      hidden: false,
-      mass: 50, // High mass for stable layout
-      community: idx,
-      communityColor: color,
+    groupNodeIds.add(group.id);
+    batchNodes.push({
+      key: group.id,
+      attributes: {
+        x,
+        y,
+        size,
+        color,
+        label: `${group.label} (${group.symbolCount})`,
+        nodeType: 'ClusterGroup' as NodeLabel,
+        filePath: '',
+        hidden: false,
+        mass: 50, // High mass for stable layout
+        community: idx,
+        communityColor: color,
+      },
     });
   });
 
-  // Add inter-group edges
+  // Collect edges for batch import, deduplicating as we go
+  const batchEdges: Array<{ key: string; source: string; target: string; attributes: SigmaEdgeAttributes }> = [];
+  const addedEdgeKeys = new Set<string>();
+
   for (const edge of summary.interGroupEdges) {
-    if (!graph.hasNode(edge.sourceGroupId) || !graph.hasNode(edge.targetGroupId)) continue;
+    if (!groupNodeIds.has(edge.sourceGroupId) || !groupNodeIds.has(edge.targetGroupId)) continue;
 
     const edgeId = `${edge.sourceGroupId}_to_${edge.targetGroupId}`;
-    if (graph.hasEdge(edgeId)) continue;
+    if (addedEdgeKeys.has(edgeId)) continue;
+    addedEdgeKeys.add(edgeId);
 
     const dominant = dominantEdgeType(edge.types);
     const style = EDGE_STYLES[dominant] || { color: '#4a4a5a', sizeMultiplier: 0.5 };
 
-    graph.addEdgeWithKey(edgeId, edge.sourceGroupId, edge.targetGroupId, {
-      size: Math.max(0.5, Math.log2(edge.count) * 0.8),
-      color: style.color,
-      relationType: dominant,
-      type: 'curved',
-      curvature: 0.15,
+    batchEdges.push({
+      key: edgeId,
+      source: edge.sourceGroupId,
+      target: edge.targetGroupId,
+      attributes: {
+        size: Math.max(0.5, Math.log2(edge.count) * 0.8),
+        color: style.color,
+        relationType: dominant,
+        type: 'curved',
+        curvature: 0.15,
+      },
     });
   }
+
+  // Batch import: single operation eliminates O(n) individual event emissions
+  graph.import({ nodes: batchNodes, edges: batchEdges });
 
   return graph;
 }

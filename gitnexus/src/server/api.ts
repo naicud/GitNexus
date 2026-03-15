@@ -32,7 +32,7 @@ function getDbConfigFromEntry(entry: { storagePath: string; db?: DbConfig }): Db
   return { type: 'kuzu', kuzuPath: path.join(entry.storagePath, 'kuzu') };
 }
 
-const NODE_HARD_CAP = 5000;
+const NODE_HARD_CAP = 20000;
 
 const buildGraph = async (limit?: number): Promise<{ nodes: GraphNode[]; relationships: GraphRelationship[]; truncated: boolean; totalAvailable: number }> => {
   const cap = limit ?? NODE_HARD_CAP;

@@ -92,21 +92,23 @@ const getFA2Settings = (nodeCount: number) => {
   const isSmall = nodeCount < 500;
   const isMedium = nodeCount >= 500 && nodeCount < 2000;
   const isLarge = nodeCount >= 2000 && nodeCount < 10000;
-  
+  const isVeryLarge = nodeCount >= 10000 && nodeCount < 20000;
+  // else is >= 20000 ("huge")
+
   return {
     // Lower gravity allows folders to stay spread out
-    gravity: isSmall ? 0.8 : isMedium ? 0.5 : isLarge ? 0.3 : 0.15,
-    
+    gravity: isSmall ? 0.8 : isMedium ? 0.5 : isLarge ? 0.3 : isVeryLarge ? 0.15 : 0.08,
+
     // Higher scaling ratio = more spread out overall
-    scalingRatio: isSmall ? 15 : isMedium ? 30 : isLarge ? 60 : 100,
-    
+    scalingRatio: isSmall ? 15 : isMedium ? 30 : isLarge ? 60 : isVeryLarge ? 120 : 160,
+
     // LOW slowDown = FASTER movement (converges quicker)
-    slowDown: isSmall ? 1 : isMedium ? 2 : isLarge ? 3 : 5,
-    
+    slowDown: isSmall ? 1 : isMedium ? 2 : isLarge ? 3 : isVeryLarge ? 6 : 8,
+
     // Barnes-Hut for performance - use it even on smaller graphs
     barnesHutOptimize: nodeCount > 200,
-    barnesHutTheta: isLarge ? 0.8 : 0.6,  // Higher = faster but less accurate
-    
+    barnesHutTheta: isVeryLarge ? 0.9 : isLarge ? 0.8 : 0.6,
+
     // These help with clustering while keeping spread
     strongGravityMode: false,
     outboundAttractionDistribution: true,
@@ -119,7 +121,8 @@ const getFA2Settings = (nodeCount: number) => {
 // Layout duration - let it run longer for better results
 // Web Worker + WebGL means minimal system impact
 const getLayoutDuration = (nodeCount: number): number => {
-  if (nodeCount > 10000) return 45000;  // 45s for huge graphs
+  if (nodeCount > 20000) return 60000;  // 60s for huge graphs
+  if (nodeCount > 10000) return 50000;  // 50s for very large
   if (nodeCount > 5000) return 35000;   // 35s
   if (nodeCount > 2000) return 30000;   // 30s
   if (nodeCount > 1000) return 30000;   // 30s
@@ -139,6 +142,7 @@ export const useSigma = (options: UseSigmaOptions = {}): UseSigmaReturn => {
   const visibleEdgeTypesRef = useRef<EdgeType[] | null>(null);
   const layoutTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const animationFrameRef = useRef<number | null>(null);
+  const zoomTierRef = useRef<'far' | 'medium' | 'close'>('medium');
   const [isLayoutRunning, setIsLayoutRunning] = useState(false);
   const [selectedNode, setSelectedNodeState] = useState<string | null>(null);
 
@@ -460,6 +464,47 @@ export const useSigma = (options: UseSigmaOptions = {}): UseSigmaReturn => {
     });
 
     sigmaRef.current = sigma;
+
+    // Zoom-responsive rendering: adjust label visibility and node sizes by zoom level
+    let lastTierUpdate = 0;
+    const TIER_THROTTLE = 100; // ms
+
+    sigma.getCamera().on('updated', (state) => {
+      const now = Date.now();
+      if (now - lastTierUpdate < TIER_THROTTLE) return;
+      lastTierUpdate = now;
+
+      const ratio = state.ratio;
+      let newTier: 'far' | 'medium' | 'close';
+      if (ratio > 2.0) {
+        newTier = 'far';
+      } else if (ratio < 0.3) {
+        newTier = 'close';
+      } else {
+        newTier = 'medium';
+      }
+
+      if (newTier !== zoomTierRef.current) {
+        zoomTierRef.current = newTier;
+        switch (newTier) {
+          case 'far':
+            sigma.setSetting('labelRenderedSizeThreshold', 999); // hide all labels
+            sigma.setSetting('labelDensity', 0);
+            sigma.setSetting('hideEdgesOnMove', true);
+            break;
+          case 'medium':
+            sigma.setSetting('labelRenderedSizeThreshold', 8);
+            sigma.setSetting('labelDensity', 0.05);
+            sigma.setSetting('hideEdgesOnMove', true);
+            break;
+          case 'close':
+            sigma.setSetting('labelRenderedSizeThreshold', 4);
+            sigma.setSetting('labelDensity', 0.15);
+            sigma.setSetting('hideEdgesOnMove', false);
+            break;
+        }
+      }
+    });
 
     sigma.on('clickNode', ({ node }) => {
       setSelectedNode(node);

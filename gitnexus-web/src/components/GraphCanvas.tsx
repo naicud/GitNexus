@@ -251,12 +251,14 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle>((_, ref) => {
 
     // Build communityMemberships map from MEMBER_OF relationships
     // MEMBER_OF edges: nodeId -> communityId (stored as targetId)
+    // Use a Map for O(1) community node lookups instead of O(n) find() per relationship
+    const nodeMap = new Map(graph.nodes.map(n => [n.id, n]));
     const communityMemberships = new Map<string, number>();
     graph.relationships.forEach(rel => {
       if (rel.type === 'MEMBER_OF') {
-        // Find the community node to get its index
-        const communityNode = graph.nodes.find(n => n.id === rel.targetId && n.label === 'Community');
-        if (communityNode) {
+        // O(1) lookup via nodeMap instead of O(n) graph.nodes.find()
+        const communityNode = nodeMap.get(rel.targetId);
+        if (communityNode && communityNode.label === 'Community') {
           // Extract community index from id (e.g., "comm_5" -> 5)
           const communityIdx = parseInt(rel.targetId.replace('comm_', ''), 10) || 0;
           communityMemberships.set(rel.sourceId, communityIdx);
@@ -465,7 +467,7 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle>((_, ref) => {
       {graphTruncated && graphViewMode === 'full' && (
         <div className="absolute top-4 left-4 flex items-center gap-2 px-3 py-1.5 bg-amber-500/10 border border-amber-500/20 rounded-lg backdrop-blur-sm z-10">
           <span className="text-xs text-amber-300 font-medium">
-            Graph truncated to 5K nodes — use cluster view or search to explore
+            Graph truncated ({graph?.nodes?.length?.toLocaleString() ?? '?'} loaded) — use cluster view or search to explore
           </span>
         </div>
       )}
