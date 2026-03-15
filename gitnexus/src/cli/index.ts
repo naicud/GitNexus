@@ -42,6 +42,23 @@ program
    .action(createLazyAction(() => import('./analyze.js'), 'analyzeCommand'));
 
 program
+  .command('embed [path]')
+  .description('Generate or update embeddings for an already-indexed repository')
+  .option('--provider <type>', 'Embedding provider: local | ollama | openai | cohere')
+  .option('--model <model>', 'Embedding model name')
+  .option('--dims <n>', 'Vector dimensions (default: 384)')
+  .option('--endpoint <url>', 'API endpoint URL (Ollama, OpenAI-compatible)')
+  .option('--api-key <key>', 'API key for cloud providers')
+  .option('--embed-provider <type>', 'Alias for --provider')
+  .option('--embed-model <model>', 'Alias for --model')
+  .option('--embed-dims <n>', 'Alias for --dims')
+  .option('--embed-endpoint <url>', 'Alias for --endpoint')
+  .option('--embed-api-key <key>', 'Alias for --api-key')
+  .option('-f, --force', 'Regenerate all embeddings')
+  .option('-y, --yes', 'Skip interactive prompts')
+  .action(createLazyAction(() => import('./embed.js'), 'embedCommand'));
+
+program
   .command('serve')
   .description('Start local HTTP server for web UI connection')
   .option('-p, --port <port>', 'Port number', '4747')

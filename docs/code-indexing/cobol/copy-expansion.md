@@ -24,11 +24,11 @@ COPY LINKAGE REPLACING TRAILING "-IN" BY "-OUT".
 
 Three REPLACING types are supported:
 
-| Type | Syntax | Behavior | Example |
-|------|--------|----------|---------|
-| **EXACT** | `REPLACING "OLD" BY "NEW"` | Replace exact identifier matches | `ANAZI-KEY` becomes `LK-KEY` |
-| **LEADING** | `REPLACING LEADING "PFX-" BY "NEW-"` | Replace prefix on all COBOL identifiers | `ESP-NAME` becomes `LK-ESP-NAME` |
-| **TRAILING** | `REPLACING TRAILING "-IN" BY "-OUT"` | Replace suffix on all COBOL identifiers | `DATA-IN` becomes `DATA-OUT` |
+| Type         | Syntax                               | Behavior                                | Example                          |
+| ------------ | ------------------------------------ | --------------------------------------- | -------------------------------- |
+| **EXACT**    | `REPLACING "OLD" BY "NEW"`           | Replace exact identifier matches        | `ANAZI-KEY` becomes `LK-KEY`     |
+| **LEADING**  | `REPLACING LEADING "PFX-" BY "NEW-"` | Replace prefix on all COBOL identifiers | `ESP-NAME` becomes `LK-ESP-NAME` |
+| **TRAILING** | `REPLACING TRAILING "-IN" BY "-OUT"` | Replace suffix on all COBOL identifiers | `DATA-IN` becomes `DATA-OUT`     |
 
 Multiple REPLACING clauses can appear in a single COPY statement. They are applied in order to each COBOL identifier in the copybook content.
 
@@ -92,7 +92,7 @@ Circular COPY references (e.g., copybook A includes copybook B which includes co
 2. If a copybook path is already in the visited set, the expansion is skipped
 3. A `warnedCircular` set (shared across all files in a chunk) deduplicates warning messages
 
-Known circular copybooks in EPAGHE: `ANAZI`, `ANDIP`, `QDIPE` (self-referential includes).
+Known circular copybooks in PROJECT-NAME: `ANAZI`, `ANDIP`, `QDIPE` (self-referential includes).
 
 ## Max Depth
 

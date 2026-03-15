@@ -2,45 +2,45 @@
 
 This document covers real-world benchmarks, worker pool configuration, memory management, known limitations, and troubleshooting for COBOL indexing.
 
-## EPAGHE Benchmark
+## PROJECT-NAME Benchmark
 
-The EPAGHE project is a large Italian payroll system written in COBOL. It serves as the primary benchmark for COBOL indexing performance.
+The PROJECT-NAME project is a large Italian payroll system written in COBOL. It serves as the primary benchmark for COBOL indexing performance.
 
 ### Input
 
-| Metric | Value |
-|--------|-------|
-| Paths scanned | 14,217 |
-| Parseable files | 13,129 |
-| Total source size | 224 MB |
-| Chunks | 12 (at 20 MB budget) |
-| Copybooks loaded | 2,976 |
-| Copybooks used in expansion | 2,955 |
-| Key directories | `s/` (7773 programs), `c/` (3036 copybooks), `wfproc/` (1973 workflow files) |
+| Metric                      | Value                                                                        |
+| --------------------------- | ---------------------------------------------------------------------------- |
+| Paths scanned               | 14,217                                                                       |
+| Parseable files             | 13,129                                                                       |
+| Total source size           | 224 MB                                                                       |
+| Chunks                      | 12 (at 20 MB budget)                                                         |
+| Copybooks loaded            | 2,976                                                                        |
+| Copybooks used in expansion | 2,955                                                                        |
+| Key directories             | `s/` (7773 programs), `c/` (3036 copybooks), `wfproc/` (1973 workflow files) |
 
 ### Output
 
-| Metric | Value |
-|--------|-------|
-| Graph nodes | 2.79M |
-| Graph edges | 5.67M |
+| Metric                 | Value  |
+| ---------------------- | ------ |
+| Graph nodes            | 2.79M  |
+| Graph edges            | 5.67M  |
 | Clusters (communities) | 16,679 |
-| Execution flows | 300 |
+| Execution flows        | 300    |
 
 ### Timing
 
-| Phase | Duration |
-|-------|----------|
-| Total | ~251s |
-| KuzuDB write | 132s |
-| Full-text search indexing | 6.7s |
-| Regex extraction (avg per file) | ~1ms |
-| COPY expansion + deep indexing | Remainder (~112s) |
+| Phase                           | Duration          |
+| ------------------------------- | ----------------- |
+| Total                           | ~251s             |
+| KuzuDB write                    | 132s              |
+| Full-text search indexing       | 6.7s              |
+| Regex extraction (avg per file) | ~1ms              |
+| COPY expansion + deep indexing  | Remainder (~112s) |
 
 ### Indexing Command
 
 ```bash
-cd /path/to/EPAGHE
+cd /path/to/PROJECT-NAME
 GITNEXUS_COBOL_DIRS=s,c,wfproc GITNEXUS_VERBOSE=1 node --max-old-space-size=8192 \
   /path/to/gitnexus/dist/cli/index.js analyze --force
 ```
@@ -51,10 +51,10 @@ GITNEXUS_COBOL_DIRS=s,c,wfproc GITNEXUS_VERBOSE=1 node --max-old-space-size=8192
 
 The worker pool splits each worker's chunk into sub-batches to bound peak memory per `postMessage` serialization. COBOL repos use a smaller sub-batch size than the default:
 
-| Parameter | Default | COBOL Mode |
-|-----------|---------|------------|
-| Sub-batch size | 1,500 files | 200 files |
-| Per sub-batch timeout | 120s | 120s (configurable) |
+| Parameter             | Default     | COBOL Mode          |
+| --------------------- | ----------- | ------------------- |
+| Sub-batch size        | 1,500 files | 200 files           |
+| Per sub-batch timeout | 120s        | 120s (configurable) |
 
 **Why 200?** COBOL regex extraction + preprocessing takes ~1ms per file on average, but with COPY expansion and deep indexing the effective time is ~150ms per file. At sub-batch size 1500, that would be ~225s per sub-batch, exceeding the 120s timeout.
 
@@ -72,10 +72,10 @@ Workers default to `min(8, cpus - 1)`. For COBOL repos, this is usually sufficie
 
 ### Timeout Configuration
 
-| Environment Variable | Default | Purpose |
-|---------------------|---------|---------|
-| `GITNEXUS_WORKER_TIMEOUT_MS` | 120,000 (2 min) | Per sub-batch processing timeout |
-| `GITNEXUS_WORKER_STARTUP_TIMEOUT_MS` | 60,000 (1 min) | Worker initialization timeout (tree-sitter loading) |
+| Environment Variable                 | Default         | Purpose                                             |
+| ------------------------------------ | --------------- | --------------------------------------------------- |
+| `GITNEXUS_WORKER_TIMEOUT_MS`         | 120,000 (2 min) | Per sub-batch processing timeout                    |
+| `GITNEXUS_WORKER_STARTUP_TIMEOUT_MS` | 60,000 (1 min)  | Worker initialization timeout (tree-sitter loading) |
 
 For COBOL-only repos, worker startup is faster because tree-sitter native modules are loaded lazily (skipped entirely if only COBOL files are present).
 
@@ -111,7 +111,7 @@ To increase the cap for specific needs, modify the `MAX_DATA_ITEMS_PER_FILE` con
 
 ### COPY Expansion Memory
 
-All copybook content is loaded upfront into a Map before chunk processing begins. For EPAGHE:
+All copybook content is loaded upfront into a Map before chunk processing begins. For PROJECT-NAME:
 
 - 2,976 copybooks, typically under 100MB total
 - The Map is shared (read-only) across chunk iterations
@@ -137,16 +137,16 @@ The `warnedCircular` set (used by the COPY expansion engine) is shared across al
 
 ## Known Limitations
 
-| Limitation | Impact | Workaround |
-|-----------|--------|------------|
-| tree-sitter-cobol hangs on ~5% of files | Cannot use tree-sitter for COBOL | Regex-only extraction (current approach) |
-| Data item cap (500/file) | May miss deeply nested items in large programs | Increase `MAX_DATA_ITEMS_PER_FILE` in source |
-| Circular copybooks (ANAZI, ANDIP, QDIPE) | Self-referential includes cannot be expanded | Detected and skipped with warning |
-| wfproc/ files may not be pure COBOL | Workflow files may produce extraction noise | Exclude `wfproc` from `GITNEXUS_COBOL_DIRS` if problematic |
-| No MOVE DATA_FLOW edges yet | Data flow between variables not in graph | Reserved for future release |
-| Continuation line handling | Some complex multi-line continuations (especially in string literals spanning 3+ lines) may not merge correctly | Known edge case; affects <0.1% of lines |
-| Single-line EXEC blocks | `EXEC SQL SELECT ... END-EXEC` on one line is handled, but pathological nesting is not | Extremely rare in practice |
-| Extension case sensitivity | `.GNM` and `.gnm` are matched differently | Use the exact case from the codebase |
+| Limitation                               | Impact                                                                                                          | Workaround                                                 |
+| ---------------------------------------- | --------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------- |
+| tree-sitter-cobol hangs on ~5% of files  | Cannot use tree-sitter for COBOL                                                                                | Regex-only extraction (current approach)                   |
+| Data item cap (500/file)                 | May miss deeply nested items in large programs                                                                  | Increase `MAX_DATA_ITEMS_PER_FILE` in source               |
+| Circular copybooks (ANAZI, ANDIP, QDIPE) | Self-referential includes cannot be expanded                                                                    | Detected and skipped with warning                          |
+| wfproc/ files may not be pure COBOL      | Workflow files may produce extraction noise                                                                     | Exclude `wfproc` from `GITNEXUS_COBOL_DIRS` if problematic |
+| No MOVE DATA_FLOW edges yet              | Data flow between variables not in graph                                                                        | Reserved for future release                                |
+| Continuation line handling               | Some complex multi-line continuations (especially in string literals spanning 3+ lines) may not merge correctly | Known edge case; affects <0.1% of lines                    |
+| Single-line EXEC blocks                  | `EXEC SQL SELECT ... END-EXEC` on one line is handled, but pathological nesting is not                          | Extremely rare in practice                                 |
+| Extension case sensitivity               | `.GNM` and `.gnm` are matched differently                                                                       | Use the exact case from the codebase                       |
 
 ## Troubleshooting
 
@@ -159,6 +159,7 @@ The `warnedCircular` set (used by the COPY expansion engine) is shared across al
 **Cause:** A copybook referenced by a COPY statement cannot be found.
 
 **Fix:**
+
 1. Verify `GITNEXUS_COBOL_DIRS` includes the directory containing copybooks (typically `c`)
 2. Check that copybook filenames match the COPY target (case-insensitive, after stripping extensions)
 3. Ensure copybook files are not in `.gitignore`
@@ -205,7 +206,7 @@ gitnexus analyze --force
 
 ### Slow KuzuDB write phase
 
-The KuzuDB write phase (132s for EPAGHE) is the bottleneck for large COBOL repos. This is proportional to the number of nodes and edges being written. Reducing `MAX_DATA_ITEMS_PER_FILE` or excluding non-essential directories from `GITNEXUS_COBOL_DIRS` can help.
+The KuzuDB write phase (132s for PROJECT-NAME) is the bottleneck for large COBOL repos. This is proportional to the number of nodes and edges being written. Reducing `MAX_DATA_ITEMS_PER_FILE` or excluding non-essential directories from `GITNEXUS_COBOL_DIRS` can help.
 
 ### Verbose output
 
@@ -216,6 +217,7 @@ GITNEXUS_VERBOSE=1 gitnexus analyze
 ```
 
 This outputs:
+
 - Scan statistics (paths, parseable files, chunk count)
 - Worker pool configuration (worker count, sub-batch size)
 - COPY expansion statistics (copybooks loaded, files expanded)

@@ -5,7 +5,7 @@
  * Uses batch size 500 to balance throughput vs request size.
  *
  * Neptune does NOT support KuzuDB's COPY FROM CSV — all inserts are HTTP requests.
- * For 177K nodes (EPAGHE scale): ~354 requests ≈ 35-60s.
+ * For 177K nodes (PROJECT-NAME scale): ~354 requests ≈ 35-60s.
  */
 
 import { NeptunedataClient, ExecuteOpenCypherQueryCommand } from '@aws-sdk/client-neptunedata';

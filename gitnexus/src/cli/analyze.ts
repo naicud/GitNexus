@@ -21,7 +21,7 @@ import fs from 'fs/promises';
 import type { DbConfig, NeptuneDbConfig } from '../core/db/interfaces.js';
 import { loadGraphToNeptune, getNeptuneStats } from '../core/db/neptune/neptune-ingest.js';
 import { generateGraphSummary } from '../core/ingestion/graph-summary.js';
-import type { EmbeddingProviderConfig, EmbeddingProviderType } from '../core/embeddings/providers/types.js';
+import { resolveEmbeddingConfig } from './embed-config.js';
 
 
 const HEAP_MB = 8192;
@@ -103,40 +103,6 @@ function resolveNeptuneConfig(options: AnalyzeOptions): NeptuneDbConfig {
     );
   }
   return { type: 'neptune', endpoint, region, port };
-}
-
-/**
- * Resolve embedding provider config from CLI options + env vars.
- * Priority: CLI flags > env vars > defaults.
- */
-function resolveEmbeddingConfig(options: AnalyzeOptions): EmbeddingProviderConfig {
-  const provider = (options.embedProvider
-    ?? process.env.GITNEXUS_EMBED_PROVIDER
-    ?? 'local') as EmbeddingProviderType;
-
-  const defaultModel = provider === 'local'
-    ? 'Snowflake/snowflake-arctic-embed-xs'
-    : provider === 'ollama' ? 'nomic-embed-text'
-    : provider === 'cohere' ? 'embed-english-light-v3.0'
-    : 'text-embedding-3-small';
-
-  const model = options.embedModel
-    ?? process.env.GITNEXUS_EMBED_MODEL
-    ?? defaultModel;
-
-  const dimensions = parseInt(
-    options.embedDims ?? process.env.GITNEXUS_EMBED_DIMS ?? '384', 10,
-  );
-
-  const endpoint = options.embedEndpoint
-    ?? process.env.GITNEXUS_EMBED_ENDPOINT
-    ?? undefined;
-
-  const apiKey = options.embedApiKey
-    ?? process.env.GITNEXUS_EMBED_API_KEY
-    ?? undefined;
-
-  return { provider, model, dimensions, endpoint, apiKey };
 }
 
 export const analyzeCommand = async (
