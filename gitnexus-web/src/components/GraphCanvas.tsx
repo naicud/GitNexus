@@ -1,11 +1,16 @@
 import { useEffect, useCallback, useMemo, useState, useRef as useReactRef, forwardRef, useImperativeHandle } from 'react';
-import { ZoomIn, ZoomOut, Maximize2, Focus, RotateCcw, Play, Pause, Lightbulb, LightbulbOff, Minimize2 } from 'lucide-react';
+import { ZoomIn, ZoomOut, Maximize2, Focus, RotateCcw, Play, Pause, Lightbulb, LightbulbOff, Minimize2, Table2, GitBranch, Palette } from 'lucide-react';
 import { useSigma } from '../hooks/useSigma';
 import { useAppState } from '../hooks/useAppState';
+import { useKeyboardShortcuts } from '../hooks/useKeyboardShortcuts';
 import { knowledgeGraphToGraphology, filterGraphByDepth, SigmaNodeAttributes, SigmaEdgeAttributes } from '../lib/graph-adapter';
 import { summaryToGraphology, expandGroupInGraph, collapseGroupInGraph, addNeighborsToGraph } from '../lib/summary-graph-adapter';
 import { fetchGroupExpansion, fetchNeighbors } from '../services/graph-lod';
 import { QueryFAB } from './QueryFAB';
+import { ContextMenu } from './ContextMenu';
+import { NeighborPanel } from './NeighborPanel';
+import { SchemaGraph } from './SchemaGraph';
+import { StylingPanel } from './StylingPanel';
 import Graph from 'graphology';
 
 export interface GraphCanvasHandle {
@@ -36,11 +41,22 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle>((_, ref) => {
     graphTruncated,
     serverBaseUrl,
     projectName,
+    isDataExplorerOpen,
+    setDataExplorerOpen,
   } = useAppState();
   const [hoveredNodeName, setHoveredNodeName] = useState<string | null>(null);
   const [expandingGroup, setExpandingGroup] = useState<string | null>(null);
   const [exploringNeighbors, setExploringNeighbors] = useState(false);
-  const [contextMenu, setContextMenu] = useState<{ x: number; y: number; nodeId: string } | null>(null);
+  const [contextMenu, setContextMenu] = useState<{ x: number; y: number; nodeId: string | null; nodeName?: string; nodeType?: string } | null>(null);
+  const [neighborPanelNodeId, setNeighborPanelNodeId] = useState<string | null>(null);
+  const [isSchemaOpen, setSchemaOpen] = useState(false);
+  const [isStylingOpen, setStylingOpen] = useState(false);
+
+  // O(1) node lookup map — replaces O(n) graph.nodes.find() calls throughout the component
+  const nodeMap = useMemo(() => {
+    if (!graph) return new Map<string, typeof graph.nodes[0]>();
+    return new Map(graph.nodes.map(n => [n.id, n]));
+  }, [graph]);
 
   const effectiveHighlightedNodeIds = useMemo(() => {
     if (!isAIHighlightsEnabled) return highlightedNodeIds;
@@ -64,24 +80,23 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle>((_, ref) => {
   }, [animatedNodes, isAIHighlightsEnabled]);
 
   const handleNodeClick = useCallback((nodeId: string) => {
-    if (!graph) return;
-    const node = graph.nodes.find(n => n.id === nodeId);
+    const node = nodeMap.get(nodeId);
     if (node) {
       setSelectedNode(node);
       openCodePanel();
     }
-  }, [graph, setSelectedNode, openCodePanel]);
+  }, [nodeMap, setSelectedNode, openCodePanel]);
 
   const handleNodeHover = useCallback((nodeId: string | null) => {
-    if (!nodeId || !graph) {
+    if (!nodeId) {
       setHoveredNodeName(null);
       return;
     }
-    const node = graph.nodes.find(n => n.id === nodeId);
+    const node = nodeMap.get(nodeId);
     if (node) {
       setHoveredNodeName(node.properties.name);
     }
-  }, [graph]);
+  }, [nodeMap]);
 
   const handleStageClick = useCallback(() => {
     setSelectedNode(null);
@@ -90,8 +105,15 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle>((_, ref) => {
 
   // Right-click context menu via Sigma's public rightClickNode event
   const handleNodeRightClick = useCallback((nodeId: string, event: { clientX: number; clientY: number }) => {
-    setContextMenu({ x: event.clientX, y: event.clientY, nodeId });
-  }, []);
+    const node = nodeMap.get(nodeId);
+    setContextMenu({
+      x: event.clientX,
+      y: event.clientY,
+      nodeId,
+      nodeName: node?.properties.name,
+      nodeType: node?.label,
+    });
+  }, [nodeMap]);
 
   // LOD: Handle group expansion on double-click
   const handleGroupExpand = useCallback(async (groupLabel: string, groupId: string) => {
@@ -189,6 +211,44 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle>((_, ref) => {
     }
   }, [expandedGroups, handleGroupCollapse]);
 
+  // Show in code: select node and open code panel
+  const handleShowInCode = useCallback((nodeId: string) => {
+    const node = nodeMap.get(nodeId);
+    if (node) {
+      setSelectedNode(node);
+      openCodePanel();
+    }
+  }, [nodeMap, setSelectedNode, openCodePanel]);
+
+  // Open neighbor panel for a node
+  const handleOpenNeighborPanel = useCallback((nodeId: string) => {
+    setNeighborPanelNodeId(nodeId);
+  }, []);
+
+  // Neighbor panel expansion with type/direction filtering
+  const handleNeighborExpand = useCallback(async (nodeId: string, depth: number, types?: string[], direction?: 'inbound' | 'outbound' | 'both') => {
+    if (!serverBaseUrl || !projectName || exploringNeighbors) return;
+    setExploringNeighbors(true);
+    try {
+      const expansion = await fetchNeighbors(serverBaseUrl, projectName, nodeId, depth, 200, types, direction);
+      const sigmaGraph = sigmaGraphRef.current;
+      if (!sigmaGraph) return;
+
+      const newNodeIds = addNeighborsToGraph(sigmaGraph, expansion, nodeId);
+
+      if (sigmaInstance.current) {
+        sigmaInstance.current.refresh();
+      }
+      if (newNodeIds.length > 0) {
+        runLayoutFn.current?.(sigmaGraph);
+      }
+    } catch (err) {
+      console.error('Failed to explore neighbors:', err);
+    } finally {
+      setExploringNeighbors(false);
+    }
+  }, [serverBaseUrl, projectName, exploringNeighbors]);
+
   const {
     containerRef,
     sigmaRef,
@@ -222,20 +282,50 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle>((_, ref) => {
   const runLayoutFn = useReactRef(runLayout);
   runLayoutFn.current = runLayout;
 
+  // Keyboard shortcuts
+  const keyboardActions = useMemo(() => ({
+    onDeselect: () => {
+      setSelectedNode(null);
+      setSigmaSelectedNode(null);
+      setContextMenu(null);
+      setNeighborPanelNodeId(null);
+    },
+    onFitToScreen: resetZoom,
+    onToggleLayout: () => {
+      if (isLayoutRunning) stopLayout();
+      else startLayout();
+    },
+    onOpenNeighborPanel: () => {
+      if (appSelectedNode) {
+        setNeighborPanelNodeId(appSelectedNode.id);
+      }
+    },
+    onToggleDataExplorer: () => {
+      setDataExplorerOpen(!isDataExplorerOpen);
+    },
+    onDismissNode: () => {
+      if (appSelectedNode) {
+        handleDismissNode(appSelectedNode.id);
+        setSelectedNode(null);
+        setSigmaSelectedNode(null);
+      }
+    },
+  }), [setSelectedNode, setSigmaSelectedNode, resetZoom, isLayoutRunning, stopLayout, startLayout, appSelectedNode, isDataExplorerOpen, setDataExplorerOpen, handleDismissNode]);
+
+  useKeyboardShortcuts(keyboardActions);
+
   // Expose focusNode to parent via ref
   useImperativeHandle(ref, () => ({
     focusNode: (nodeId: string) => {
       // Also update app state so the selection syncs properly
-      if (graph) {
-        const node = graph.nodes.find(n => n.id === nodeId);
-        if (node) {
-          setSelectedNode(node);
-          openCodePanel();
-        }
+      const node = nodeMap.get(nodeId);
+      if (node) {
+        setSelectedNode(node);
+        openCodePanel();
       }
       focusNode(nodeId);
     }
-  }), [focusNode, graph, setSelectedNode, openCodePanel]);
+  }), [focusNode, nodeMap, setSelectedNode, openCodePanel]);
 
   // Update Sigma graph when KnowledgeGraph or summary changes
   useEffect(() => {
@@ -251,8 +341,7 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle>((_, ref) => {
 
     // Build communityMemberships map from MEMBER_OF relationships
     // MEMBER_OF edges: nodeId -> communityId (stored as targetId)
-    // Use a Map for O(1) community node lookups instead of O(n) find() per relationship
-    const nodeMap = new Map(graph.nodes.map(n => [n.id, n]));
+    // Reuse component-level nodeMap for O(1) community node lookups
     const communityMemberships = new Map<string, number>();
     graph.relationships.forEach(rel => {
       if (rel.type === 'MEMBER_OF') {
@@ -268,7 +357,7 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle>((_, ref) => {
 
     const sigmaGraph = knowledgeGraphToGraphology(graph, communityMemberships);
     setSigmaGraph(sigmaGraph);
-  }, [graph, graphViewMode, graphSummary, setSigmaGraph]);
+  }, [graph, graphViewMode, graphSummary, setSigmaGraph, nodeMap]);
 
   // Update node visibility when filters change
   useEffect(() => {
@@ -324,7 +413,13 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle>((_, ref) => {
       <div
         ref={containerRef}
         className="sigma-container w-full h-full cursor-grab active:cursor-grabbing"
-        onContextMenu={(e) => e.preventDefault()}
+        onContextMenu={(e) => {
+          e.preventDefault();
+          // Show canvas context menu (node right-clicks are handled by Sigma's rightClickNode event)
+          if (!contextMenu) {
+            setContextMenu({ x: e.clientX, y: e.clientY, nodeId: null });
+          }
+        }}
       />
 
       {/* Hovered node tooltip - only show when NOT selected */}
@@ -437,6 +532,34 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle>((_, ref) => {
             </button>
           </>
         )}
+
+        {/* Data Explorer toggle */}
+        <div className="h-px bg-border-subtle my-1" />
+        <button
+          onClick={() => setDataExplorerOpen(!isDataExplorerOpen)}
+          className={`w-9 h-9 flex items-center justify-center border rounded-md transition-colors ${
+            isDataExplorerOpen
+              ? 'bg-accent/20 border-accent/30 text-accent'
+              : 'bg-elevated border-border-subtle text-text-secondary hover:bg-hover hover:text-text-primary'
+          }`}
+          title="Toggle Data Explorer"
+        >
+          <Table2 className="w-4 h-4" />
+        </button>
+        <button
+          onClick={() => setSchemaOpen(true)}
+          className="w-9 h-9 flex items-center justify-center bg-elevated border border-border-subtle rounded-md text-text-secondary hover:bg-hover hover:text-text-primary transition-colors"
+          title="View Schema"
+        >
+          <GitBranch className="w-4 h-4" />
+        </button>
+        <button
+          onClick={() => setStylingOpen(true)}
+          className="w-9 h-9 flex items-center justify-center bg-elevated border border-border-subtle rounded-md text-text-secondary hover:bg-hover hover:text-text-primary transition-colors"
+          title="Graph Styling"
+        >
+          <Palette className="w-4 h-4" />
+        </button>
       </div>
 
       {/* Layout running indicator */}
@@ -491,33 +614,52 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle>((_, ref) => {
         </div>
       )}
 
-      {/* Context menu */}
+      {/* Context Menu */}
       {contextMenu && (
-        <div
-          className="fixed z-50 bg-elevated border border-border-subtle rounded-lg shadow-xl py-1 min-w-[180px]"
-          style={{ left: contextMenu.x, top: contextMenu.y }}
-        >
-          <button
-            onClick={() => handleExploreNeighbors(contextMenu.nodeId, 1)}
-            className="w-full px-3 py-1.5 text-left text-sm text-text-primary hover:bg-hover transition-colors"
-          >
-            Explore neighbors (1 hop)
-          </button>
-          <button
-            onClick={() => handleExploreNeighbors(contextMenu.nodeId, 2)}
-            className="w-full px-3 py-1.5 text-left text-sm text-text-primary hover:bg-hover transition-colors"
-          >
-            Explore neighbors (2 hops)
-          </button>
-          <div className="h-px bg-border-subtle my-1" />
-          <button
-            onClick={() => handleDismissNode(contextMenu.nodeId)}
-            className="w-full px-3 py-1.5 text-left text-sm text-red-400 hover:bg-hover transition-colors"
-          >
-            Dismiss node
-          </button>
-        </div>
+        <ContextMenu
+          x={contextMenu.x}
+          y={contextMenu.y}
+          nodeId={contextMenu.nodeId}
+          nodeName={contextMenu.nodeName}
+          nodeType={contextMenu.nodeType}
+          onExploreNeighbors={handleExploreNeighbors}
+          onOpenNeighborPanel={handleOpenNeighborPanel}
+          onShowInCode={handleShowInCode}
+          onDismissNode={handleDismissNode}
+          onResetZoom={resetZoom}
+          onToggleLayout={isLayoutRunning ? stopLayout : startLayout}
+          onCollapseAll={handleCollapseAll}
+          onClose={() => setContextMenu(null)}
+          isLayoutRunning={isLayoutRunning}
+          hasExpandedGroups={expandedGroups.size > 0}
+          graphViewMode={graphViewMode}
+        />
       )}
+
+      {/* Neighbor Panel */}
+      {neighborPanelNodeId && serverBaseUrl && projectName && (
+        <NeighborPanel
+          nodeId={neighborPanelNodeId}
+          nodeName={nodeMap.get(neighborPanelNodeId)?.properties.name || neighborPanelNodeId}
+          nodeType={nodeMap.get(neighborPanelNodeId)?.label || 'Unknown'}
+          baseUrl={serverBaseUrl}
+          repo={projectName}
+          isOpen={!!neighborPanelNodeId}
+          onClose={() => setNeighborPanelNodeId(null)}
+          onExpand={handleNeighborExpand}
+        />
+      )}
+
+      {/* Schema Graph Modal */}
+      <SchemaGraph
+        isOpen={isSchemaOpen}
+        onClose={() => setSchemaOpen(false)}
+        baseUrl={serverBaseUrl || ''}
+        repo={projectName || ''}
+      />
+
+      {/* Styling Panel Modal */}
+      <StylingPanel isOpen={isStylingOpen} onClose={() => setStylingOpen(false)} />
 
       {/* Query FAB */}
       <QueryFAB />

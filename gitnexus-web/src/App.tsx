@@ -9,6 +9,7 @@ import { SettingsPanel } from './components/SettingsPanel';
 import { StatusBar } from './components/StatusBar';
 import { FileTreePanel } from './components/FileTreePanel';
 import { CodeReferencesPanel } from './components/CodeReferencesPanel';
+import { DataExplorer } from './components/DataExplorer';
 import { FileEntry } from './services/zip';
 import { getActiveProviderConfig } from './core/llm/settings-service';
 import { createKnowledgeGraph } from './core/graph/graph';
@@ -39,6 +40,7 @@ const AppContent = () => {
     codeReferences,
     selectedNode,
     isCodePanelOpen,
+    isDataExplorerOpen,
     serverBaseUrl,
     setServerBaseUrl,
     availableRepos,
@@ -347,6 +349,9 @@ const AppContent = () => {
         {/* Right Panel - Code & Chat (tabbed) */}
         {isRightPanelOpen && <RightPanel />}
       </main>
+
+      {/* Data Explorer (bottom panel) */}
+      {isDataExplorerOpen && <DataExplorer onFocusNode={handleFocusNode} />}
 
       <StatusBar />
 

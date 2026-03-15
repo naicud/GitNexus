@@ -99,6 +99,8 @@ export async function fetchNeighbors(
   nodeId: string,
   depth: number = 1,
   limit: number = 200,
+  types?: string[],
+  direction?: 'inbound' | 'outbound' | 'both',
 ): Promise<NeighborExpansion> {
   const params = new URLSearchParams({
     repo,
@@ -106,7 +108,28 @@ export async function fetchNeighbors(
     depth: String(depth),
     limit: String(limit),
   });
+  if (types && types.length > 0) params.set('types', types.join(','));
+  if (direction) params.set('direction', direction);
   const res = await fetch(`${baseUrl}/graph/neighbors?${params}`);
   if (!res.ok) throw new Error(`Failed to fetch neighbors for "${nodeId}": ${res.status}`);
+  return res.json();
+}
+
+// ── Neighbor Counts ─────────────────────────────────────────────────
+
+export interface NeighborCounts {
+  inbound: Record<string, number>;
+  outbound: Record<string, number>;
+  total: number;
+}
+
+export async function fetchNeighborCounts(
+  baseUrl: string,
+  repo: string,
+  nodeId: string,
+): Promise<NeighborCounts> {
+  const params = new URLSearchParams({ repo, node: nodeId });
+  const res = await fetch(`${baseUrl}/graph/neighbor-counts?${params}`);
+  if (!res.ok) throw new Error(`Failed to fetch neighbor counts: ${res.status}`);
   return res.json();
 }

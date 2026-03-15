@@ -761,6 +761,10 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
       const depth = Math.max(1, Math.min(3, parseInt(String(req.query.depth ?? '1'), 10) || 1));
       const limit = Math.max(1, Math.min(500, parseInt(String(req.query.limit ?? '200'), 10) || 200));
 
+      // Optional type-filtered expansion params (omitting them produces identical behavior to before)
+      const types = req.query.types ? String(req.query.types).split(',').filter(Boolean) : null;
+      const direction = String(req.query.direction ?? 'both');
+
       const dbConfig = getDbConfigFromEntry(entry);
 
       if (dbConfig.type === 'neptune') {
@@ -782,10 +786,15 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
             id: cr.id as string, label: (cr.nodeLabel || 'CodeElement') as GraphNode['label'],
             properties: { name: (cr.name || '') as string, filePath: (cr.filePath || '') as string, startLine: cr.startLine as number, endLine: cr.endLine as number },
           };
+          // Build direction pattern and type filter for Neptune
+          const neptuneDirPattern = direction === 'inbound' ? '<-[r:CodeRelation]-' : direction === 'outbound' ? '-[r:CodeRelation]->' : '-[r:CodeRelation]-';
+          const neptuneTypeFilter = types ? ' AND r.type IN $types' : '';
+          const neptuneNeighborParams: Record<string, any> = types ? { nodeId, types } : { nodeId };
+
           const neighborRows = await adapter.executeParameterized(
             depth === 1
-              ? `MATCH (start)-[r:CodeRelation]-(n)
-                 WHERE start.id = $nodeId AND n.id <> $nodeId
+              ? `MATCH (start)${neptuneDirPattern}(n)
+                 WHERE start.id = $nodeId AND n.id <> $nodeId${neptuneTypeFilter}
                  RETURN DISTINCT n.id AS id, n.name AS name, n.filePath AS filePath,
                         n.startLine AS startLine, n.endLine AS endLine,
                         labels(n)[0] AS nodeLabel
@@ -796,7 +805,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
                         n.startLine AS startLine, n.endLine AS endLine,
                         labels(n)[0] AS nodeLabel
                  LIMIT ${limit}`,
-            { nodeId },
+            neptuneNeighborParams,
           );
           const nodes: GraphNode[] = neighborRows.map((row: any) => ({
             id: row.id, label: (row.nodeLabel || 'CodeElement') as GraphNode['label'],
@@ -852,10 +861,15 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
 
         // Get neighbors via variable-length paths (parameterized)
         // depth is already validated as integer 1-3
+        // Build direction pattern and type filter for KuzuDB
+        const dirPattern = direction === 'inbound' ? '<-[r:CodeRelation]-' : direction === 'outbound' ? '-[r:CodeRelation]->' : '-[r:CodeRelation]-';
+        const typeFilter = types ? ' AND r.type IN $types' : '';
+        const neighborParams: Record<string, any> = types ? { nodeId, types } : { nodeId };
+
         const neighborRows = await executeParameterizedQuery(
           depth === 1
-            ? `MATCH (start)-[r:CodeRelation]-(n)
-               WHERE start.id = $nodeId AND n.id <> $nodeId
+            ? `MATCH (start)${dirPattern}(n)
+               WHERE start.id = $nodeId AND n.id <> $nodeId${typeFilter}
                RETURN DISTINCT n.id AS id, n.name AS name, n.filePath AS filePath,
                       n.startLine AS startLine, n.endLine AS endLine,
                       labels(n)[0] AS nodeLabel
@@ -866,7 +880,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
                       n.startLine AS startLine, n.endLine AS endLine,
                       labels(n)[0] AS nodeLabel
                LIMIT ${limit}`,
-          { nodeId },
+          neighborParams,
         );
 
         const nodes: GraphNode[] = neighborRows.map(row => ({
@@ -934,6 +948,113 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
       res.json(result);
     } catch (err: any) {
       res.status(500).json({ error: err.message || 'Failed to fetch neighbors' });
+    }
+  });
+
+  // ── LOD: Neighbor counts by relationship type ──────────────────────
+  app.get('/api/graph/neighbor-counts', async (req, res) => {
+    try {
+      const entry = await resolveRepo(requestedRepo(req));
+      if (!entry) {
+        res.status(404).json({ error: 'Repository not found' });
+        return;
+      }
+
+      const nodeId = String(req.query.node ?? '').trim();
+      if (!nodeId) {
+        res.status(400).json({ error: 'Missing "node" query parameter' });
+        return;
+      }
+
+      const dbConfig = getDbConfigFromEntry(entry);
+
+      if (dbConfig.type === 'neptune') {
+        res.status(501).json({ error: 'Neighbor counts not supported on Neptune' });
+        return;
+      }
+
+      const kuzuPath = path.join(entry.storagePath, 'kuzu');
+      const result = await withKuzuDb(kuzuPath, async () => {
+        // Inbound counts: other nodes → this node, grouped by relationship type
+        const inboundRows = await executeParameterizedQuery(
+          `MATCH (other)-[r:CodeRelation]->(n)
+           WHERE n.id = $nodeId AND r.type <> 'MEMBER_OF' AND r.type <> 'STEP_IN_PROCESS'
+           RETURN r.type AS relType, count(*) AS cnt`,
+          { nodeId },
+        );
+        const inbound: Record<string, number> = {};
+        for (const row of inboundRows) {
+          inbound[row.relType] = row.cnt;
+        }
+
+        // Outbound counts: this node → other nodes, grouped by relationship type
+        const outboundRows = await executeParameterizedQuery(
+          `MATCH (n)-[r:CodeRelation]->(other)
+           WHERE n.id = $nodeId AND r.type <> 'MEMBER_OF' AND r.type <> 'STEP_IN_PROCESS'
+           RETURN r.type AS relType, count(*) AS cnt`,
+          { nodeId },
+        );
+        const outbound: Record<string, number> = {};
+        for (const row of outboundRows) {
+          outbound[row.relType] = row.cnt;
+        }
+
+        const total = Object.values(inbound).reduce((s, c) => s + c, 0) + Object.values(outbound).reduce((s, c) => s + c, 0);
+        return { inbound, outbound, total };
+      });
+
+      res.json(result);
+    } catch (err: any) {
+      res.status(500).json({ error: err.message || 'Failed to fetch neighbor counts' });
+    }
+  });
+
+  // Graph schema — node types + relationship patterns with counts
+  app.get('/api/graph/schema', async (req, res) => {
+    try {
+      const entry = await resolveRepo(requestedRepo(req));
+      if (!entry) {
+        res.status(404).json({ error: 'Repository not found' });
+        return;
+      }
+
+      const dbConfig = getDbConfigFromEntry(entry);
+
+      if (dbConfig.type === 'neptune') {
+        res.status(501).json({ error: 'Schema graph not supported on Neptune' });
+        return;
+      }
+
+      const kuzuPath = path.join(entry.storagePath, 'kuzu');
+      const result = await withKuzuDb(kuzuPath, async () => {
+        // Node type counts
+        const nodeRows = await executeQuery(
+          `MATCH (n) RETURN labels(n)[0] AS nodeType, count(*) AS cnt`,
+        );
+        const nodeTypes = nodeRows.map((row: any) => ({
+          type: row.nodeType,
+          count: typeof row.cnt === 'number' ? row.cnt : Number(row.cnt),
+        }));
+
+        // Relationship type patterns (excluding internal edges)
+        const edgeRows = await executeQuery(
+          `MATCH (a)-[r:CodeRelation]->(b)
+           WHERE r.type <> 'MEMBER_OF' AND r.type <> 'STEP_IN_PROCESS'
+           RETURN labels(a)[0] AS sourceType, labels(b)[0] AS targetType, r.type AS relType, count(*) AS cnt`,
+        );
+        const edgeTypes = edgeRows.map((row: any) => ({
+          sourceType: row.sourceType,
+          targetType: row.targetType,
+          type: row.relType,
+          count: typeof row.cnt === 'number' ? row.cnt : Number(row.cnt),
+        }));
+
+        return { nodeTypes, edgeTypes };
+      });
+
+      res.json(result);
+    } catch (err: any) {
+      res.status(500).json({ error: err.message || 'Failed to fetch graph schema' });
     }
   });
 
