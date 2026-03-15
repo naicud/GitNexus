@@ -2,10 +2,11 @@
  * Neptune Ingestion
  *
  * Loads a KnowledgeGraph into AWS Neptune via openCypher UNWIND+MERGE batches.
- * Uses batch size 500 to balance throughput vs request size.
  *
- * Neptune does NOT support KuzuDB's COPY FROM CSV — all inserts are HTTP requests.
- * For 177K nodes (PROJECT-NAME scale): ~354 requests ≈ 35-60s.
+ * Design principles:
+ * - Fault-tolerant: failed batches are skipped with warnings, never abort the load.
+ * - Idempotent: MERGE upserts nodes/edges — re-running is always safe.
+ * - No destructive clear: stale nodes are cleaned up AFTER successful insert.
  */
 
 import { NeptunedataClient, ExecuteOpenCypherQueryCommand } from '@aws-sdk/client-neptunedata';
@@ -14,16 +15,23 @@ import type { NeptuneDbConfig } from '../interfaces.js';
 
 const NODE_BATCH_SIZE = 500;
 const EDGE_BATCH_SIZE = 25;
-const DELETE_BATCH_SIZE = 10_000;
 const MAX_RETRIES = 5;
 
 export interface NeptuneLoadResult {
   nodesInserted: number;
+  nodesFailed: number;
   edgesInserted: number;
+  edgesFailed: number;
   warnings: string[];
 }
 
 type NeptuneBatchRow = Record<string, unknown>;
+
+interface BatchResult {
+  inserted: number;
+  failed: number;
+  failedBatches: NeptuneBatchRow[][];
+}
 
 async function sendCypher(
   client: NeptunedataClient,
@@ -49,6 +57,10 @@ async function sendCypher(
   }
 }
 
+/**
+ * Insert items in batches with adaptive sizing and fault tolerance.
+ * Failed batches (after all retries) are collected — never abort the load.
+ */
 async function batchedInsert(
   client: NeptunedataClient,
   items: NeptuneBatchRow[],
@@ -56,14 +68,18 @@ async function batchedInsert(
   batchSize: number = NODE_BATCH_SIZE,
   paramName: string = 'batch',
   onBatch?: (done: number, total: number) => void,
-): Promise<void> {
+): Promise<BatchResult> {
   const MIN_BATCH = 5;
   let currentSize = batchSize;
   let i = 0;
+  let inserted = 0;
+  const failedBatches: NeptuneBatchRow[][] = [];
+
   while (i < items.length) {
     const chunk = items.slice(i, i + currentSize);
     try {
       await sendCypher(client, cypher, { [paramName]: chunk });
+      inserted += chunk.length;
       i += currentSize;
       onBatch?.(Math.min(i, items.length), items.length);
     } catch (err: any) {
@@ -72,9 +88,14 @@ async function batchedInsert(
         onBatch?.(-1, items.length); // signal: batch size reduced
         continue; // retry same offset with smaller batch
       }
-      throw err;
+      // Persistent failure — skip this batch, continue with the next
+      failedBatches.push(chunk);
+      i += currentSize;
+      onBatch?.(Math.min(i, items.length), items.length);
     }
   }
+
+  return { inserted, failed: items.length - inserted, failedBatches };
 }
 
 /** Neptune openCypher only accepts simple literals (string, number, boolean) as property values. */
@@ -92,14 +113,13 @@ function sanitizeForNeptune(props: Record<string, unknown>): Record<string, unkn
 /**
  * Load a KnowledgeGraph into Neptune.
  *
- * 1. Clears all existing data (MATCH (n) DETACH DELETE n)
- * 2. Inserts nodes grouped by label via UNWIND+MERGE
- * 3. Inserts relationships via UNWIND+MERGE
- * 4. Creates indexes for query performance
+ * 1. Upserts nodes grouped by label via UNWIND+MERGE (idempotent)
+ * 2. Creates indexes for query performance
+ * 3. Upserts relationships via UNWIND+MERGE (idempotent)
+ * 4. Cleans up orphan nodes no longer in the graph
  *
- * @param graph     The in-memory knowledge graph built by the ingestion pipeline
- * @param config    Neptune connection config
- * @param onProgress  Optional callback for progress messages (same signature as loadGraphToKuzu)
+ * Failed batches are skipped with warnings — the load never aborts.
+ * Re-running analyze is always safe thanks to MERGE idempotency.
  */
 export async function loadGraphToNeptune(
   graph: KnowledgeGraph,
@@ -113,54 +133,52 @@ export async function loadGraphToNeptune(
 
   const warnings: string[] = [];
   let nodesInserted = 0;
+  let nodesFailed = 0;
   let edgesInserted = 0;
+  let edgesFailed = 0;
+
+  // Unique generation marker — used to identify stale nodes after upsert
+  const generation = `gen_${Date.now()}`;
 
   try {
-    // 1. Clear existing data in batches (single DETACH DELETE times out on large graphs)
-    onProgress?.('Clearing existing Neptune data...');
-    let deleteRound = 0;
-    for (;;) {
-      deleteRound++;
-      const res = await client.send(new ExecuteOpenCypherQueryCommand({
-        openCypherQuery: `MATCH (n) WITH n LIMIT ${DELETE_BATCH_SIZE} DETACH DELETE n RETURN count(*) AS deleted`,
-      }));
-      const rows = (res.results as Record<string, unknown>[]) ?? [];
-      const deleted = Number(rows[0]?.['deleted'] ?? 0);
-      if (deleted === 0) break;
-      onProgress?.(`Cleared ${deleted} nodes (round ${deleteRound})...`);
-    }
-
-    // 2. Group nodes by label
+    // 1. Group nodes by label
     const nodesByLabel = new Map<string, NeptuneBatchRow[]>();
     graph.forEachNode((node) => {
       const label = node.label ?? 'CodeElement';
       if (!nodesByLabel.has(label)) nodesByLabel.set(label, []);
-      // Flatten node.properties into the batch row alongside the id
       nodesByLabel.get(label)!.push({
         id: node.id,
+        _gen: generation,
         ...sanitizeForNeptune(node.properties as Record<string, unknown>),
       });
     });
 
-    // 3. Insert nodes by label
+    // 2. Upsert nodes by label
     const totalLabels = nodesByLabel.size;
     let labelIdx = 0;
     for (const [label, rows] of nodesByLabel) {
       labelIdx++;
-      onProgress?.(`Inserting ${label} nodes (${labelIdx}/${totalLabels}, ${rows.length} nodes)...`);
+      onProgress?.(`Upserting ${label} nodes (${labelIdx}/${totalLabels}, ${rows.length} nodes)...`);
       const cypher = `
         UNWIND $batch AS row
         MERGE (n:\`${label}\` {id: row.id})
         SET n += row
       `;
-      await batchedInsert(client, rows, cypher, NODE_BATCH_SIZE, 'batch', (done, total) => {
-        onProgress?.(`Inserting ${label} nodes (${labelIdx}/${totalLabels}, ${done}/${total})...`);
+      const result = await batchedInsert(client, rows, cypher, NODE_BATCH_SIZE, 'batch', (done, total) => {
+        if (done === -1) {
+          onProgress?.(`${label} nodes: batch size reduced (timeout), retrying...`);
+        } else {
+          onProgress?.(`Upserting ${label} nodes (${labelIdx}/${totalLabels}, ${done}/${total})...`);
+        }
       });
-      nodesInserted += rows.length;
+      nodesInserted += result.inserted;
+      nodesFailed += result.failed;
+      if (result.failed > 0) {
+        warnings.push(`${result.failed} ${label} nodes failed to insert (${result.failedBatches.length} batches skipped)`);
+      }
     }
 
-    // 4. Create indexes BEFORE edges — critical for MATCH performance
-    //    Index ALL labels in the graph, not just a hardcoded set.
+    // 3. Create indexes BEFORE edges — critical for MATCH performance
     const allLabels = new Set([...nodesByLabel.keys(),
       'Function', 'File', 'Class', 'Method', 'Interface', 'Module',
       'Namespace', 'Variable', 'Property', 'CodeElement']);
@@ -173,7 +191,7 @@ export async function loadGraphToNeptune(
       }
     }
 
-    // 5. Insert relationships (smaller batches — MATCH on two nodes is heavier)
+    // 4. Upsert relationships
     const relRows: NeptuneBatchRow[] = [];
     graph.forEachRelationship((rel) => {
       const row: NeptuneBatchRow = {
@@ -187,24 +205,49 @@ export async function loadGraphToNeptune(
       relRows.push(row);
     });
 
-    onProgress?.(`Inserting ${relRows.length.toLocaleString()} relationships (batch=${EDGE_BATCH_SIZE})...`);
+    onProgress?.(`Upserting ${relRows.length.toLocaleString()} relationships (batch=${EDGE_BATCH_SIZE})...`);
     const relCypher = `
       UNWIND $batch AS row
       MATCH (a {id: row.from}), (b {id: row.to})
       MERGE (a)-[r:CodeRelation {type: row.type}]->(b)
       SET r += row
     `;
-    await batchedInsert(client, relRows, relCypher, EDGE_BATCH_SIZE, 'batch', (done, total) => {
+    const edgeResult = await batchedInsert(client, relRows, relCypher, EDGE_BATCH_SIZE, 'batch', (done, total) => {
       if (done === -1) {
         onProgress?.(`Relationships: batch size reduced (timeout), retrying...`);
       } else {
-        onProgress?.(`Inserting relationships ${done.toLocaleString()}/${total.toLocaleString()}...`);
+        onProgress?.(`Upserting relationships ${done.toLocaleString()}/${total.toLocaleString()}...`);
       }
     });
-    edgesInserted = relRows.length;
+    edgesInserted = edgeResult.inserted;
+    edgesFailed = edgeResult.failed;
+    if (edgeResult.failed > 0) {
+      warnings.push(`${edgeResult.failed} relationships failed to insert (${edgeResult.failedBatches.length} batches skipped)`);
+    }
+
+    // 5. Clean up stale nodes from previous runs.
+    //    Any node without the current generation marker is orphaned.
+    //    Batched to avoid timeouts on large graphs. Non-fatal if it fails.
+    onProgress?.('Cleaning up stale nodes...');
+    const CLEANUP_BATCH = 10_000;
+    let cleanupTotal = 0;
+    try {
+      for (;;) {
+        const res = await client.send(new ExecuteOpenCypherQueryCommand({
+          openCypherQuery: `MATCH (n) WHERE n._gen <> '${generation}' OR NOT exists(n._gen) WITH n LIMIT ${CLEANUP_BATCH} DETACH DELETE n RETURN count(*) AS deleted`,
+        }));
+        const rows = (res.results as Record<string, unknown>[]) ?? [];
+        const deleted = Number(rows[0]?.['deleted'] ?? 0);
+        if (deleted === 0) break;
+        cleanupTotal += deleted;
+        onProgress?.(`Cleaned ${cleanupTotal} stale nodes...`);
+      }
+    } catch (err: any) {
+      warnings.push(`Orphan cleanup failed after removing ${cleanupTotal} nodes (non-fatal): ${err.message ?? err.name}`);
+    }
 
     onProgress?.('Neptune loading complete');
-    return { nodesInserted, edgesInserted, warnings };
+    return { nodesInserted, nodesFailed, edgesInserted, edgesFailed, warnings };
   } finally {
     client.destroy();
   }
@@ -216,10 +259,6 @@ export async function loadGraphToNeptune(
  * For each embedding, matches the node by id and sets n.embedding = float[].
  * Uses UNWIND batches of 200 (smaller than BATCH_SIZE because embedding arrays
  * are large payloads).
- *
- * @param config      Neptune connection config
- * @param embeddings  Array of { nodeId, embedding } pairs
- * @param onProgress  Optional callback for progress messages
  */
 export async function loadEmbeddingsToNeptune(
   config: NeptuneDbConfig,

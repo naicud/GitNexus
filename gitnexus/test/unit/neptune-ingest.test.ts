@@ -2,8 +2,8 @@
  * Unit Tests: Neptune Ingestion
  *
  * Tests loadGraphToNeptune and getNeptuneStats. AWS SDK is fully mocked.
- * Verifies: data clearing, node grouping by label, batched inserts,
- * relationship insertion, progress callbacks, and stats retrieval.
+ * Verifies: idempotent upsert, node grouping by label, batched inserts,
+ * fault-tolerant edge insertion, progress callbacks, orphan cleanup, and stats retrieval.
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
@@ -90,13 +90,20 @@ describe('loadGraphToNeptune', () => {
     mockSend.mockResolvedValue({});
   });
 
-  it('clears existing data as the first operation', async () => {
+  it('does not clear data before inserting (idempotent upsert)', async () => {
     const graph = createMockGraph(2, 1);
     await loadGraphToNeptune(graph, testConfig);
 
-    // The first send call should be the DETACH DELETE
-    const firstCall = (ExecuteOpenCypherQueryCommand as any).mock.calls[0][0];
-    expect(firstCall.openCypherQuery).toBe('MATCH (n) DETACH DELETE n');
+    // No DETACH DELETE should appear before the MERGE inserts
+    const cypherCalls = (ExecuteOpenCypherQueryCommand as any).mock.calls.map(
+      (call: any[]) => call[0].openCypherQuery,
+    );
+    const firstMerge = cypherCalls.findIndex((q: string) => q.includes('MERGE'));
+    const firstDelete = cypherCalls.findIndex((q: string) => q.includes('DETACH DELETE'));
+    // Cleanup (delete) should come AFTER upserts, not before
+    if (firstDelete !== -1) {
+      expect(firstDelete).toBeGreaterThan(firstMerge);
+    }
   });
 
   it('returns correct node count', async () => {
@@ -151,8 +158,7 @@ describe('loadGraphToNeptune', () => {
 
     expect(onProgress).toHaveBeenCalled();
     const messages = onProgress.mock.calls.map((c: any[]) => c[0]);
-    expect(messages.some((m: string) => m.includes('Clearing'))).toBe(true);
-    expect(messages.some((m: string) => m.includes('Inserting'))).toBe(true);
+    expect(messages.some((m: string) => m.includes('Upserting'))).toBe(true);
     expect(messages.some((m: string) => m.includes('complete'))).toBe(true);
   });
 
@@ -167,8 +173,51 @@ describe('loadGraphToNeptune', () => {
     const graph = createMockGraph(0, 0);
     const result = await loadGraphToNeptune(graph, testConfig);
     expect(result.nodesInserted).toBe(0);
+    expect(result.nodesFailed).toBe(0);
     expect(result.edgesInserted).toBe(0);
+    expect(result.edgesFailed).toBe(0);
     expect(result.warnings).toEqual([]);
+  });
+
+  it('skips failed edge batches and reports them in warnings', async () => {
+    const graph = createMockGraph(4, 3);
+    let callCount = 0;
+    mockSend.mockImplementation(async () => {
+      callCount++;
+      // Fail the relationship MERGE calls (non-retryable error)
+      // Node MERGEs come first, then indexes, then edges
+      // We need to identify edge calls — they happen after index calls
+      // For simplicity, fail on a later call that would be an edge batch
+      return {};
+    });
+
+    // Override: fail only on edge-related sendCypher calls
+    // We do this by failing after the index creation calls
+    const nodeAndIndexCalls = 10 + 2; // 10 indexes + 2 label groups
+    let sendCount = 0;
+    mockSend.mockImplementation(async () => {
+      sendCount++;
+      // After nodes + indexes, the edge calls start.
+      // Fail the first edge batch with a non-retryable error.
+      if (sendCount === nodeAndIndexCalls + 1) {
+        const err = new Error('ConcurrentModificationException');
+        err.name = 'NonRetryableError';
+        throw err;
+      }
+      return {};
+    });
+
+    const result = await loadGraphToNeptune(graph, testConfig);
+    // Some edges should have failed
+    expect(result.edgesFailed).toBeGreaterThan(0);
+    expect(result.warnings.some((w: string) => w.includes('relationships failed'))).toBe(true);
+  });
+
+  it('returns nodesFailed and edgesFailed as zero on success', async () => {
+    const graph = createMockGraph(2, 1);
+    const result = await loadGraphToNeptune(graph, testConfig);
+    expect(result.nodesFailed).toBe(0);
+    expect(result.edgesFailed).toBe(0);
   });
 
   it('attempts to create indexes for standard labels', async () => {
@@ -191,13 +240,12 @@ describe('loadGraphToNeptune', () => {
   });
 
   it('destroys client even when send fails', async () => {
-    mockSend.mockRejectedValueOnce(new Error('Neptune down'));
+    // With fault tolerance, node batch failures are skipped.
+    // Client should still be destroyed.
+    mockSend.mockRejectedValue(new Error('Neptune down'));
     const graph = createMockGraph(1, 0);
-    try {
-      await loadGraphToNeptune(graph, testConfig);
-    } catch {
-      // expected
-    }
+    const result = await loadGraphToNeptune(graph, testConfig);
+    expect(result.nodesFailed).toBeGreaterThan(0);
     expect(mockDestroy).toHaveBeenCalledTimes(1);
   });
 });
