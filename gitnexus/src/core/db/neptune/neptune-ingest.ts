@@ -13,7 +13,8 @@ import type { KnowledgeGraph } from '../../graph/types.js';
 import type { NeptuneDbConfig } from '../interfaces.js';
 
 const NODE_BATCH_SIZE = 500;
-const EDGE_BATCH_SIZE = 100;
+const EDGE_BATCH_SIZE = 25;
+const DELETE_BATCH_SIZE = 10_000;
 const MAX_RETRIES = 5;
 
 export interface NeptuneLoadResult {
@@ -56,10 +57,23 @@ async function batchedInsert(
   paramName: string = 'batch',
   onBatch?: (done: number, total: number) => void,
 ): Promise<void> {
-  for (let i = 0; i < items.length; i += batchSize) {
-    const batch = items.slice(i, i + batchSize);
-    await sendCypher(client, cypher, { [paramName]: batch });
-    onBatch?.(Math.min(i + batchSize, items.length), items.length);
+  const MIN_BATCH = 5;
+  let currentSize = batchSize;
+  let i = 0;
+  while (i < items.length) {
+    const chunk = items.slice(i, i + currentSize);
+    try {
+      await sendCypher(client, cypher, { [paramName]: chunk });
+      i += currentSize;
+      onBatch?.(Math.min(i, items.length), items.length);
+    } catch (err: any) {
+      if (err.name === 'TimeLimitExceededException' && currentSize > MIN_BATCH) {
+        currentSize = Math.max(MIN_BATCH, Math.floor(currentSize / 2));
+        onBatch?.(-1, items.length); // signal: batch size reduced
+        continue; // retry same offset with smaller batch
+      }
+      throw err;
+    }
   }
 }
 
@@ -90,9 +104,19 @@ export async function loadGraphToNeptune(
   let edgesInserted = 0;
 
   try {
-    // 1. Clear existing data
+    // 1. Clear existing data in batches (single DETACH DELETE times out on large graphs)
     onProgress?.('Clearing existing Neptune data...');
-    await sendCypher(client, 'MATCH (n) DETACH DELETE n');
+    let deleteRound = 0;
+    for (;;) {
+      deleteRound++;
+      const res = await client.send(new ExecuteOpenCypherQueryCommand({
+        openCypherQuery: `MATCH (n) WITH n LIMIT ${DELETE_BATCH_SIZE} DETACH DELETE n RETURN count(*) AS deleted`,
+      }));
+      const rows = (res.results as Record<string, unknown>[]) ?? [];
+      const deleted = Number(rows[0]?.['deleted'] ?? 0);
+      if (deleted === 0) break;
+      onProgress?.(`Cleared ${deleted} nodes (round ${deleteRound})...`);
+    }
 
     // 2. Group nodes by label
     const nodesByLabel = new Map<string, NeptuneBatchRow[]>();
@@ -124,10 +148,12 @@ export async function loadGraphToNeptune(
     }
 
     // 4. Create indexes BEFORE edges — critical for MATCH performance
-    onProgress?.('Creating Neptune indexes...');
-    const indexLabels = ['Function', 'File', 'Class', 'Method', 'Interface', 'Module',
-      'Namespace', 'Variable', 'Property', 'CodeElement'];
-    for (const lbl of indexLabels) {
+    //    Index ALL labels in the graph, not just a hardcoded set.
+    const allLabels = new Set([...nodesByLabel.keys(),
+      'Function', 'File', 'Class', 'Method', 'Interface', 'Module',
+      'Namespace', 'Variable', 'Property', 'CodeElement']);
+    onProgress?.(`Creating Neptune indexes on ${allLabels.size} labels...`);
+    for (const lbl of allLabels) {
       try {
         await sendCypher(client, `CREATE INDEX ON :\`${lbl}\`(id)`);
       } catch {
@@ -148,7 +174,7 @@ export async function loadGraphToNeptune(
       });
     });
 
-    onProgress?.(`Inserting ${relRows.length} relationships (batch=${EDGE_BATCH_SIZE})...`);
+    onProgress?.(`Inserting ${relRows.length.toLocaleString()} relationships (batch=${EDGE_BATCH_SIZE})...`);
     const relCypher = `
       UNWIND $batch AS row
       MATCH (a {id: row.from}), (b {id: row.to})
@@ -156,7 +182,11 @@ export async function loadGraphToNeptune(
       SET r += row
     `;
     await batchedInsert(client, relRows, relCypher, EDGE_BATCH_SIZE, 'batch', (done, total) => {
-      onProgress?.(`Inserting relationships ${done.toLocaleString()}/${total.toLocaleString()}...`);
+      if (done === -1) {
+        onProgress?.(`Relationships: batch size reduced (timeout), retrying...`);
+      } else {
+        onProgress?.(`Inserting relationships ${done.toLocaleString()}/${total.toLocaleString()}...`);
+      }
     });
     edgesInserted = relRows.length;
 

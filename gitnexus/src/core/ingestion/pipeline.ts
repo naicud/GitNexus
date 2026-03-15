@@ -473,42 +473,52 @@ export const runPipelineFromRepo = async (
           workerPool,
         );
 
-        if (chunkWorkerData) {
-          // Imports
+        if (chunkWorkerData && !chunkWorkerData.sequentialFallback) {
+          // Full worker path — all languages resolved by workers
           await processImportsFromExtracted(graph, allPathObjects, chunkWorkerData.imports, importMap, undefined, repoPath, importCtx, packageMap, namedImportMap);
-          // Calls + Heritage + Routes — resolve in parallel (no shared mutable state between them)
-          // This is safe because each writes disjoint relationship types into idempotent id-keyed Maps,
-          // and the single-threaded event loop prevents races between synchronous addRelationship calls.
           await Promise.all([
             processCallsFromExtracted(
-              graph, 
-              chunkWorkerData.calls, 
-              symbolTable, importMap, 
-              packageMap, 
-              undefined, 
+              graph,
+              chunkWorkerData.calls,
+              symbolTable, importMap,
+              packageMap,
+              undefined,
               namedImportMap
             ),
             processHeritageFromExtracted(
-              graph, 
-              chunkWorkerData.heritage, 
-              symbolTable, 
-              importMap, 
+              graph,
+              chunkWorkerData.heritage,
+              symbolTable,
+              importMap,
               packageMap
             ),
             processRoutesFromExtracted(
-              graph, 
-              chunkWorkerData.routes ?? [], 
-              symbolTable, 
-              importMap, 
+              graph,
+              chunkWorkerData.routes ?? [],
+              symbolTable,
+              importMap,
               packageMap
             ),
           ]);
         } else {
-          // Pool failed — disable for all remaining chunks to avoid 120s timeout per chunk.
+          // Sequential fallback — disable worker pool for remaining chunks
           if (workerPool) {
             await workerPool.terminate();
             workerPool = undefined;
           }
+          // Resolve COBOL calls/imports collected by sequential parsing
+          if (chunkWorkerData) {
+            await processImportsFromExtracted(graph, allPathObjects, chunkWorkerData.imports, importMap, undefined, repoPath, importCtx, packageMap, namedImportMap);
+            await processCallsFromExtracted(
+              graph,
+              chunkWorkerData.calls,
+              symbolTable, importMap,
+              packageMap,
+              undefined,
+              namedImportMap
+            );
+          }
+          // Tree-sitter import/call processing for non-COBOL files
           await processImports(graph, chunkFiles, astCache, importMap, undefined, repoPath, allPaths, packageMap, namedImportMap);
           sequentialChunkPaths.push(chunkPaths);
         }

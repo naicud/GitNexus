@@ -270,6 +270,7 @@ const CALLABLE_SYMBOL_TYPES = new Set([
   'Constructor',
   'Macro',
   'Delegate',
+  'Module',  // COBOL: CALL "PROGRAM" targets a Module (PROGRAM-ID) node
 ]);
 
 const collectTieredCandidates = (

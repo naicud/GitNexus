@@ -5,7 +5,7 @@ import { LANGUAGE_QUERIES } from './tree-sitter-queries.js';
 import { generateId } from '../../lib/utils.js';
 import { SymbolTable } from './symbol-table.js';
 import { ASTCache } from './ast-cache.js';
-import { getLanguageFromFilename, getLanguageFromPath, yieldToEventLoop, DEFINITION_CAPTURE_KEYS, getDefinitionNodeFromCaptures, findEnclosingClassId, extractMethodSignature } from './utils.js';
+import { getLanguageFromFilename, getLanguageFromPath, yieldToEventLoop, DEFINITION_CAPTURE_KEYS, getDefinitionNodeFromCaptures, findEnclosingClassId, extractMethodSignature, isBuiltInOrNoise } from './utils.js';
 import { isNodeExported } from './export-detection.js';
 import { preprocessCobolSource, extractCobolSymbolsWithRegex } from './cobol-preprocessor.js';
 import { SupportedLanguages } from '../../config/supported-languages.js';
@@ -21,6 +21,9 @@ export interface WorkerExtractedData {
   calls: ExtractedCall[];
   heritage: ExtractedHeritage[];
   routes: ExtractedRoute[];
+  /** True when data came from the sequential fallback (only COBOL data present;
+   *  non-COBOL files still need tree-sitter-based import/call processing). */
+  sequentialFallback?: boolean;
 }
 
 // isNodeExported imported from ./export-detection.js (shared module)
@@ -104,9 +107,14 @@ const processParsingSequential = async (
   symbolTable: SymbolTable,
   astCache: ASTCache,
   onFileProgress?: FileProgressCallback
-) => {
+): Promise<WorkerExtractedData | null> => {
   const parser = await loadParser();
   const total = files.length;
+
+  // Collect COBOL extracted data so the pipeline can resolve calls/imports
+  // (tree-sitter-based processCalls/processImports skip COBOL files)
+  const cobolImports: ExtractedImport[] = [];
+  const cobolCalls: ExtractedCall[] = [];
 
   for (let i = 0; i < files.length; i++) {
     const file = files[i];
@@ -396,6 +404,26 @@ const processParsingSequential = async (
       // REL_TYPES, and generate O(moves × files) relationships that push the
       // in-memory Map past V8's 16.7M limit on large COBOL repos.
 
+      // Collect COBOL imports/calls for pipeline resolution (mirrors worker path).
+      // Without this, the sequential fallback produces nodes but no CALLS/IMPORTS
+      // edges — tree-sitter-based processCalls/processImports skip COBOL files.
+      for (const copy of regexResults.copies) {
+        cobolImports.push({ filePath: file.path, rawImportPath: copy.target, language: SupportedLanguages.COBOL });
+      }
+      for (const call of regexResults.calls) {
+        if (!isBuiltInOrNoise(call.target)) {
+          cobolCalls.push({ filePath: file.path, calledName: call.target, sourceId: fileId });
+        }
+      }
+      for (const perf of regexResults.performs) {
+        if (!isBuiltInOrNoise(perf.target)) {
+          const perfSourceId = perf.caller
+            ? generateId('Function', `${file.path}:${perf.caller}`)
+            : fileId;
+          cobolCalls.push({ filePath: file.path, calledName: perf.target, sourceId: perfSourceId });
+        }
+      }
+
       continue;
     }
 
@@ -556,6 +584,13 @@ const processParsingSequential = async (
       }
     });
   }
+
+  // Return collected COBOL extracted data (if any) so the pipeline can resolve
+  // calls/imports via processCallsFromExtracted / processImportsFromExtracted.
+  if (cobolImports.length > 0 || cobolCalls.length > 0) {
+    return { imports: cobolImports, calls: cobolCalls, heritage: [], routes: [], sequentialFallback: true };
+  }
+  return null;
 };
 
 // ============================================================================
@@ -578,7 +613,6 @@ export const processParsing = async (
     }
   }
 
-  // Fallback: sequential parsing (no pre-extracted data)
-  await processParsingSequential(graph, files, symbolTable, astCache, onFileProgress);
-  return null;
+  // Fallback: sequential parsing — returns COBOL extracted data if present
+  return await processParsingSequential(graph, files, symbolTable, astCache, onFileProgress);
 };
