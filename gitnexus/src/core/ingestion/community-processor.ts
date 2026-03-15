@@ -93,7 +93,8 @@ export const processCommunities = async (
   // Pre-check total symbol count to determine large-graph mode before building
   let symbolCount = 0;
   knowledgeGraph.forEachNode(node => {
-    if (node.label === 'Function' || node.label === 'Class' || node.label === 'Method' || node.label === 'Interface') {
+    if (node.label === 'Function' || node.label === 'Class' || node.label === 'Method' || node.label === 'Interface'
+        || node.label === 'Module' || node.label === 'Namespace' || node.label === 'Struct' || node.label === 'Enum' || node.label === 'Macro') {
       symbolCount++;
     }
   });
@@ -189,8 +190,8 @@ const MIN_CONFIDENCE_LARGE = 0.5;
 const buildGraphologyGraph = (knowledgeGraph: KnowledgeGraph, isLarge: boolean): any => {
   const graph = new (Graph as any)({ type: 'undirected', allowSelfLoops: false });
 
-  const symbolTypes = new Set<NodeLabel>(['Function', 'Class', 'Method', 'Interface']);
-  const clusteringRelTypes = new Set(['CALLS', 'EXTENDS', 'IMPLEMENTS']);
+  const symbolTypes = new Set<NodeLabel>(['Function', 'Class', 'Method', 'Interface', 'Module', 'Namespace', 'Struct', 'Enum', 'Macro']);
+  const clusteringRelTypes = new Set(['CALLS', 'EXTENDS', 'IMPLEMENTS', 'IMPORTS', 'CONTRACTS']);
   const connectedNodes = new Set<string>();
   const nodeDegree = new Map<string, number>();
 
@@ -206,9 +207,8 @@ const buildGraphologyGraph = (knowledgeGraph: KnowledgeGraph, isLarge: boolean):
 
   knowledgeGraph.forEachNode(node => {
     if (!symbolTypes.has(node.label) || !connectedNodes.has(node.id)) return;
-    // For large graphs, skip degree-1 nodes — they just become singletons or
-    // get absorbed into their single neighbor's community, but cost iteration time.
-    if (isLarge && (nodeDegree.get(node.id) || 0) < 2) return;
+    // For large graphs, skip isolated nodes (degree 0) that have no clustering edges.
+    if (isLarge && (nodeDegree.get(node.id) || 0) < 1) return;
 
     graph.addNode(node.id, {
       name: node.properties.name,

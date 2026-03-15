@@ -1,10 +1,10 @@
-import { useEffect, useCallback, useMemo, useState, forwardRef, useImperativeHandle } from 'react';
+import { useEffect, useCallback, useMemo, useState, useRef as useReactRef, forwardRef, useImperativeHandle } from 'react';
 import { ZoomIn, ZoomOut, Maximize2, Focus, RotateCcw, Play, Pause, Lightbulb, LightbulbOff, Minimize2 } from 'lucide-react';
 import { useSigma } from '../hooks/useSigma';
 import { useAppState } from '../hooks/useAppState';
 import { knowledgeGraphToGraphology, filterGraphByDepth, SigmaNodeAttributes, SigmaEdgeAttributes } from '../lib/graph-adapter';
-import { summaryToGraphology, expandGroupInGraph, collapseGroupInGraph } from '../lib/summary-graph-adapter';
-import { fetchGroupExpansion } from '../services/graph-lod';
+import { summaryToGraphology, expandGroupInGraph, collapseGroupInGraph, addNeighborsToGraph } from '../lib/summary-graph-adapter';
+import { fetchGroupExpansion, fetchNeighbors } from '../services/graph-lod';
 import { QueryFAB } from './QueryFAB';
 import Graph from 'graphology';
 
@@ -33,11 +33,14 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle>((_, ref) => {
     expandedGroups,
     setExpandedGroups,
     graphSummary,
+    graphTruncated,
     serverBaseUrl,
     projectName,
   } = useAppState();
   const [hoveredNodeName, setHoveredNodeName] = useState<string | null>(null);
   const [expandingGroup, setExpandingGroup] = useState<string | null>(null);
+  const [exploringNeighbors, setExploringNeighbors] = useState(false);
+  const [contextMenu, setContextMenu] = useState<{ x: number; y: number; nodeId: string } | null>(null);
 
   const effectiveHighlightedNodeIds = useMemo(() => {
     if (!isAIHighlightsEnabled) return highlightedNodeIds;
@@ -82,7 +85,13 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle>((_, ref) => {
 
   const handleStageClick = useCallback(() => {
     setSelectedNode(null);
+    setContextMenu(null);
   }, [setSelectedNode]);
+
+  // Right-click context menu via Sigma's public rightClickNode event
+  const handleNodeRightClick = useCallback((nodeId: string, event: { clientX: number; clientY: number }) => {
+    setContextMenu({ x: event.clientX, y: event.clientY, nodeId });
+  }, []);
 
   // LOD: Handle group expansion on double-click
   const handleGroupExpand = useCallback(async (groupLabel: string, groupId: string) => {
@@ -137,6 +146,42 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle>((_, ref) => {
     }
   }, [graphSummary, expandedGroups, setExpandedGroups]);
 
+  // Neighbor exploration: expand neighbors of a symbol node
+  const handleExploreNeighbors = useCallback(async (nodeId: string, depth: number = 1) => {
+    if (!serverBaseUrl || !projectName || exploringNeighbors) return;
+    setExploringNeighbors(true);
+    setContextMenu(null);
+    try {
+      const expansion = await fetchNeighbors(serverBaseUrl, projectName, nodeId, depth);
+      const sigmaGraph = sigmaGraphRef.current;
+      if (!sigmaGraph) return;
+
+      const newNodeIds = addNeighborsToGraph(sigmaGraph, expansion, nodeId);
+
+      if (sigmaInstance.current) {
+        sigmaInstance.current.refresh();
+      }
+      if (newNodeIds.length > 0) {
+        runLayoutFn.current?.(sigmaGraph);
+      }
+    } catch (err) {
+      console.error('Failed to explore neighbors:', err);
+    } finally {
+      setExploringNeighbors(false);
+    }
+  }, [serverBaseUrl, projectName, exploringNeighbors]);
+
+  // Dismiss a node from the canvas
+  const handleDismissNode = useCallback((nodeId: string) => {
+    setContextMenu(null);
+    const sigmaGraph = sigmaGraphRef.current;
+    if (!sigmaGraph || !sigmaGraph.hasNode(nodeId)) return;
+    sigmaGraph.dropNode(nodeId);
+    if (sigmaInstance.current) {
+      sigmaInstance.current.refresh();
+    }
+  }, []);
+
   // LOD: Collapse all expanded groups
   const handleCollapseAll = useCallback(() => {
     for (const groupId of expandedGroups.keys()) {
@@ -164,6 +209,7 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle>((_, ref) => {
     onNodeHover: handleNodeHover,
     onStageClick: handleStageClick,
     onGroupExpand: handleGroupExpand,
+    onNodeRightClick: handleNodeRightClick,
     highlightedNodeIds: effectiveHighlightedNodeIds,
     blastRadiusNodeIds: effectiveBlastRadiusNodeIds,
     animatedNodes: effectiveAnimatedNodes,
@@ -173,7 +219,8 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle>((_, ref) => {
   // Refs for accessing sigma internals from LOD callbacks (avoids stale closure issues)
   const sigmaGraphRef = sigmaGraphRefFromHook;
   const sigmaInstance = sigmaRef;
-  const runLayoutFn = { current: runLayout } as { current: typeof runLayout };
+  const runLayoutFn = useReactRef(runLayout);
+  runLayoutFn.current = runLayout;
 
   // Expose focusNode to parent via ref
   useImperativeHandle(ref, () => ({
@@ -275,6 +322,7 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle>((_, ref) => {
       <div
         ref={containerRef}
         className="sigma-container w-full h-full cursor-grab active:cursor-grabbing"
+        onContextMenu={(e) => e.preventDefault()}
       />
 
       {/* Hovered node tooltip - only show when NOT selected */}
@@ -405,12 +453,67 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle>((_, ref) => {
         </div>
       )}
 
+      {/* Exploring neighbors indicator */}
+      {exploringNeighbors && (
+        <div className="absolute bottom-4 left-1/2 -translate-x-1/2 flex items-center gap-2 px-3 py-1.5 bg-cyan-500/20 border border-cyan-500/30 rounded-full backdrop-blur-sm z-10 animate-fade-in">
+          <div className="w-2 h-2 bg-cyan-400 rounded-full animate-ping" />
+          <span className="text-xs text-cyan-400 font-medium">Exploring neighbors...</span>
+        </div>
+      )}
+
+      {/* Truncation banner */}
+      {graphTruncated && graphViewMode === 'full' && (
+        <div className="absolute top-4 left-4 flex items-center gap-2 px-3 py-1.5 bg-amber-500/10 border border-amber-500/20 rounded-lg backdrop-blur-sm z-10">
+          <span className="text-xs text-amber-300 font-medium">
+            Graph truncated to 5K nodes — use cluster view or search to explore
+          </span>
+        </div>
+      )}
+
+      {/* Empty summary message */}
+      {graphViewMode === 'summary' && graphSummary && graphSummary.clusterGroups.length === 0 && (
+        <div className="absolute inset-0 flex items-center justify-center z-10 pointer-events-none">
+          <div className="px-6 py-4 bg-elevated/90 border border-border-subtle rounded-xl backdrop-blur-sm text-center">
+            <p className="text-sm text-text-secondary">No cluster groups found.</p>
+            <p className="text-xs text-text-muted mt-1">Re-index the repository to generate community clusters.</p>
+          </div>
+        </div>
+      )}
+
       {/* Summary mode indicator */}
-      {graphViewMode === 'summary' && (
+      {graphViewMode === 'summary' && graphSummary && graphSummary.clusterGroups.length > 0 && (
         <div className="absolute bottom-4 left-4 flex items-center gap-2 px-3 py-1.5 bg-violet-500/10 border border-violet-500/20 rounded-lg backdrop-blur-sm z-10">
           <span className="text-xs text-violet-300 font-medium">
-            LOD View {expandedGroups.size > 0 ? `(${expandedGroups.size} expanded)` : ''} — Double-click to expand
+            LOD View {expandedGroups.size > 0 ? `(${expandedGroups.size} expanded)` : ''} — Double-click to expand, right-click for options
           </span>
+        </div>
+      )}
+
+      {/* Context menu */}
+      {contextMenu && (
+        <div
+          className="fixed z-50 bg-elevated border border-border-subtle rounded-lg shadow-xl py-1 min-w-[180px]"
+          style={{ left: contextMenu.x, top: contextMenu.y }}
+        >
+          <button
+            onClick={() => handleExploreNeighbors(contextMenu.nodeId, 1)}
+            className="w-full px-3 py-1.5 text-left text-sm text-text-primary hover:bg-hover transition-colors"
+          >
+            Explore neighbors (1 hop)
+          </button>
+          <button
+            onClick={() => handleExploreNeighbors(contextMenu.nodeId, 2)}
+            className="w-full px-3 py-1.5 text-left text-sm text-text-primary hover:bg-hover transition-colors"
+          >
+            Explore neighbors (2 hops)
+          </button>
+          <div className="h-px bg-border-subtle my-1" />
+          <button
+            onClick={() => handleDismissNode(contextMenu.nodeId)}
+            className="w-full px-3 py-1.5 text-left text-sm text-red-400 hover:bg-hover transition-colors"
+          >
+            Dismiss node
+          </button>
         </div>
       )}
 

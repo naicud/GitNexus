@@ -472,6 +472,14 @@ export const batchInsertNodesToKuzu = async (
   return { inserted, failed };
 };
 
+/** Normalize kuzu getAll() — large DBs may return paged results [[page1...], [page2...]] */
+const flattenRows = (rows: any[]): any[] => {
+  if (rows.length > 0 && Array.isArray(rows[0])) {
+    return rows.flat();
+  }
+  return rows;
+};
+
 export const executeQuery = async (cypher: string): Promise<any[]> => {
   if (!conn) {
     throw new Error('KuzuDB not initialized. Call initKuzu first.');
@@ -482,7 +490,26 @@ export const executeQuery = async (cypher: string): Promise<any[]> => {
   // Query returns QueryResult for single queries, QueryResult[] for multi-statement
   const result = Array.isArray(queryResult) ? queryResult[0] : queryResult;
   const rows = await result.getAll();
-  return rows;
+  return flattenRows(rows);
+};
+
+/**
+ * Execute a parameterized Cypher query (safe against injection).
+ * Uses conn.prepare() + conn.execute() to bind parameters safely.
+ */
+export const executeParameterizedQuery = async (
+  cypher: string,
+  params: Record<string, any>,
+): Promise<any[]> => {
+  if (!conn) {
+    throw new Error('KuzuDB not initialized. Call initKuzu first.');
+  }
+
+  const stmt = await conn.prepare(cypher);
+  const queryResult = await conn.execute(stmt, params);
+  const result = Array.isArray(queryResult) ? queryResult[0] : queryResult;
+  const rows = await result.getAll();
+  return flattenRows(rows);
 };
 
 export const executeWithReusedStatement = async (

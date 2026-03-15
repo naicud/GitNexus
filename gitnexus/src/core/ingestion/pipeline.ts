@@ -568,6 +568,20 @@ export const runPipelineFromRepo = async (
       }
     }
 
+    // ── Phase 4c: JCL job stream integration ────────────────────────
+    if (process.env.GITNEXUS_JCL_DIRS) {
+      const { isJclFile } = await import('./utils.js');
+      const jclPaths = allPaths.filter(p => isJclFile(p));
+      if (jclPaths.length > 0) {
+        const { processJclFiles } = await import('./jcl-processor.js');
+        const jclContents = await readFileContents(repoPath, jclPaths);
+        const jclResult = processJclFiles(graph, jclPaths, jclContents);
+        if (isDev) {
+          console.log(`[pipeline] JCL integration: ${jclResult.jobCount} jobs, ${jclResult.stepCount} steps, ${jclResult.programLinks} program links`);
+        }
+      }
+    }
+
     // Free copybook content map — no longer needed
     cobolCopybookContents = undefined;
 

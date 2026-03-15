@@ -128,6 +128,8 @@ interface AppState {
   setExpandedGroups: (groups: Map<string, string[]>) => void;
   graphSummary: import('../services/graph-lod').GraphSummary | null;
   setGraphSummary: (s: import('../services/graph-lod').GraphSummary | null) => void;
+  graphTruncated: boolean;
+  setGraphTruncated: (v: boolean) => void;
 
   // Worker API (shared across app)
   runPipeline: (file: File, onProgress: (p: PipelineProgress) => void, clusteringConfig?: ProviderConfig) => Promise<PipelineResult>;
@@ -299,6 +301,7 @@ export const AppStateProvider = ({ children }: { children: ReactNode }) => {
   const [graphViewMode, setGraphViewMode] = useState<'full' | 'summary'>('full');
   const [expandedGroups, setExpandedGroups] = useState<Map<string, string[]>>(new Map());
   const [graphSummary, setGraphSummary] = useState<import('../services/graph-lod').GraphSummary | null>(null);
+  const [graphTruncated, setGraphTruncated] = useState(false);
 
   // Embedding state
   const [embeddingStatus, setEmbeddingStatus] = useState<EmbeddingStatus>('idle');
@@ -1213,6 +1216,8 @@ export const AppStateProvider = ({ children }: { children: ReactNode }) => {
     setExpandedGroups,
     graphSummary,
     setGraphSummary,
+    graphTruncated,
+    setGraphTruncated,
     runPipeline,
     runPipelineFromFiles,
     runQuery,

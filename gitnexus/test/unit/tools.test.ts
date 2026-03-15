@@ -2,7 +2,7 @@
  * Unit Tests: MCP Tool Definitions
  *
  * Tests: GITNEXUS_TOOLS from tools.ts
- * - All 7 tools are defined
+ * - All 8 tools are defined
  * - Each tool has valid name, description, inputSchema
  * - Required fields are correct
  * - Optional repo parameter is present on tools that need it
@@ -11,8 +11,8 @@ import { describe, it, expect } from 'vitest';
 import { GITNEXUS_TOOLS, type ToolDefinition } from '../../src/mcp/tools.js';
 
 describe('GITNEXUS_TOOLS', () => {
-  it('exports exactly 7 tools', () => {
-    expect(GITNEXUS_TOOLS).toHaveLength(7);
+  it('exports exactly 8 tools', () => {
+    expect(GITNEXUS_TOOLS).toHaveLength(8);
   });
 
   it('contains all expected tool names', () => {
@@ -20,7 +20,7 @@ describe('GITNEXUS_TOOLS', () => {
     expect(names).toEqual(
       expect.arrayContaining([
         'list_repos', 'query', 'cypher', 'context',
-        'detect_changes', 'rename', 'impact',
+        'detect_changes', 'rename', 'impact', 'assess',
       ])
     );
   });

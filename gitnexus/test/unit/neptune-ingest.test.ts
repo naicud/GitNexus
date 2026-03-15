@@ -179,8 +179,9 @@ describe('loadGraphToNeptune', () => {
       (call: any[]) => call[0].openCypherQuery,
     );
     const indexCalls = cypherCalls.filter((q: string) => q.includes('CREATE INDEX'));
-    // Should attempt indexes for Function, File, Class, Method, Interface, Module
-    expect(indexCalls.length).toBe(6);
+    // Should attempt indexes for Function, File, Class, Method, Interface, Module,
+    // Namespace, Variable, Property, CodeElement
+    expect(indexCalls.length).toBe(10);
   });
 
   it('destroys client in finally block', async () => {

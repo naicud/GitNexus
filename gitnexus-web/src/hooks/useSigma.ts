@@ -54,6 +54,7 @@ interface UseSigmaOptions {
   onNodeHover?: (nodeId: string | null) => void;
   onStageClick?: () => void;
   onGroupExpand?: (groupLabel: string, groupId: string) => void;
+  onNodeRightClick?: (nodeId: string, event: { clientX: number; clientY: number }) => void;
   highlightedNodeIds?: Set<string>;
   blastRadiusNodeIds?: Set<string>;
   animatedNodes?: Map<string, NodeAnimation>;
@@ -475,6 +476,15 @@ export const useSigma = (options: UseSigmaOptions = {}): UseSigmaReturn => {
         const label = (attrs.label || '').replace(/\s*\(\d+\)$/, '');
         options.onGroupExpand?.(label, node);
       }
+    });
+
+    sigma.on('rightClickNode', ({ node, event }) => {
+      event.preventSigmaDefault();
+      event.original.preventDefault();
+      options.onNodeRightClick?.(node, {
+        clientX: event.original.clientX,
+        clientY: event.original.clientY,
+      });
     });
 
     sigma.on('clickStage', () => {

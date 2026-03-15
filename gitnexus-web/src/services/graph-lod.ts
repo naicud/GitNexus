@@ -55,6 +55,14 @@ export interface GroupExpansion {
   totalAvailable: number;
 }
 
+export interface NeighborExpansion {
+  centerNode: GraphNode;
+  nodes: GraphNode[];
+  relationships: GraphRelationship[];
+  truncated: boolean;
+  totalAvailable: number;
+}
+
 // ── Fetch Functions ──────────────────────────────────────────────────────
 
 export async function fetchGraphInfo(baseUrl: string, repo: string): Promise<GraphInfo> {
@@ -73,7 +81,7 @@ export async function fetchGroupExpansion(
   baseUrl: string,
   repo: string,
   groupLabel: string,
-  limit: number = 5000,
+  limit: number = 1000,
 ): Promise<GroupExpansion> {
   const params = new URLSearchParams({
     repo,
@@ -82,5 +90,23 @@ export async function fetchGroupExpansion(
   });
   const res = await fetch(`${baseUrl}/graph/expand?${params}`);
   if (!res.ok) throw new Error(`Failed to expand group "${groupLabel}": ${res.status}`);
+  return res.json();
+}
+
+export async function fetchNeighbors(
+  baseUrl: string,
+  repo: string,
+  nodeId: string,
+  depth: number = 1,
+  limit: number = 200,
+): Promise<NeighborExpansion> {
+  const params = new URLSearchParams({
+    repo,
+    node: nodeId,
+    depth: String(depth),
+    limit: String(limit),
+  });
+  const res = await fetch(`${baseUrl}/graph/neighbors?${params}`);
+  if (!res.ok) throw new Error(`Failed to fetch neighbors for "${nodeId}": ${res.status}`);
   return res.json();
 }

@@ -14,7 +14,7 @@ import path from 'path';
 import fs from 'fs/promises';
 import { AwsClient } from 'aws4fetch';
 import { loadMeta, listRegisteredRepos, updateRepoDb } from '../storage/repo-manager.js';
-import { executeQuery, closeKuzu, withKuzuDb } from '../core/kuzu/kuzu-adapter.js';
+import { executeQuery, executeParameterizedQuery, closeKuzu, withKuzuDb } from '../core/kuzu/kuzu-adapter.js';
 import { NODE_TABLES } from '../core/kuzu/schema.js';
 import { GraphNode, GraphRelationship } from '../core/graph/types.js';
 import { searchFTSFromKuzu } from '../core/search/bm25-index.js';
@@ -32,21 +32,28 @@ function getDbConfigFromEntry(entry: { storagePath: string; db?: DbConfig }): Db
   return { type: 'kuzu', kuzuPath: path.join(entry.storagePath, 'kuzu') };
 }
 
-const buildGraph = async (): Promise<{ nodes: GraphNode[]; relationships: GraphRelationship[] }> => {
+const NODE_HARD_CAP = 5000;
+
+const buildGraph = async (limit?: number): Promise<{ nodes: GraphNode[]; relationships: GraphRelationship[]; truncated: boolean; totalAvailable: number }> => {
+  const cap = limit ?? NODE_HARD_CAP;
   const nodes: GraphNode[] = [];
+  let totalAvailable = 0;
+  let remaining = cap;
+
   for (const table of NODE_TABLES) {
+    if (remaining <= 0) break;
     try {
       let query = '';
       if (table === 'File') {
-        query = `MATCH (n:File) RETURN n.id AS id, n.name AS name, n.filePath AS filePath, n.content AS content`;
+        query = `MATCH (n:File) RETURN n.id AS id, n.name AS name, n.filePath AS filePath, n.content AS content LIMIT ${remaining}`;
       } else if (table === 'Folder') {
-        query = `MATCH (n:Folder) RETURN n.id AS id, n.name AS name, n.filePath AS filePath`;
+        query = `MATCH (n:Folder) RETURN n.id AS id, n.name AS name, n.filePath AS filePath LIMIT ${remaining}`;
       } else if (table === 'Community') {
-        query = `MATCH (n:Community) RETURN n.id AS id, n.label AS label, n.heuristicLabel AS heuristicLabel, n.cohesion AS cohesion, n.symbolCount AS symbolCount`;
+        query = `MATCH (n:Community) RETURN n.id AS id, n.label AS label, n.heuristicLabel AS heuristicLabel, n.cohesion AS cohesion, n.symbolCount AS symbolCount LIMIT ${remaining}`;
       } else if (table === 'Process') {
-        query = `MATCH (n:Process) RETURN n.id AS id, n.label AS label, n.heuristicLabel AS heuristicLabel, n.processType AS processType, n.stepCount AS stepCount, n.communities AS communities, n.entryPointId AS entryPointId, n.terminalId AS terminalId`;
+        query = `MATCH (n:Process) RETURN n.id AS id, n.label AS label, n.heuristicLabel AS heuristicLabel, n.processType AS processType, n.stepCount AS stepCount, n.communities AS communities, n.entryPointId AS entryPointId, n.terminalId AS terminalId LIMIT ${remaining}`;
       } else {
-        query = `MATCH (n:${table}) RETURN n.id AS id, n.name AS name, n.filePath AS filePath, n.startLine AS startLine, n.endLine AS endLine, n.content AS content`;
+        query = `MATCH (n:${table}) RETURN n.id AS id, n.name AS name, n.filePath AS filePath, n.startLine AS startLine, n.endLine AS endLine, n.content AS content LIMIT ${remaining}`;
       }
 
       const rows = await executeQuery(query);
@@ -71,14 +78,28 @@ const buildGraph = async (): Promise<{ nodes: GraphNode[]; relationships: GraphR
           } as GraphNode['properties'],
         });
       }
+      remaining -= rows.length;
+
+      // Count total available for this table
+      try {
+        const countRows = await executeQuery(`MATCH (n:${table}) RETURN count(n) AS cnt`);
+        totalAvailable += countRows[0]?.cnt ?? rows.length;
+      } catch {
+        totalAvailable += rows.length;
+      }
     } catch {
       // ignore empty tables
     }
   }
 
+  // Push edge filtering to Cypher (avoid fetching all 5.67M edges for large repos)
+  const nodeIds = nodes.map(n => n.id);
   const relationships: GraphRelationship[] = [];
-  const relRows = await executeQuery(
-    `MATCH (a)-[r:CodeRelation]->(b) RETURN a.id AS sourceId, b.id AS targetId, r.type AS type, r.confidence AS confidence, r.reason AS reason, r.step AS step`
+  const relRows = await executeParameterizedQuery(
+    `MATCH (a)-[r:CodeRelation]->(b)
+     WHERE a.id IN $ids AND b.id IN $ids
+     RETURN a.id AS sourceId, b.id AS targetId, r.type AS type, r.confidence AS confidence, r.reason AS reason, r.step AS step`,
+    { ids: nodeIds },
   );
   for (const row of relRows) {
     relationships.push({
@@ -92,8 +113,128 @@ const buildGraph = async (): Promise<{ nodes: GraphNode[]; relationships: GraphR
     });
   }
 
-  return { nodes, relationships };
+  return { nodes, relationships, truncated: nodes.length < totalAvailable, totalAvailable };
 };
+
+/**
+ * Generate a structural summary by querying the DB for filePath distribution.
+ * Used when no communities exist (e.g., COBOL repos). Caches result to disk.
+ */
+const STRUCTURAL_SKIP_LABELS = new Set(['Community', 'Process', 'Folder']);
+const STRUCTURAL_NODE_LABELS = NODE_TABLES.filter(t => !STRUCTURAL_SKIP_LABELS.has(t));
+
+const toGroupKey = (filePath: string): string => {
+  const parts = filePath.split('/').filter(Boolean);
+  if (parts.length < 2) return '(root)';
+  if (['src', 'lib', 'app', 'packages'].includes(parts[0].toLowerCase()) && parts.length >= 3) {
+    return `${parts[0]}/${parts[1]}`;
+  }
+  return parts[0];
+};
+
+async function buildStructuralSummaryFromDb(
+  queryFn: (cypher: string) => Promise<any[]>,
+  storagePath: string,
+  totalNodes: number,
+  totalEdges: number,
+): Promise<any> {
+  const MAX_GROUPS = 200;
+  const dirCounts = new Map<string, number>();
+
+  // Step 1: Aggregate node counts by directory from each symbol table
+  for (const table of STRUCTURAL_NODE_LABELS) {
+    try {
+      const rows = await queryFn(
+        `MATCH (n:${table}) WHERE n.filePath IS NOT NULL RETURN n.filePath AS fp, count(*) AS cnt`
+      );
+      for (const row of rows) {
+        const key = toGroupKey(String(row.fp || ''));
+        dirCounts.set(key, (dirCounts.get(key) || 0) + (typeof row.cnt === 'number' ? row.cnt : 1));
+      }
+    } catch { /* table may not exist */ }
+  }
+
+  // Step 2: Sort and cap at MAX_GROUPS
+  let sorted = Array.from(dirCounts.entries()).sort((a, b) => b[1] - a[1]);
+  if (sorted.length > MAX_GROUPS) {
+    const kept = sorted.slice(0, MAX_GROUPS - 1);
+    const otherCount = sorted.slice(MAX_GROUPS - 1).reduce((sum, [, c]) => sum + c, 0);
+    kept.push(['Other', otherCount]);
+    sorted = kept;
+  }
+
+  const clusterGroups = sorted
+    .filter(([, count]) => count >= 5)
+    .map(([label, count]) => ({
+      id: `cg_${label}`,
+      label,
+      symbolCount: count,
+      cohesion: 0.5,
+      subCommunityIds: [] as string[],
+      subCommunityCount: 0,
+    }));
+
+  // Step 3: Sample cross-directory edges (with timeout to avoid blocking)
+  const validGroups = new Set(clusterGroups.map(g => g.label));
+  const edgeCounts = new Map<string, { count: number; types: Record<string, number> }>();
+  const interGroupEdges: any[] = [];
+
+  try {
+    const sampleEdges = async () => {
+      try {
+        const rows = await queryFn(`
+          MATCH (a)-[r:CodeRelation]->(b)
+          WHERE a.filePath IS NOT NULL AND b.filePath IS NOT NULL AND a.filePath <> b.filePath
+            AND r.type <> 'MEMBER_OF' AND r.type <> 'STEP_IN_PROCESS'
+            AND r.type <> 'CONTAINS' AND r.type <> 'DEFINES'
+          RETURN a.filePath AS srcFp, b.filePath AS tgtFp, r.type AS relType
+          LIMIT 30000
+        `);
+        for (const row of rows) {
+          const srcGroup = toGroupKey(String(row.srcFp || ''));
+          const tgtGroup = toGroupKey(String(row.tgtFp || ''));
+          if (srcGroup === tgtGroup || !validGroups.has(srcGroup) || !validGroups.has(tgtGroup)) continue;
+          const relType = String(row.relType || 'UNKNOWN');
+          const key = `cg_${srcGroup}|||cg_${tgtGroup}`;
+          const existing = edgeCounts.get(key);
+          if (existing) {
+            existing.count++;
+            existing.types[relType] = (existing.types[relType] || 0) + 1;
+          } else {
+            edgeCounts.set(key, { count: 1, types: { [relType]: 1 } });
+          }
+        }
+      } catch { /* non-fatal */ }
+    };
+    await Promise.race([
+      sampleEdges(),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('edge-timeout')), 15000)),
+    ]);
+  } catch { /* edge sampling timed out or failed — summary still usable without edges */ }
+
+  for (const [key, data] of edgeCounts) {
+    const [src, tgt] = key.split('|||');
+    interGroupEdges.push({ sourceGroupId: src, targetGroupId: tgt, count: data.count, types: data.types });
+  }
+  interGroupEdges.sort((a: any, b: any) => b.count - a.count);
+
+  const summary = {
+    version: 1,
+    summaryMode: 'structural',
+    generatedAt: new Date().toISOString(),
+    totalNodes,
+    totalEdges,
+    clusterGroups,
+    interGroupEdges,
+  };
+
+  // Cache to disk for instant subsequent loads
+  try {
+    await fs.writeFile(path.join(storagePath, 'graph-summary.json'), JSON.stringify(summary), 'utf-8');
+  } catch { /* cache write failure is non-fatal */ }
+
+  return summary;
+}
 
 const statusFromError = (err: any): number => {
   const msg = String(err?.message ?? '');
@@ -246,12 +387,15 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
       const totalEdges = meta?.stats?.edges ?? 0;
 
       let hasSummary = false;
+      let hasValidSummary = false;
       try {
-        await fs.access(path.join(entry.storagePath, 'graph-summary.json'));
+        const summaryData = await fs.readFile(path.join(entry.storagePath, 'graph-summary.json'), 'utf-8');
         hasSummary = true;
-      } catch { /* no summary file */ }
+        const parsed = JSON.parse(summaryData);
+        hasValidSummary = Array.isArray(parsed.clusterGroups) && parsed.clusterGroups.length > 0;
+      } catch { /* no summary file or invalid */ }
 
-      const mode = (totalNodes > 50000 && hasSummary) ? 'summary' : 'full';
+      const mode = (totalNodes > 50000) ? 'summary' : 'full';
       res.json({ totalNodes, totalEdges, hasSummary, mode });
     } catch (err: any) {
       res.status(500).json({ error: err.message || 'Failed to get graph info' });
@@ -267,30 +411,53 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
         return;
       }
 
+      // Try cached summary first (instant read from disk)
       const summaryPath = path.join(entry.storagePath, 'graph-summary.json');
       try {
         const data = await fs.readFile(summaryPath, 'utf-8');
-        res.setHeader('Content-Type', 'application/json');
-        res.send(data);
-        return;
-      } catch {
-        // No precomputed summary — compute on-the-fly from KuzuDB
-      }
+        const parsed = JSON.parse(data);
+        if (Array.isArray(parsed.clusterGroups) && parsed.clusterGroups.length > 0) {
+          res.setHeader('Content-Type', 'application/json');
+          res.send(data);
+          return;
+        }
+      } catch { /* no valid cached summary */ }
 
+      // No valid cached summary — generate on-the-fly
+      const meta = await loadMeta(entry.storagePath);
+      const totalNodes = meta?.stats?.nodes ?? 0;
+      const totalEdges = meta?.stats?.edges ?? 0;
       const dbConfig = getDbConfigFromEntry(entry);
+
       if (dbConfig.type === 'neptune') {
-        res.status(501).json({ error: 'On-the-fly summary not supported for Neptune. Re-index to generate.' });
-        return;
+        const adapter = new NeptuneAdapter(dbConfig);
+        try {
+          const summary = await buildStructuralSummaryFromDb(
+            (q) => adapter.executeQuery(q),
+            entry.storagePath, totalNodes, totalEdges,
+          );
+          await adapter.close();
+          return res.json(summary);
+        } catch (err: any) {
+          await adapter.close();
+          return res.status(500).json({ error: err.message || 'Failed to generate summary' });
+        }
       }
 
+      // KuzuDB path
       const kuzuPath = path.join(entry.storagePath, 'kuzu');
       const summary = await withKuzuDb(kuzuPath, async () => {
-        // Query communities
+        // Try community-based first
         const commRows = await executeQuery(
           `MATCH (c:Community) RETURN c.id AS id, c.heuristicLabel AS heuristicLabel, c.symbolCount AS symbolCount, c.cohesion AS cohesion`
         );
 
-        // Aggregate into cluster groups
+        // No communities — generate structural summary (e.g., COBOL repos)
+        if (commRows.length === 0) {
+          return buildStructuralSummaryFromDb(executeQuery, entry.storagePath, totalNodes, totalEdges);
+        }
+
+        // Community-based aggregation
         const groupMap = new Map<string, { ids: string[]; totalSymbols: number; weightedCohesion: number }>();
         for (const c of commRows) {
           const label = c.heuristicLabel || 'Unknown';
@@ -318,7 +485,6 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
           .filter(c => c.symbolCount >= 5)
           .sort((a, b) => b.symbolCount - a.symbolCount);
 
-        // Query inter-group edges
         let interGroupEdges: any[] = [];
         try {
           const edgeRows = await executeQuery(`
@@ -349,12 +515,11 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
           // Inter-group edge query may fail on some schemas — non-fatal
         }
 
-        const meta = await loadMeta(entry.storagePath);
         return {
           version: 1,
           generatedAt: new Date().toISOString(),
-          totalNodes: meta?.stats?.nodes ?? 0,
-          totalEdges: meta?.stats?.edges ?? 0,
+          totalNodes,
+          totalEdges,
           clusterGroups,
           interGroupEdges,
         };
@@ -381,17 +546,114 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
         return;
       }
 
-      const limit = Math.max(1, Math.min(10000, parseInt(String(req.query.limit ?? '5000'), 10) || 5000));
+      const limit = Math.max(1, Math.min(3000, parseInt(String(req.query.limit ?? '1000'), 10) || 1000));
+
+      // Determine expansion mode from cached summary
+      let summaryMode = 'community';
+      try {
+        const summaryData = JSON.parse(await fs.readFile(path.join(entry.storagePath, 'graph-summary.json'), 'utf-8'));
+        summaryMode = summaryData.summaryMode || 'community';
+      } catch { /* default to community */ }
+
       const dbConfig = getDbConfigFromEntry(entry);
 
+      // ── Structural expansion (directory-based) ──────────────────────
+      if (summaryMode === 'structural') {
+        const prefix = groupLabel === '(root)' ? null : `${groupLabel}/`;
+
+        const structuralExpand = async (queryFn: (q: string) => Promise<any[]>, paramQueryFn: (q: string, p: Record<string, any>) => Promise<any[]>) => {
+          const nodes: GraphNode[] = [];
+          let remaining = limit;
+
+          for (const table of STRUCTURAL_NODE_LABELS) {
+            if (remaining <= 0) break;
+            try {
+              const condition = prefix
+                ? `n.filePath STARTS WITH '${prefix.replace(/'/g, "\\'")}'`
+                : `(n.filePath IS NULL OR NOT contains(n.filePath, '/'))`;
+              const rows = await queryFn(`
+                MATCH (n:${table}) WHERE ${condition}
+                RETURN n.id AS id, n.name AS name, n.filePath AS filePath,
+                       n.startLine AS startLine, n.endLine AS endLine
+                LIMIT ${remaining}
+              `);
+              for (const row of rows) {
+                nodes.push({
+                  id: row.id,
+                  label: table as GraphNode['label'],
+                  properties: { name: row.name || '', filePath: row.filePath || '', startLine: row.startLine, endLine: row.endLine },
+                });
+              }
+              remaining -= rows.length;
+            } catch { /* table may not exist */ }
+          }
+
+          // Get edges between returned nodes
+          const nodeIds = nodes.map(n => n.id);
+          const relationships: GraphRelationship[] = [];
+          if (nodeIds.length > 0) {
+            try {
+              const relRows = await paramQueryFn(
+                `MATCH (a)-[r:CodeRelation]->(b)
+                 WHERE a.id IN $ids AND b.id IN $ids
+                   AND r.type <> 'MEMBER_OF' AND r.type <> 'STEP_IN_PROCESS'
+                 RETURN a.id AS sourceId, b.id AS targetId, r.type AS type, r.confidence AS confidence`,
+                { ids: nodeIds },
+              );
+              for (const row of relRows) {
+                relationships.push({
+                  id: `${row.sourceId}_${row.type}_${row.targetId}`,
+                  type: row.type,
+                  sourceId: row.sourceId,
+                  targetId: row.targetId,
+                  confidence: row.confidence ?? 1,
+                  reason: '',
+                });
+              }
+            } catch { /* non-fatal */ }
+          }
+
+          return {
+            groupLabel,
+            nodes,
+            relationships,
+            crossEdges: [] as any[],
+            truncated: remaining <= 0,
+            totalAvailable: remaining <= 0 ? nodes.length + 1 : nodes.length,
+          };
+        };
+
+        if (dbConfig.type === 'neptune') {
+          const adapter = new NeptuneAdapter(dbConfig);
+          try {
+            const result = await structuralExpand(
+              (q) => adapter.executeQuery(q),
+              (q, p) => adapter.executeParameterized(q, p),
+            );
+            await adapter.close();
+            return res.json(result);
+          } catch (err: any) {
+            await adapter.close();
+            return res.status(500).json({ error: err.message || 'Failed to expand group' });
+          }
+        }
+
+        // KuzuDB structural expand
+        const kuzuPath = path.join(entry.storagePath, 'kuzu');
+        const result = await withKuzuDb(kuzuPath, () =>
+          structuralExpand(executeQuery, executeParameterizedQuery)
+        );
+        return res.json(result);
+      }
+
+      // ── Community-based expansion ───────────────────────────────────
       if (dbConfig.type === 'neptune') {
-        res.status(501).json({ error: 'Group expansion not yet supported for Neptune' });
+        res.status(501).json({ error: 'Community-based group expansion not yet supported for Neptune' });
         return;
       }
 
       const kuzuPath = path.join(entry.storagePath, 'kuzu');
       const result = await withKuzuDb(kuzuPath, async () => {
-        // Get symbols in group's communities
         const nodeRows = await executeQuery(`
           MATCH (n)-[:CodeRelation {type: 'MEMBER_OF'}]->(c:Community)
           WHERE c.heuristicLabel = '${groupLabel.replace(/'/g, "\\'")}'
@@ -414,7 +676,6 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
 
         const nodeIdSet = new Set(nodes.map(n => n.id));
 
-        // Get internal edges (both endpoints in this group)
         const relRows = await executeQuery(`
           MATCH (a)-[r:CodeRelation]->(b),
                 (a)-[:CodeRelation {type: 'MEMBER_OF'}]->(ca:Community),
@@ -436,7 +697,6 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
             reason: '',
           }));
 
-        // Get cross-edges (source in group, target in other group)
         const crossRows = await executeQuery(`
           MATCH (a)-[r:CodeRelation]->(b),
                 (a)-[:CodeRelation {type: 'MEMBER_OF'}]->(ca:Community),
@@ -457,7 +717,6 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
             targetGroup: row.targetGroup,
           }));
 
-        // Count total available (may be more than limit)
         let totalAvailable = nodes.length;
         try {
           const countRows = await executeQuery(`
@@ -484,6 +743,200 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
     }
   });
 
+  // ── LOD: Explore neighbors of a node ──────────────────────────────
+  app.get('/api/graph/neighbors', async (req, res) => {
+    try {
+      const entry = await resolveRepo(requestedRepo(req));
+      if (!entry) {
+        res.status(404).json({ error: 'Repository not found' });
+        return;
+      }
+
+      const nodeId = String(req.query.node ?? '').trim();
+      if (!nodeId) {
+        res.status(400).json({ error: 'Missing "node" query parameter' });
+        return;
+      }
+
+      const depth = Math.max(1, Math.min(3, parseInt(String(req.query.depth ?? '1'), 10) || 1));
+      const limit = Math.max(1, Math.min(500, parseInt(String(req.query.limit ?? '200'), 10) || 200));
+
+      const dbConfig = getDbConfigFromEntry(entry);
+
+      if (dbConfig.type === 'neptune') {
+        const adapter = new NeptuneAdapter(dbConfig);
+        try {
+          const centerRows = await adapter.executeParameterized(
+            `MATCH (n) WHERE n.id = $nodeId
+             RETURN n.id AS id, n.name AS name, n.filePath AS filePath,
+                    n.startLine AS startLine, n.endLine AS endLine,
+                    labels(n)[0] AS nodeLabel`,
+            { nodeId },
+          );
+          if (centerRows.length === 0) {
+            await adapter.close();
+            return res.status(404).json({ error: 'Node not found' });
+          }
+          const cr = centerRows[0] as any;
+          const centerNode: GraphNode = {
+            id: cr.id as string, label: (cr.nodeLabel || 'CodeElement') as GraphNode['label'],
+            properties: { name: (cr.name || '') as string, filePath: (cr.filePath || '') as string, startLine: cr.startLine as number, endLine: cr.endLine as number },
+          };
+          const neighborRows = await adapter.executeParameterized(
+            depth === 1
+              ? `MATCH (start)-[r:CodeRelation]-(n)
+                 WHERE start.id = $nodeId AND n.id <> $nodeId
+                 RETURN DISTINCT n.id AS id, n.name AS name, n.filePath AS filePath,
+                        n.startLine AS startLine, n.endLine AS endLine,
+                        labels(n)[0] AS nodeLabel
+                 LIMIT ${limit}`
+              : `MATCH (start)-[r:CodeRelation*1..${depth}]-(n)
+                 WHERE start.id = $nodeId AND n.id <> $nodeId
+                 RETURN DISTINCT n.id AS id, n.name AS name, n.filePath AS filePath,
+                        n.startLine AS startLine, n.endLine AS endLine,
+                        labels(n)[0] AS nodeLabel
+                 LIMIT ${limit}`,
+            { nodeId },
+          );
+          const nodes: GraphNode[] = neighborRows.map((row: any) => ({
+            id: row.id, label: (row.nodeLabel || 'CodeElement') as GraphNode['label'],
+            properties: { name: row.name || '', filePath: row.filePath || '', startLine: row.startLine, endLine: row.endLine },
+          }));
+          const allNodeIds = [nodeId, ...nodes.map(n => n.id)];
+          const relRows = await adapter.executeParameterized(
+            `MATCH (a)-[r:CodeRelation]->(b)
+             WHERE a.id IN $ids AND b.id IN $ids
+               AND r.type <> 'MEMBER_OF' AND r.type <> 'STEP_IN_PROCESS'
+             RETURN a.id AS sourceId, b.id AS targetId, r.type AS type, r.confidence AS confidence`,
+            { ids: allNodeIds },
+          );
+          const relationships: GraphRelationship[] = relRows.map((row: any) => ({
+            id: `${row.sourceId}_${row.type}_${row.targetId}`,
+            type: row.type, sourceId: row.sourceId, targetId: row.targetId,
+            confidence: row.confidence ?? 1, reason: '',
+          }));
+          await adapter.close();
+          return res.json({ centerNode, nodes, relationships, truncated: nodes.length >= limit, totalAvailable: nodes.length });
+        } catch (err: any) {
+          await adapter.close();
+          return res.status(500).json({ error: err.message || 'Failed to fetch neighbors' });
+        }
+      }
+
+      const kuzuPath = path.join(entry.storagePath, 'kuzu');
+      const result = await withKuzuDb(kuzuPath, async () => {
+        // Get the center node (parameterized to prevent injection)
+        const centerRows = await executeParameterizedQuery(
+          `MATCH (n) WHERE n.id = $nodeId
+           RETURN n.id AS id, n.name AS name, n.filePath AS filePath,
+                  n.startLine AS startLine, n.endLine AS endLine,
+                  labels(n)[0] AS nodeLabel`,
+          { nodeId },
+        );
+
+        if (centerRows.length === 0) {
+          return { error: 'Node not found' };
+        }
+
+        const centerRow = centerRows[0];
+        const centerNode: GraphNode = {
+          id: centerRow.id,
+          label: (centerRow.nodeLabel || 'CodeElement') as GraphNode['label'],
+          properties: {
+            name: centerRow.name || '',
+            filePath: centerRow.filePath || '',
+            startLine: centerRow.startLine,
+            endLine: centerRow.endLine,
+          },
+        };
+
+        // Get neighbors via variable-length paths (parameterized)
+        // depth is already validated as integer 1-3
+        const neighborRows = await executeParameterizedQuery(
+          depth === 1
+            ? `MATCH (start)-[r:CodeRelation]-(n)
+               WHERE start.id = $nodeId AND n.id <> $nodeId
+               RETURN DISTINCT n.id AS id, n.name AS name, n.filePath AS filePath,
+                      n.startLine AS startLine, n.endLine AS endLine,
+                      labels(n)[0] AS nodeLabel
+               LIMIT ${limit}`
+            : `MATCH (start)-[r:CodeRelation*1..${depth}]-(n)
+               WHERE start.id = $nodeId AND n.id <> $nodeId
+               RETURN DISTINCT n.id AS id, n.name AS name, n.filePath AS filePath,
+                      n.startLine AS startLine, n.endLine AS endLine,
+                      labels(n)[0] AS nodeLabel
+               LIMIT ${limit}`,
+          { nodeId },
+        );
+
+        const nodes: GraphNode[] = neighborRows.map(row => ({
+          id: row.id,
+          label: (row.nodeLabel || 'CodeElement') as GraphNode['label'],
+          properties: {
+            name: row.name || '',
+            filePath: row.filePath || '',
+            startLine: row.startLine,
+            endLine: row.endLine,
+          },
+        }));
+
+        // Get edges between returned nodes only (push filter to Cypher, not JS)
+        const allNodeIds = [nodeId, ...nodes.map(n => n.id)];
+        const relRows = await executeParameterizedQuery(
+          `MATCH (a)-[r:CodeRelation]->(b)
+           WHERE a.id IN $ids AND b.id IN $ids
+             AND r.type <> 'MEMBER_OF' AND r.type <> 'STEP_IN_PROCESS'
+           RETURN a.id AS sourceId, b.id AS targetId, r.type AS type, r.confidence AS confidence`,
+          { ids: allNodeIds },
+        );
+
+        const relationships: GraphRelationship[] = relRows.map(row => ({
+          id: `${row.sourceId}_${row.type}_${row.targetId}`,
+          type: row.type,
+          sourceId: row.sourceId,
+          targetId: row.targetId,
+          confidence: row.confidence ?? 1,
+          reason: '',
+        }));
+
+        // Skip expensive count query if we got fewer than the limit
+        let totalAvailable = nodes.length;
+        if (nodes.length >= limit) {
+          try {
+            const countRows = await executeParameterizedQuery(
+              depth === 1
+                ? `MATCH (start)-[r:CodeRelation]-(n)
+                   WHERE start.id = $nodeId AND n.id <> $nodeId
+                   RETURN count(DISTINCT n) AS cnt`
+                : `MATCH (start)-[r:CodeRelation*1..${depth}]-(n)
+                   WHERE start.id = $nodeId AND n.id <> $nodeId
+                   RETURN count(DISTINCT n) AS cnt`,
+              { nodeId },
+            );
+            totalAvailable = countRows[0]?.cnt ?? nodes.length;
+          } catch { /* use nodes.length as fallback */ }
+        }
+
+        return {
+          centerNode,
+          nodes,
+          relationships,
+          truncated: nodes.length < totalAvailable,
+          totalAvailable,
+        };
+      });
+
+      if ((result as any).error) {
+        res.status(404).json(result);
+        return;
+      }
+
+      res.json(result);
+    } catch (err: any) {
+      res.status(500).json({ error: err.message || 'Failed to fetch neighbors' });
+    }
+  });
+
   // Get full graph
   app.get('/api/graph', async (req, res) => {
     try {
@@ -495,24 +948,26 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
 
       const dbConfig = getDbConfigFromEntry(entry);
 
-      // Neptune path
+      // Neptune path (with same NODE_HARD_CAP as KuzuDB)
       if (dbConfig.type === 'neptune') {
         const adapter = new NeptuneAdapter(dbConfig);
         try {
           const nodes: GraphNode[] = [];
+          let remaining = NODE_HARD_CAP;
           for (const table of NODE_TABLES) {
+            if (remaining <= 0) break;
             try {
               let query = '';
               if (table === 'File') {
-                query = `MATCH (n:File) RETURN n.id AS id, n.name AS name, n.filePath AS filePath, n.content AS content`;
+                query = `MATCH (n:File) RETURN n.id AS id, n.name AS name, n.filePath AS filePath, n.content AS content LIMIT ${remaining}`;
               } else if (table === 'Folder') {
-                query = `MATCH (n:Folder) RETURN n.id AS id, n.name AS name, n.filePath AS filePath`;
+                query = `MATCH (n:Folder) RETURN n.id AS id, n.name AS name, n.filePath AS filePath LIMIT ${remaining}`;
               } else if (table === 'Community') {
-                query = `MATCH (n:Community) RETURN n.id AS id, n.label AS label, n.heuristicLabel AS heuristicLabel, n.cohesion AS cohesion, n.symbolCount AS symbolCount`;
+                query = `MATCH (n:Community) RETURN n.id AS id, n.label AS label, n.heuristicLabel AS heuristicLabel, n.cohesion AS cohesion, n.symbolCount AS symbolCount LIMIT ${remaining}`;
               } else if (table === 'Process') {
-                query = `MATCH (n:Process) RETURN n.id AS id, n.label AS label, n.heuristicLabel AS heuristicLabel, n.processType AS processType, n.stepCount AS stepCount, n.communities AS communities, n.entryPointId AS entryPointId, n.terminalId AS terminalId`;
+                query = `MATCH (n:Process) RETURN n.id AS id, n.label AS label, n.heuristicLabel AS heuristicLabel, n.processType AS processType, n.stepCount AS stepCount, n.communities AS communities, n.entryPointId AS entryPointId, n.terminalId AS terminalId LIMIT ${remaining}`;
               } else {
-                query = `MATCH (n:\`${table}\`) RETURN n.id AS id, n.name AS name, n.filePath AS filePath, n.startLine AS startLine, n.endLine AS endLine, n.content AS content`;
+                query = `MATCH (n:\`${table}\`) RETURN n.id AS id, n.name AS name, n.filePath AS filePath, n.startLine AS startLine, n.endLine AS endLine, n.content AS content LIMIT ${remaining}`;
               }
               const rows = await adapter.executeQuery(query);
               for (const row of rows) {
@@ -536,10 +991,15 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
                   } as GraphNode['properties'],
                 });
               }
+              remaining -= rows.length;
             } catch { /* ignore empty labels */ }
           }
-          const relRows = await adapter.executeQuery(
-            'MATCH (a)-[r:CodeRelation]->(b) RETURN a.id AS sourceId, b.id AS targetId, r.type AS type, r.confidence AS confidence, r.reason AS reason, r.step AS step'
+          const nodeIds = nodes.map(n => n.id);
+          const relRows = await adapter.executeParameterized(
+            `MATCH (a)-[r:CodeRelation]->(b)
+             WHERE a.id IN $ids AND b.id IN $ids
+             RETURN a.id AS sourceId, b.id AS targetId, r.type AS type, r.confidence AS confidence, r.reason AS reason, r.step AS step`,
+            { ids: nodeIds },
           );
           const relationships: GraphRelationship[] = relRows.map(row => ({
             id: `${row.sourceId}_${row.type}_${row.targetId}`,
@@ -551,7 +1011,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
             step: row.step as number,
           }));
           await adapter.close();
-          return res.json({ nodes, relationships });
+          return res.json({ nodes, relationships, truncated: true, totalAvailable: NODE_HARD_CAP });
         } catch (err: any) {
           await adapter.close();
           return res.status(500).json({ error: err.message || 'Failed to build graph' });
@@ -560,8 +1020,8 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
 
       // KuzuDB path (default)
       const kuzuPath = path.join(entry.storagePath, 'kuzu');
-      const graph = await withKuzuDb(kuzuPath, async () => buildGraph());
-      res.json(graph);
+      const result = await withKuzuDb(kuzuPath, async () => buildGraph());
+      res.json(result);
     } catch (err: any) {
       res.status(500).json({ error: err.message || 'Failed to build graph' });
     }

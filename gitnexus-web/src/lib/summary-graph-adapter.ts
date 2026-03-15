@@ -9,7 +9,7 @@
 import Graph from 'graphology';
 import type { SigmaNodeAttributes, SigmaEdgeAttributes } from './graph-adapter';
 import { NODE_COLORS, NODE_SIZES, COMMUNITY_COLORS, getCommunityColor } from './constants';
-import type { GraphSummary, GroupExpansion, ClusterGroupSummary } from '../services/graph-lod';
+import type { GraphSummary, GroupExpansion, ClusterGroupSummary, NeighborExpansion } from '../services/graph-lod';
 import type { NodeLabel } from '../core/graph/types';
 
 // Edge styles matching graph-adapter.ts
@@ -277,4 +277,94 @@ export function collapseGroupInGraph(
       curvature: 0.15,
     });
   }
+}
+
+/**
+ * Add neighbor nodes to the Sigma graph around a center node.
+ * Used for the search-first → expand-on-demand exploration pattern.
+ *
+ * Returns the list of newly added node IDs (for scoped layout).
+ */
+export function addNeighborsToGraph(
+  graph: Graph<SigmaNodeAttributes, SigmaEdgeAttributes>,
+  expansion: NeighborExpansion,
+  centerNodeId: string,
+): string[] {
+  // Get or set center node position
+  let centerX = 0;
+  let centerY = 0;
+  if (graph.hasNode(centerNodeId)) {
+    const attrs = graph.getNodeAttributes(centerNodeId);
+    centerX = attrs.x;
+    centerY = attrs.y;
+  } else {
+    // Add center node if not already in graph
+    const cn = expansion.centerNode;
+    const baseSize = NODE_SIZES[cn.label as NodeLabel] || 4;
+    graph.addNode(cn.id, {
+      x: 0,
+      y: 0,
+      size: baseSize * 1.5, // Slightly larger as the exploration center
+      color: NODE_COLORS[cn.label as NodeLabel] || '#8b5cf6',
+      label: cn.properties.name,
+      nodeType: cn.label as NodeLabel,
+      filePath: cn.properties.filePath || '',
+      startLine: cn.properties.startLine,
+      endLine: cn.properties.endLine,
+      hidden: false,
+      mass: 5,
+    });
+  }
+
+  // Position new nodes radially around the center
+  const newNodeIds: string[] = [];
+  const nodeCount = expansion.nodes.length;
+  const radius = Math.max(80, Math.sqrt(nodeCount) * 25);
+
+  for (let i = 0; i < expansion.nodes.length; i++) {
+    const node = expansion.nodes[i];
+    if (graph.hasNode(node.id)) continue;
+
+    const angle = (2 * Math.PI * i) / nodeCount;
+    // Add some radial jitter to prevent perfect circle
+    const r = radius * (0.7 + Math.random() * 0.6);
+    const x = centerX + r * Math.cos(angle);
+    const y = centerY + r * Math.sin(angle);
+
+    const baseSize = NODE_SIZES[node.label as NodeLabel] || 4;
+
+    graph.addNode(node.id, {
+      x,
+      y,
+      size: baseSize,
+      color: NODE_COLORS[node.label as NodeLabel] || '#8b5cf6',
+      label: node.properties.name,
+      nodeType: node.label as NodeLabel,
+      filePath: node.properties.filePath || '',
+      startLine: node.properties.startLine,
+      endLine: node.properties.endLine,
+      hidden: false,
+      mass: 2,
+    });
+    newNodeIds.push(node.id);
+  }
+
+  // Add edges between all returned nodes
+  for (const rel of expansion.relationships) {
+    if (!graph.hasNode(rel.sourceId) || !graph.hasNode(rel.targetId)) continue;
+    const edgeId = `${rel.sourceId}_${rel.type}_${rel.targetId}`;
+    if (graph.hasEdge(edgeId)) continue;
+
+    const style = EDGE_STYLES[rel.type] || { color: '#4a4a5a', sizeMultiplier: 0.5 };
+
+    graph.addEdgeWithKey(edgeId, rel.sourceId, rel.targetId, {
+      size: style.sizeMultiplier,
+      color: style.color,
+      relationType: rel.type,
+      type: 'curved',
+      curvature: 0.12 + Math.random() * 0.08,
+    });
+  }
+
+  return newNodeIds;
 }

@@ -20,7 +20,7 @@ import { generateSkillFiles, type GeneratedSkillInfo } from './skill-gen.js';
 import fs from 'fs/promises';
 import type { DbConfig, NeptuneDbConfig } from '../core/db/interfaces.js';
 import { loadGraphToNeptune, getNeptuneStats } from '../core/db/neptune/neptune-ingest.js';
-import { generateGraphSummary } from '../core/ingestion/graph-summary.js';
+import { generateGraphSummary, generateStructuralSummary } from '../core/ingestion/graph-summary.js';
 import { resolveEmbeddingConfig } from './embed-config.js';
 
 
@@ -439,12 +439,14 @@ export const analyzeCommand = async (
   await addToGitignore(repoPath);
 
   // Generate LOD graph summary for large-codebase visualization
-  if (pipelineResult.communityResult) {
-    try {
+  try {
+    if (pipelineResult.communityResult && pipelineResult.communityResult.communities.length > 0) {
       await generateGraphSummary(pipelineResult.graph, pipelineResult.communityResult, storagePath);
-    } catch {
-      // Non-fatal — summary is best-effort
+    } else {
+      await generateStructuralSummary(pipelineResult.graph, storagePath);
     }
+  } catch {
+    // Non-fatal — summary is best-effort
   }
 
   const projectName = path.basename(repoPath);

@@ -161,3 +161,149 @@ export async function generateGraphSummary(
 
   return summary;
 }
+
+/**
+ * Generate a structural fallback summary from the directory tree.
+ * Used when community detection produces 0 results (e.g., COBOL repos
+ * where node types weren't previously included in community detection).
+ *
+ * Groups nodes by top-level directory segments, producing cluster groups
+ * compatible with the same frontend as community-based summaries.
+ */
+export async function generateStructuralSummary(
+  graph: KnowledgeGraph,
+  storagePath: string,
+): Promise<GraphSummary> {
+  const MAX_GROUPS = 200;
+
+  // Step 1: Group nodes by top-level directory (first 2 path segments)
+  const dirGroups = new Map<string, { count: number; nodeIds: string[] }>();
+  const nodeToGroup = new Map<string, string>();
+
+  const skipLabels = new Set(['Community', 'Process', 'Folder']);
+
+  graph.forEachNode(node => {
+    if (skipLabels.has(node.label)) return;
+
+    const filePath = node.properties.filePath || '';
+    const parts = filePath.split('/').filter(Boolean);
+
+    // Use first meaningful directory segment, or 'root' for top-level files
+    let groupKey: string;
+    if (parts.length >= 2) {
+      groupKey = parts[0];
+      // For deeper nesting (e.g., src/core/...), use first two segments
+      if (['src', 'lib', 'app', 'packages'].includes(parts[0].toLowerCase()) && parts.length >= 3) {
+        groupKey = `${parts[0]}/${parts[1]}`;
+      }
+    } else {
+      groupKey = '(root)';
+    }
+
+    const existing = dirGroups.get(groupKey);
+    if (existing) {
+      existing.count++;
+      existing.nodeIds.push(node.id);
+    } else {
+      dirGroups.set(groupKey, { count: 1, nodeIds: [node.id] });
+    }
+    nodeToGroup.set(node.id, groupKey);
+  });
+
+  // Step 2: Sort by count, cap at MAX_GROUPS, merge rest into "Other"
+  const sorted = Array.from(dirGroups.entries()).sort((a, b) => b[1].count - a[1].count);
+
+  if (sorted.length > MAX_GROUPS) {
+    const kept = sorted.slice(0, MAX_GROUPS - 1);
+    const rest = sorted.slice(MAX_GROUPS - 1);
+    let otherCount = 0;
+    const otherNodeIds: string[] = [];
+    for (const [, data] of rest) {
+      otherCount += data.count;
+      otherNodeIds.push(...data.nodeIds);
+    }
+    kept.push(['Other', { count: otherCount, nodeIds: otherNodeIds }]);
+
+    // Update nodeToGroup for merged nodes
+    for (const nodeId of otherNodeIds) {
+      nodeToGroup.set(nodeId, 'Other');
+    }
+
+    sorted.length = 0;
+    sorted.push(...kept);
+  }
+
+  // Step 3: Build cluster groups (filter out tiny groups <5 symbols)
+  const clusterGroups: ClusterGroupSummary[] = [];
+  const groupKeyToId = new Map<string, string>();
+
+  for (const [groupKey, data] of sorted) {
+    if (data.count < 5) continue;
+
+    const groupId = `cg_${groupKey}`;
+    groupKeyToId.set(groupKey, groupId);
+
+    clusterGroups.push({
+      id: groupId,
+      label: groupKey,
+      symbolCount: data.count,
+      cohesion: 0.5, // structural groups have no meaningful cohesion score
+      subCommunityIds: [], // no communities in fallback mode
+      subCommunityCount: 0,
+    });
+  }
+
+  // Step 4: Single pass over relationships to count inter-group edges
+  const edgeKey = (src: string, tgt: string) => `${src}|||${tgt}`;
+  const interGroupMap = new Map<string, { count: number; types: Record<string, number> }>();
+
+  graph.forEachRelationship(rel => {
+    if (rel.type === 'MEMBER_OF' || rel.type === 'STEP_IN_PROCESS') return;
+
+    const srcGroupKey = nodeToGroup.get(rel.sourceId);
+    const tgtGroupKey = nodeToGroup.get(rel.targetId);
+    if (!srcGroupKey || !tgtGroupKey || srcGroupKey === tgtGroupKey) return;
+
+    const srcGroupId = groupKeyToId.get(srcGroupKey);
+    const tgtGroupId = groupKeyToId.get(tgtGroupKey);
+    if (!srcGroupId || !tgtGroupId) return;
+
+    const key = edgeKey(srcGroupId, tgtGroupId);
+    const existing = interGroupMap.get(key);
+    if (existing) {
+      existing.count++;
+      existing.types[rel.type] = (existing.types[rel.type] || 0) + 1;
+    } else {
+      interGroupMap.set(key, { count: 1, types: { [rel.type]: 1 } });
+    }
+  });
+
+  const interGroupEdges: InterGroupEdge[] = [];
+  for (const [key, data] of interGroupMap) {
+    const [src, tgt] = key.split('|||');
+    interGroupEdges.push({
+      sourceGroupId: src,
+      targetGroupId: tgt,
+      count: data.count,
+      types: data.types,
+    });
+  }
+  interGroupEdges.sort((a, b) => b.count - a.count);
+
+  const summary: GraphSummary = {
+    version: 1,
+    generatedAt: new Date().toISOString(),
+    totalNodes: graph.nodeCount,
+    totalEdges: graph.relationshipCount,
+    clusterGroups,
+    interGroupEdges,
+  };
+
+  await fs.writeFile(
+    path.join(storagePath, 'graph-summary.json'),
+    JSON.stringify(summary),
+    'utf-8',
+  );
+
+  return summary;
+}

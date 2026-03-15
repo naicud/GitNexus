@@ -47,6 +47,7 @@ const AppContent = () => {
     setGraphViewMode,
     setGraphSummary,
     setExpandedGroups,
+    setGraphTruncated,
   } = useAppState();
 
   const graphCanvasRef = useRef<GraphCanvasHandle>(null);
@@ -154,6 +155,7 @@ const AppContent = () => {
       graph.addRelationship(rel);
     }
     setGraph(graph);
+    setGraphTruncated(result.truncated ?? false);
 
     // Set file contents from extracted File node content
     const fileMap = new Map<string, string>();
@@ -180,7 +182,7 @@ const AppContent = () => {
         console.warn('Embeddings auto-start failed:', err);
       }
     });
-  }, [setViewMode, setGraph, setFileContents, setProjectName, initializeAgent, startEmbeddings]);
+  }, [setViewMode, setGraph, setFileContents, setProjectName, setGraphTruncated, initializeAgent, startEmbeddings]);
 
   // Auto-connect when ?server query param is present (bookmarkable shortcut)
   const autoConnectRan = useRef(false);

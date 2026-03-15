@@ -404,6 +404,8 @@ CREATE REL TABLE ${REL_TABLE_NAME} (
   FROM Function TO CodeElement,
   FROM \`Namespace\` TO CodeElement,
   FROM CodeElement TO CodeElement,
+  FROM CodeElement TO \`Module\`,
+  FROM CodeElement TO File,
   FROM \`Module\` TO \`Constructor\`,
   type STRING,
   confidence DOUBLE,

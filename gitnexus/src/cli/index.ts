@@ -101,6 +101,15 @@ program
   .action(createLazyAction(() => import('./wiki.js'), 'wikiCommand'));
 
 program
+  .command('assess [path]')
+  .description('Run modernization assessment on an indexed repository')
+  .option('--format <type>', 'Output format: markdown, json, or both', 'both')
+  .option('--output <dir>', 'Output directory (default: .gitnexus/)')
+  .option('--detailed', 'Include per-program breakdowns')
+  .option('-y, --yes', 'Skip interactive prompts')
+  .action(createLazyAction(() => import('./assess.js'), 'assessCommand'));
+
+program
   .command('augment <pattern>')
   .description('Augment a search pattern with knowledge graph context (used by hooks)')
   .action(createLazyAction(() => import('./augment.js'), 'augmentCommand'));
