@@ -287,7 +287,12 @@ export async function loadEmbeddingsToNeptune(
     `;
 
     for (let i = 0; i < embeddings.length; i += EMBEDDING_BATCH_SIZE) {
-      const batch = embeddings.slice(i, i + EMBEDDING_BATCH_SIZE);
+      // Neptune openCypher rejects list/array types as property values (CType error).
+      // Serialize the float[] as a JSON string so Neptune sees a simple literal.
+      const batch = embeddings.slice(i, i + EMBEDDING_BATCH_SIZE).map(e => ({
+        nodeId: e.nodeId,
+        embedding: JSON.stringify(e.embedding),
+      }));
       const batchNum = Math.floor(i / EMBEDDING_BATCH_SIZE) + 1;
       await sendCypher(client, cypher, { batch });
       onProgress?.(`Embedding batch ${batchNum}/${totalBatches} (${batch.length} vectors)`);
