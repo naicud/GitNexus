@@ -73,6 +73,28 @@ function cosineSimilarity(
 }
 
 /**
+ * Parse an embedding property value returned from Neptune.
+ *
+ * Neptune stores embeddings as a comma-separated string ("1.23,4.56,...").
+ * Older data may have used JSON array notation ("[1.23,4.56,...]").
+ * Both formats are handled here; native number[] is also accepted as a
+ * safety fallback.
+ */
+function parseEmbedding(raw: unknown): number[] | null {
+  if (Array.isArray(raw)) return raw as number[];
+  if (typeof raw !== 'string' || raw.length === 0) return null;
+  const str = raw.startsWith('[') ? raw.slice(1, -1) : raw;
+  const parts = str.split(',');
+  const result = new Array<number>(parts.length);
+  for (let i = 0; i < parts.length; i++) {
+    const n = Number(parts[i]);
+    if (!Number.isFinite(n)) return null;
+    result[i] = n;
+  }
+  return result;
+}
+
+/**
  * Build the embedding cache by fetching all embeddings from Neptune.
  */
 async function buildCache(adapter: NeptuneAdapter): Promise<EmbeddingCache> {
@@ -85,17 +107,20 @@ async function buildCache(adapter: NeptuneAdapter): Promise<EmbeddingCache> {
   }
 
   // Determine dimensionality from the first valid embedding
-  const firstEmbedding = rows[0]['embedding'] as number[];
+  const firstEmbedding = parseEmbedding(rows[0]['embedding']);
+  if (!firstEmbedding) {
+    return { nodeIds: [], matrix: new Float64Array(0), dims: 0 };
+  }
   const dims = firstEmbedding.length;
 
   const nodeIds: string[] = [];
   const values: number[] = [];
 
   for (const row of rows) {
-    const embedding = row['embedding'] as number[] | undefined;
+    const embedding = parseEmbedding(row['embedding']);
     const nodeId = row['nodeId'] as string | undefined;
 
-    if (!nodeId || !embedding || !Array.isArray(embedding) || embedding.length !== dims) {
+    if (!nodeId || !embedding || embedding.length !== dims) {
       continue; // Skip malformed entries
     }
 

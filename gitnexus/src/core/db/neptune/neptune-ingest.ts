@@ -286,19 +286,31 @@ export async function loadEmbeddingsToNeptune(
       SET n.embedding = row.embedding
     `;
 
+    let failed = 0;
     for (let i = 0; i < embeddings.length; i += EMBEDDING_BATCH_SIZE) {
       // Neptune openCypher rejects list/array types as property values (CType error).
-      // Serialize the float[] as a JSON string so Neptune sees a simple literal.
+      // Serialize the float[] as a comma-separated string — NOT JSON.stringify, because
+      // Neptune's parameter parser auto-deserializes strings starting with '[' back into
+      // native lists, reproducing the CType error.
       const batch = embeddings.slice(i, i + EMBEDDING_BATCH_SIZE).map(e => ({
         nodeId: e.nodeId,
-        embedding: JSON.stringify(e.embedding),
+        embedding: e.embedding.join(','),
       }));
       const batchNum = Math.floor(i / EMBEDDING_BATCH_SIZE) + 1;
-      await sendCypher(client, cypher, { batch });
-      onProgress?.(`Embedding batch ${batchNum}/${totalBatches} (${batch.length} vectors)`);
+      try {
+        await sendCypher(client, cypher, { batch });
+        onProgress?.(`Embedding batch ${batchNum}/${totalBatches} (${batch.length} vectors)`);
+      } catch (err: any) {
+        failed += batch.length;
+        onProgress?.(`Embedding batch ${batchNum}/${totalBatches} failed (${err.message ?? err.name}) — skipping`);
+      }
     }
 
-    onProgress?.(`Neptune embedding loading complete (${embeddings.length} vectors stored)`);
+    if (failed > 0) {
+      onProgress?.(`Neptune embedding loading complete: ${embeddings.length - failed} stored, ${failed} failed`);
+    } else {
+      onProgress?.(`Neptune embedding loading complete (${embeddings.length} vectors stored)`);
+    }
   } finally {
     client.destroy();
   }
