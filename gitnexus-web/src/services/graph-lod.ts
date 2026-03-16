@@ -13,7 +13,7 @@ export interface GraphInfo {
   totalNodes: number;
   totalEdges: number;
   hasSummary: boolean;
-  mode: 'summary' | 'full';
+  mode: 'summary' | 'full' | 'hierarchy';
 }
 
 export interface ClusterGroupSummary {
@@ -117,6 +117,38 @@ export async function fetchNeighbors(
 
 // ── Neighbor Counts ─────────────────────────────────────────────────
 
+// ── Hierarchy Types ─────────────────────────────────────────────────────
+
+export interface HierarchyNode {
+  id: string;
+  name: string;
+  type: string;           // 'Folder', 'File', 'Module', etc.
+  filePath: string;
+  childCount: number;     // direct children
+  descendantCount: number; // total subtree (for sizing)
+  hasChildren: boolean;
+}
+
+export interface VirtualGroup {
+  prefix: string;
+  count: number;
+  sampleNames: string[];
+}
+
+export interface HierarchyResponse {
+  parentId: string | null;
+  parentType: string | null;
+  children: HierarchyNode[];
+  totalChildren: number;
+  truncated: boolean;
+  virtualGroups?: VirtualGroup[];
+}
+
+export interface AncestorPathResponse {
+  node: HierarchyNode;
+  ancestors: HierarchyNode[]; // ordered root→leaf
+}
+
 export interface NeighborCounts {
   inbound: Record<string, number>;
   outbound: Record<string, number>;
@@ -131,5 +163,34 @@ export async function fetchNeighborCounts(
   const params = new URLSearchParams({ repo, node: nodeId });
   const res = await fetch(`${baseUrl}/graph/neighbor-counts?${params}`);
   if (!res.ok) throw new Error(`Failed to fetch neighbor counts: ${res.status}`);
+  return res.json();
+}
+
+// ── Hierarchy Fetch Functions ───────────────────────────────────────────
+
+export async function fetchHierarchyChildren(
+  baseUrl: string,
+  repo: string,
+  parentId?: string,
+  options?: { limit?: number; offset?: number; namePrefix?: string },
+): Promise<HierarchyResponse> {
+  const params = new URLSearchParams({ repo });
+  if (parentId) params.set('parentId', parentId);
+  if (options?.limit) params.set('limit', String(options.limit));
+  if (options?.offset) params.set('offset', String(options.offset));
+  if (options?.namePrefix) params.set('namePrefix', options.namePrefix);
+  const res = await fetch(`${baseUrl}/graph/hierarchy?${params}`);
+  if (!res.ok) throw new Error(`Failed to fetch hierarchy children: ${res.status}`);
+  return res.json();
+}
+
+export async function fetchAncestorPath(
+  baseUrl: string,
+  repo: string,
+  nodeId: string,
+): Promise<AncestorPathResponse> {
+  const params = new URLSearchParams({ repo, nodeId });
+  const res = await fetch(`${baseUrl}/graph/hierarchy/ancestors?${params}`);
+  if (!res.ok) throw new Error(`Failed to fetch ancestor path: ${res.status}`);
   return res.json();
 }

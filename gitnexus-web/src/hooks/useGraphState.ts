@@ -1,6 +1,6 @@
 import { useState, useCallback, useRef, useEffect } from 'react';
 import { KnowledgeGraph, GraphNode } from '../core/graph/types';
-import type { GraphSummary } from '../services/graph-lod';
+import type { GraphSummary, HierarchyResponse, HierarchyNode } from '../services/graph-lod';
 import type { RepoSummary, ConnectToServerResult } from '../services/server-connection';
 import { connectToServer } from '../services/server-connection';
 import { createKnowledgeGraph } from '../core/graph/graph';
@@ -65,14 +65,20 @@ export interface GraphState {
   switchRepo: (repoName: string) => Promise<void>;
 
   // LOD state
-  graphViewMode: 'full' | 'summary';
-  setGraphViewMode: (mode: 'full' | 'summary') => void;
+  graphViewMode: 'full' | 'summary' | 'hierarchy';
+  setGraphViewMode: (mode: 'full' | 'summary' | 'hierarchy') => void;
   expandedGroups: Map<string, string[]>;
   setExpandedGroups: (groups: Map<string, string[]>) => void;
   graphSummary: GraphSummary | null;
   setGraphSummary: (s: GraphSummary | null) => void;
   graphTruncated: boolean;
   setGraphTruncated: (v: boolean) => void;
+
+  // Hierarchy state
+  hierarchyExpandedNodes: Map<string, HierarchyResponse>;
+  setHierarchyExpandedNodes: (nodes: Map<string, HierarchyResponse>) => void;
+  hierarchyBreadcrumb: HierarchyNode[];
+  setHierarchyBreadcrumb: (breadcrumb: HierarchyNode[]) => void;
 
   // Code References Panel state
   codeReferences: CodeReference[];
@@ -159,10 +165,14 @@ export function useGraphState(switchRepoDeps?: SwitchRepoDeps): GraphState {
   const [availableRepos, setAvailableRepos] = useState<RepoSummary[]>([]);
 
   // LOD state
-  const [graphViewMode, setGraphViewMode] = useState<'full' | 'summary'>('full');
+  const [graphViewMode, setGraphViewMode] = useState<'full' | 'summary' | 'hierarchy'>('full');
   const [expandedGroups, setExpandedGroups] = useState<Map<string, string[]>>(new Map());
   const [graphSummary, setGraphSummary] = useState<GraphSummary | null>(null);
   const [graphTruncated, setGraphTruncated] = useState(false);
+
+  // Hierarchy state
+  const [hierarchyExpandedNodes, setHierarchyExpandedNodes] = useState<Map<string, HierarchyResponse>>(new Map());
+  const [hierarchyBreadcrumb, setHierarchyBreadcrumb] = useState<HierarchyNode[]>([]);
 
   // Helpers
   const normalizePath = useCallback((p: string) => {
@@ -399,6 +409,10 @@ export function useGraphState(switchRepoDeps?: SwitchRepoDeps): GraphState {
     setGraphSummary,
     graphTruncated,
     setGraphTruncated,
+    hierarchyExpandedNodes,
+    setHierarchyExpandedNodes,
+    hierarchyBreadcrumb,
+    setHierarchyBreadcrumb,
     codeReferences,
     isCodePanelOpen,
     setCodePanelOpen,

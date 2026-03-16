@@ -18,6 +18,9 @@ export interface SigmaNodeAttributes {
   mass?: number; // ForceAtlas2 mass - higher = more repulsion
   community?: number; // Community index from Leiden algorithm
   communityColor?: string; // Color assigned by community
+  childCount?: number;
+  isExpanded?: boolean;
+  isExpandable?: boolean;
 }
 
 export interface SigmaEdgeAttributes {

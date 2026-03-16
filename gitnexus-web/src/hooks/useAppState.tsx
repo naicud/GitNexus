@@ -87,14 +87,20 @@ interface AppState {
   switchRepo: (repoName: string) => Promise<void>;
 
   // LOD (Level-of-Detail) graph state
-  graphViewMode: 'full' | 'summary';
-  setGraphViewMode: (mode: 'full' | 'summary') => void;
+  graphViewMode: 'full' | 'summary' | 'hierarchy';
+  setGraphViewMode: (mode: 'full' | 'summary' | 'hierarchy') => void;
   expandedGroups: Map<string, string[]>; // groupId -> expanded node IDs
   setExpandedGroups: (groups: Map<string, string[]>) => void;
   graphSummary: import('../services/graph-lod').GraphSummary | null;
   setGraphSummary: (s: import('../services/graph-lod').GraphSummary | null) => void;
   graphTruncated: boolean;
   setGraphTruncated: (v: boolean) => void;
+
+  // Hierarchy state
+  hierarchyExpandedNodes: Map<string, import('../services/graph-lod').HierarchyResponse>;
+  setHierarchyExpandedNodes: (nodes: Map<string, import('../services/graph-lod').HierarchyResponse>) => void;
+  hierarchyBreadcrumb: import('../services/graph-lod').HierarchyNode[];
+  setHierarchyBreadcrumb: (breadcrumb: import('../services/graph-lod').HierarchyNode[]) => void;
 
   // Worker API (shared across app)
   runPipeline: (file: File, onProgress: (p: PipelineProgress) => void, clusteringConfig?: ProviderConfig) => Promise<PipelineResult>;
@@ -230,6 +236,10 @@ export const AppStateProvider = ({ children }: { children: ReactNode }) => {
     setGraphSummary: graphState.setGraphSummary,
     graphTruncated: graphState.graphTruncated,
     setGraphTruncated: graphState.setGraphTruncated,
+    hierarchyExpandedNodes: graphState.hierarchyExpandedNodes,
+    setHierarchyExpandedNodes: graphState.setHierarchyExpandedNodes,
+    hierarchyBreadcrumb: graphState.hierarchyBreadcrumb,
+    setHierarchyBreadcrumb: graphState.setHierarchyBreadcrumb,
     codeReferences: graphState.codeReferences,
     isCodePanelOpen: graphState.isCodePanelOpen,
     setCodePanelOpen: graphState.setCodePanelOpen,

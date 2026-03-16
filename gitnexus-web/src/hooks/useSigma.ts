@@ -54,6 +54,7 @@ interface UseSigmaOptions {
   onNodeHover?: (nodeId: string | null) => void;
   onStageClick?: () => void;
   onGroupExpand?: (groupLabel: string, groupId: string) => void;
+  onHierarchyExpand?: (nodeId: string) => void;
   onNodeRightClick?: (nodeId: string, event: { clientX: number; clientY: number }) => void;
   highlightedNodeIds?: Set<string>;
   blastRadiusNodeIds?: Set<string>;
@@ -283,7 +284,18 @@ export const useSigma = (options: UseSigmaOptions = {}): UseSigmaReturn => {
           res.hidden = true;
           return res;
         }
-        
+
+        // Hierarchy mode visual cues (base appearance modifiers)
+        if (data.isExpanded) {
+          // Expanded nodes: semi-transparent, smaller
+          res.color = dimColor(data.color, 0.6);
+          res.zIndex = 0;
+        } else if (data.isExpandable) {
+          // Expandable nodes: thicker border effect via slightly larger size
+          res.size = (data.size || 8) * 1.05;
+          res.zIndex = 1;
+        }
+
         const currentSelected = selectedNodeRef.current;
         const highlighted = highlightedRef.current;
         const blastRadius = blastRadiusRef.current;
@@ -520,6 +532,9 @@ export const useSigma = (options: UseSigmaOptions = {}): UseSigmaReturn => {
         // Extract the group label from the display label (e.g. "Ingestion (135)" -> "Ingestion")
         const label = (attrs.label || '').replace(/\s*\(\d+\)$/, '');
         options.onGroupExpand?.(label, node);
+      } else if (attrs.isExpandable || attrs.isExpanded) {
+        // Hierarchy mode: expandable/expanded nodes toggle on double-click
+        options.onHierarchyExpand?.(node);
       }
     });
 

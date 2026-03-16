@@ -395,8 +395,8 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
         hasValidSummary = Array.isArray(parsed.clusterGroups) && parsed.clusterGroups.length > 0;
       } catch { /* no summary file or invalid */ }
 
-      const mode = (totalNodes > 50000) ? 'summary' : 'full';
-      res.json({ totalNodes, totalEdges, hasSummary, mode });
+      const mode = (totalNodes > 100000) ? 'hierarchy' : (totalNodes > 50000) ? 'summary' : 'full';
+      res.json({ totalNodes, totalEdges, hasSummary, mode, hierarchyAvailable: totalNodes > 100000 });
     } catch (err: any) {
       res.status(500).json({ error: err.message || 'Failed to get graph info' });
     }
@@ -948,6 +948,430 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
       res.json(result);
     } catch (err: any) {
       res.status(500).json({ error: err.message || 'Failed to fetch neighbors' });
+    }
+  });
+
+  // ── LOD: Hierarchy drill-down ────────────────────────────────────────
+  app.get('/api/graph/hierarchy', async (req, res) => {
+    try {
+      const entry = await resolveRepo(requestedRepo(req));
+      if (!entry) {
+        res.status(404).json({ error: 'Repository not found' });
+        return;
+      }
+
+      const parentId = req.query.parentId ? String(req.query.parentId).trim() : null;
+      const namePrefix = req.query.namePrefix ? String(req.query.namePrefix).trim() : null;
+      const limit = Math.max(1, Math.min(2000, parseInt(String(req.query.limit ?? '500'), 10) || 500));
+      const offset = Math.max(0, parseInt(String(req.query.offset ?? '0'), 10) || 0);
+
+      const dbConfig = getDbConfigFromEntry(entry);
+
+      if (dbConfig.type === 'neptune') {
+        const adapter = new NeptuneAdapter(dbConfig);
+        try {
+          if (!parentId) {
+            // L0: Return Folder nodes
+            const rows = await adapter.executeQuery(
+              `MATCH (f:Folder)
+               OPTIONAL MATCH (f)-[r:CodeRelation]->(child) WHERE r.type IN ['CONTAINS', 'DEFINES']
+               WITH f, count(child) AS cc
+               RETURN f.id AS id, f.name AS name, f.filePath AS filePath, cc AS childCount
+               ORDER BY f.name`
+            );
+            const children = rows.map((row: any) => ({
+              id: row.id as string,
+              name: row.name as string,
+              type: 'Folder',
+              filePath: (row.filePath || '') as string,
+              childCount: typeof row.childCount === 'number' ? row.childCount : Number(row.childCount || 0),
+              descendantCount: 0,
+              hasChildren: (typeof row.childCount === 'number' ? row.childCount : Number(row.childCount || 0)) > 0,
+            }));
+            await adapter.close();
+            return res.json({
+              parentId: null,
+              parentType: null,
+              children,
+              totalChildren: children.length,
+              truncated: false,
+            });
+          }
+
+          // Specific parent: first get total count
+          const countRows = await adapter.executeParameterized(
+            `MATCH (parent)-[r:CodeRelation]->(child)
+             WHERE parent.id = $parentId AND r.type IN ['CONTAINS', 'DEFINES']
+             RETURN count(child) AS total`,
+            { parentId },
+          );
+          const totalChildren = Number(countRows[0]?.total ?? 0);
+
+          // If too many children and no prefix filter, return virtual groups
+          if (totalChildren > 500 && !namePrefix) {
+            const groupRows = await adapter.executeParameterized(
+              `MATCH (parent)-[r:CodeRelation]->(child)
+               WHERE parent.id = $parentId AND r.type IN ['CONTAINS', 'DEFINES']
+               RETURN left(child.name, 2) AS prefix, count(*) AS cnt,
+                      collect(child.name)[0..3] AS sampleNames
+               ORDER BY prefix`,
+              { parentId },
+            );
+            const virtualGroups = groupRows.map((row: any) => ({
+              prefix: row.prefix as string,
+              count: typeof row.cnt === 'number' ? row.cnt : Number(row.cnt || 0),
+              sampleNames: Array.isArray(row.sampleNames) ? row.sampleNames : [],
+            }));
+
+            // Also get parent type
+            const parentRows = await adapter.executeParameterized(
+              `MATCH (p) WHERE p.id = $parentId RETURN labels(p)[0] AS type`,
+              { parentId },
+            );
+            const parentType = parentRows[0]?.type ?? null;
+            await adapter.close();
+            return res.json({
+              parentId,
+              parentType,
+              children: [],
+              totalChildren,
+              truncated: true,
+              virtualGroups,
+            });
+          }
+
+          // Return children with child counts
+          const prefixFilter = namePrefix ? ' AND child.name STARTS WITH $namePrefix' : '';
+          const params: Record<string, any> = { parentId };
+          if (namePrefix) params.namePrefix = namePrefix;
+
+          const childRows = await adapter.executeParameterized(
+            `MATCH (parent)-[r:CodeRelation]->(child)
+             WHERE parent.id = $parentId AND r.type IN ['CONTAINS', 'DEFINES']${prefixFilter}
+             WITH child, labels(child)[0] AS type
+             OPTIONAL MATCH (child)-[r2:CodeRelation]->(gc) WHERE r2.type IN ['CONTAINS', 'DEFINES']
+             WITH child, type, count(gc) AS childCount
+             RETURN child.id AS id, child.name AS name, type, child.filePath AS filePath, childCount
+             ORDER BY child.name
+             SKIP ${offset} LIMIT ${limit}`,
+            params,
+          );
+
+          const children = childRows.map((row: any) => ({
+            id: row.id as string,
+            name: row.name as string,
+            type: (row.type || 'CodeElement') as string,
+            filePath: (row.filePath || '') as string,
+            childCount: typeof row.childCount === 'number' ? row.childCount : Number(row.childCount || 0),
+            descendantCount: 0,
+            hasChildren: (typeof row.childCount === 'number' ? row.childCount : Number(row.childCount || 0)) > 0,
+          }));
+
+          // Get parent type
+          const parentRows = await adapter.executeParameterized(
+            `MATCH (p) WHERE p.id = $parentId RETURN labels(p)[0] AS type`,
+            { parentId },
+          );
+          const parentType = parentRows[0]?.type ?? null;
+
+          // Recount with prefix filter if applicable
+          let filteredTotal = totalChildren;
+          if (namePrefix) {
+            const filteredCountRows = await adapter.executeParameterized(
+              `MATCH (parent)-[r:CodeRelation]->(child)
+               WHERE parent.id = $parentId AND r.type IN ['CONTAINS', 'DEFINES'] AND child.name STARTS WITH $namePrefix
+               RETURN count(child) AS total`,
+              { parentId, namePrefix },
+            );
+            filteredTotal = Number(filteredCountRows[0]?.total ?? 0);
+          }
+
+          await adapter.close();
+          return res.json({
+            parentId,
+            parentType,
+            children,
+            totalChildren: filteredTotal,
+            truncated: (offset + children.length) < filteredTotal,
+          });
+        } catch (err: any) {
+          await adapter.close();
+          return res.status(500).json({ error: err.message || 'Failed to fetch hierarchy' });
+        }
+      }
+
+      // KuzuDB path
+      const kuzuPath = path.join(entry.storagePath, 'kuzu');
+      const result = await withKuzuDb(kuzuPath, async () => {
+        if (!parentId) {
+          // L0: Return Folder nodes
+          const rows = await executeQuery(
+            `MATCH (f:Folder)
+             OPTIONAL MATCH (f)-[r:CodeRelation]->(child) WHERE r.type IN ['CONTAINS', 'DEFINES']
+             WITH f, count(child) AS cc
+             RETURN f.id AS id, f.name AS name, f.filePath AS filePath, cc AS childCount
+             ORDER BY f.name`
+          );
+          const children = rows.map((row: any) => ({
+            id: row.id as string,
+            name: row.name as string,
+            type: 'Folder',
+            filePath: (row.filePath || '') as string,
+            childCount: typeof row.childCount === 'number' ? row.childCount : Number(row.childCount || 0),
+            descendantCount: 0,
+            hasChildren: (typeof row.childCount === 'number' ? row.childCount : Number(row.childCount || 0)) > 0,
+          }));
+          return {
+            parentId: null,
+            parentType: null,
+            children,
+            totalChildren: children.length,
+            truncated: false,
+          };
+        }
+
+        // Specific parent: first get total count
+        const safeParentId = parentId.replace(/'/g, "\\'");
+        const countRows = await executeQuery(
+          `MATCH (parent)-[r:CodeRelation]->(child)
+           WHERE parent.id = '${safeParentId}' AND r.type IN ['CONTAINS', 'DEFINES']
+           RETURN count(child) AS total`
+        );
+        const totalChildren = countRows[0]?.total ?? 0;
+
+        // If too many children and no prefix filter, return virtual groups
+        if (totalChildren > 500 && !namePrefix) {
+          const groupRows = await executeQuery(
+            `MATCH (parent)-[r:CodeRelation]->(child)
+             WHERE parent.id = '${safeParentId}' AND r.type IN ['CONTAINS', 'DEFINES']
+             RETURN left(child.name, 2) AS prefix, count(*) AS cnt,
+                    collect(child.name)[0..3] AS sampleNames
+             ORDER BY prefix`
+          );
+          const virtualGroups = groupRows.map((row: any) => ({
+            prefix: row.prefix as string,
+            count: typeof row.cnt === 'number' ? row.cnt : Number(row.cnt || 0),
+            sampleNames: Array.isArray(row.sampleNames) ? row.sampleNames : [],
+          }));
+
+          // Get parent type
+          const parentRows = await executeQuery(
+            `MATCH (p) WHERE p.id = '${safeParentId}' RETURN labels(p)[0] AS type`
+          );
+          const parentType = parentRows[0]?.type ?? null;
+          return {
+            parentId,
+            parentType,
+            children: [],
+            totalChildren,
+            truncated: true,
+            virtualGroups,
+          };
+        }
+
+        // Return children with child counts
+        const safePrefixFilter = namePrefix
+          ? ` AND child.name STARTS WITH '${namePrefix.replace(/'/g, "\\'")}'`
+          : '';
+
+        const childRows = await executeQuery(
+          `MATCH (parent)-[r:CodeRelation]->(child)
+           WHERE parent.id = '${safeParentId}' AND r.type IN ['CONTAINS', 'DEFINES']${safePrefixFilter}
+           WITH child, labels(child)[0] AS type
+           OPTIONAL MATCH (child)-[r2:CodeRelation]->(gc) WHERE r2.type IN ['CONTAINS', 'DEFINES']
+           WITH child, type, count(gc) AS childCount
+           RETURN child.id AS id, child.name AS name, type, child.filePath AS filePath, childCount
+           ORDER BY child.name
+           SKIP ${offset} LIMIT ${limit}`
+        );
+
+        const children = childRows.map((row: any) => ({
+          id: row.id as string,
+          name: row.name as string,
+          type: (row.type || 'CodeElement') as string,
+          filePath: (row.filePath || '') as string,
+          childCount: typeof row.childCount === 'number' ? row.childCount : Number(row.childCount || 0),
+          descendantCount: 0,
+          hasChildren: (typeof row.childCount === 'number' ? row.childCount : Number(row.childCount || 0)) > 0,
+        }));
+
+        // Get parent type
+        const parentRows = await executeQuery(
+          `MATCH (p) WHERE p.id = '${safeParentId}' RETURN labels(p)[0] AS type`
+        );
+        const parentType = parentRows[0]?.type ?? null;
+
+        // Recount with prefix filter if applicable
+        let filteredTotal = totalChildren;
+        if (namePrefix) {
+          const filteredCountRows = await executeQuery(
+            `MATCH (parent)-[r:CodeRelation]->(child)
+             WHERE parent.id = '${safeParentId}' AND r.type IN ['CONTAINS', 'DEFINES']${safePrefixFilter}
+             RETURN count(child) AS total`
+          );
+          filteredTotal = filteredCountRows[0]?.total ?? 0;
+        }
+
+        return {
+          parentId,
+          parentType,
+          children,
+          totalChildren: filteredTotal,
+          truncated: (offset + children.length) < filteredTotal,
+        };
+      });
+
+      res.json(result);
+    } catch (err: any) {
+      res.status(500).json({ error: err.message || 'Failed to fetch hierarchy' });
+    }
+  });
+
+  // ── LOD: Hierarchy ancestor path ─────────────────────────────────────
+  app.get('/api/graph/hierarchy/ancestors', async (req, res) => {
+    try {
+      const entry = await resolveRepo(requestedRepo(req));
+      if (!entry) {
+        res.status(404).json({ error: 'Repository not found' });
+        return;
+      }
+
+      const nodeId = String(req.query.nodeId ?? '').trim();
+      if (!nodeId) {
+        res.status(400).json({ error: 'Missing "nodeId" query parameter' });
+        return;
+      }
+
+      const dbConfig = getDbConfigFromEntry(entry);
+
+      if (dbConfig.type === 'neptune') {
+        const adapter = new NeptuneAdapter(dbConfig);
+        try {
+          // Get the target node
+          const targetRows = await adapter.executeParameterized(
+            `MATCH (target) WHERE target.id = $nodeId
+             OPTIONAL MATCH (target)-[r:CodeRelation]->(gc) WHERE r.type IN ['CONTAINS', 'DEFINES']
+             WITH target, count(gc) AS childCount
+             RETURN target.id AS id, target.name AS name, labels(target)[0] AS type,
+                    target.filePath AS filePath, childCount`,
+            { nodeId },
+          );
+          if (targetRows.length === 0) {
+            await adapter.close();
+            return res.status(404).json({ error: 'Node not found' });
+          }
+          const tr = targetRows[0] as any;
+          const node = {
+            id: tr.id as string,
+            name: tr.name as string,
+            type: (tr.type || 'CodeElement') as string,
+            filePath: (tr.filePath || '') as string,
+            childCount: typeof tr.childCount === 'number' ? tr.childCount : Number(tr.childCount || 0),
+            descendantCount: 0,
+            hasChildren: (typeof tr.childCount === 'number' ? tr.childCount : Number(tr.childCount || 0)) > 0,
+          };
+
+          // Walk up parent chain (max 10 levels)
+          const ancestors: typeof node[] = [];
+          let currentId = nodeId;
+          for (let i = 0; i < 10; i++) {
+            const parentRows = await adapter.executeParameterized(
+              `MATCH (parent)-[r:CodeRelation]->(child)
+               WHERE child.id = $childId AND r.type IN ['CONTAINS', 'DEFINES']
+               OPTIONAL MATCH (parent)-[r2:CodeRelation]->(gc) WHERE r2.type IN ['CONTAINS', 'DEFINES']
+               WITH parent, count(gc) AS childCount
+               RETURN parent.id AS id, parent.name AS name, labels(parent)[0] AS type,
+                      parent.filePath AS filePath, childCount
+               LIMIT 1`,
+              { childId: currentId },
+            );
+            if (parentRows.length === 0) break;
+            const pr = parentRows[0] as any;
+            ancestors.unshift({
+              id: pr.id as string,
+              name: pr.name as string,
+              type: (pr.type || 'CodeElement') as string,
+              filePath: (pr.filePath || '') as string,
+              childCount: typeof pr.childCount === 'number' ? pr.childCount : Number(pr.childCount || 0),
+              descendantCount: 0,
+              hasChildren: (typeof pr.childCount === 'number' ? pr.childCount : Number(pr.childCount || 0)) > 0,
+            });
+            currentId = pr.id;
+          }
+
+          await adapter.close();
+          return res.json({ node, ancestors });
+        } catch (err: any) {
+          await adapter.close();
+          return res.status(500).json({ error: err.message || 'Failed to fetch ancestors' });
+        }
+      }
+
+      // KuzuDB path
+      const kuzuPath = path.join(entry.storagePath, 'kuzu');
+      const result = await withKuzuDb(kuzuPath, async () => {
+        const safeNodeId = nodeId.replace(/'/g, "\\'");
+        // Get the target node
+        const targetRows = await executeQuery(
+          `MATCH (target) WHERE target.id = '${safeNodeId}'
+           OPTIONAL MATCH (target)-[r:CodeRelation]->(gc) WHERE r.type IN ['CONTAINS', 'DEFINES']
+           WITH target, count(gc) AS childCount
+           RETURN target.id AS id, target.name AS name, labels(target)[0] AS type,
+                  target.filePath AS filePath, childCount`
+        );
+        if (targetRows.length === 0) {
+          return { error: 'Node not found' };
+        }
+        const tr = targetRows[0] as any;
+        const node = {
+          id: tr.id as string,
+          name: tr.name as string,
+          type: (tr.type || 'CodeElement') as string,
+          filePath: (tr.filePath || '') as string,
+          childCount: typeof tr.childCount === 'number' ? tr.childCount : Number(tr.childCount || 0),
+          descendantCount: 0,
+          hasChildren: (typeof tr.childCount === 'number' ? tr.childCount : Number(tr.childCount || 0)) > 0,
+        };
+
+        // Walk up parent chain (max 10 levels)
+        const ancestors: typeof node[] = [];
+        let currentId = nodeId;
+        for (let i = 0; i < 10; i++) {
+          const safeCurrentId = currentId.replace(/'/g, "\\'");
+          const parentRows = await executeQuery(
+            `MATCH (parent)-[r:CodeRelation]->(child)
+             WHERE child.id = '${safeCurrentId}' AND r.type IN ['CONTAINS', 'DEFINES']
+             OPTIONAL MATCH (parent)-[r2:CodeRelation]->(gc) WHERE r2.type IN ['CONTAINS', 'DEFINES']
+             WITH parent, count(gc) AS childCount
+             RETURN parent.id AS id, parent.name AS name, labels(parent)[0] AS type,
+                    parent.filePath AS filePath, childCount
+             LIMIT 1`
+          );
+          if (parentRows.length === 0) break;
+          const pr = parentRows[0] as any;
+          ancestors.unshift({
+            id: pr.id as string,
+            name: pr.name as string,
+            type: (pr.type || 'CodeElement') as string,
+            filePath: (pr.filePath || '') as string,
+            childCount: typeof pr.childCount === 'number' ? pr.childCount : Number(pr.childCount || 0),
+            descendantCount: 0,
+            hasChildren: (typeof pr.childCount === 'number' ? pr.childCount : Number(pr.childCount || 0)) > 0,
+          });
+          currentId = pr.id;
+        }
+
+        return { node, ancestors };
+      });
+
+      if ((result as any).error) {
+        res.status(404).json(result);
+        return;
+      }
+
+      res.json(result);
+    } catch (err: any) {
+      res.status(500).json({ error: err.message || 'Failed to fetch ancestors' });
     }
   });
 

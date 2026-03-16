@@ -217,16 +217,30 @@ const AppContent = () => {
         const name = repoInfo.repoPath.split('/').pop() || 'server-project';
         setProjectName(name);
 
-        // Check if LOD mode should be used
-        let useLOD = false;
+        // Check if LOD or hierarchy mode should be used
+        let graphMode: 'full' | 'summary' | 'hierarchy' = 'full';
         try {
           const graphInfo = await fetchGraphInfo(baseUrl, repoParam || name);
-          useLOD = graphInfo.mode === 'summary';
+          graphMode = graphInfo.mode;
         } catch {
           // Older server without /api/graph/info — fall back to full mode
         }
 
-        if (useLOD) {
+        if (graphMode === 'hierarchy') {
+          // Hierarchy path: drill-down starts from root folders
+          setProgress({ phase: 'extracting', percent: 90, message: 'Building hierarchy view...', detail: 'Loading folder structure' });
+
+          const emptyGraph = createKnowledgeGraph();
+          setGraph(emptyGraph);
+          setFileContents(new Map());
+          setGraphViewMode('hierarchy');
+          setExpandedGroups(new Map());
+          setViewMode('exploring');
+
+          if (getActiveProviderConfig()) {
+            initializeAgent(name, baseUrl);
+          }
+        } else if (graphMode === 'summary') {
           // LOD path: fetch summary instead of full graph
           setProgress({ phase: 'extracting', percent: 50, message: 'Loading graph summary...', detail: 'Fetching cluster overview' });
           const summary = await fetchGraphSummary(baseUrl, repoParam || name);
