@@ -15,7 +15,7 @@ import { getActiveProviderConfig } from './core/llm/settings-service';
 import { createKnowledgeGraph } from './core/graph/graph';
 import { connectToServer, fetchRepos, fetchRepoInfo, normalizeServerUrl, type ConnectToServerResult } from './services/server-connection';
 import { fetchGraphInfo, fetchGraphSummary } from './services/graph-lod';
-import { summaryToGraphology } from './lib/summary-graph-adapter';
+
 
 const AppContent = () => {
   const {
@@ -186,6 +186,86 @@ const AppContent = () => {
     });
   }, [setViewMode, setGraph, setFileContents, setProjectName, setGraphTruncated, initializeAgent, startEmbeddings]);
 
+  // Smart connect: checks LOD mode first, routes to hierarchy/summary/full as appropriate
+  const smartConnect = useCallback(async (serverUrl: string, repoName?: string) => {
+    const baseUrl = normalizeServerUrl(serverUrl);
+    setProgress({ phase: 'extracting', percent: 0, message: 'Connecting to server...', detail: 'Validating server' });
+    setViewMode('loading');
+    setServerBaseUrl(baseUrl);
+
+    try {
+      const repoInfo = await fetchRepoInfo(baseUrl, repoName);
+      const name = repoInfo.repoPath.split('/').pop() || 'server-project';
+      setProjectName(name);
+
+      // Check LOD mode
+      let graphMode: 'full' | 'summary' | 'hierarchy' = 'full';
+      try {
+        const graphInfo = await fetchGraphInfo(baseUrl, repoName || name);
+        graphMode = graphInfo.mode;
+      } catch {
+        // Older server without /api/graph/info — fall back to full
+      }
+
+      if (graphMode === 'hierarchy') {
+        setProgress({ phase: 'extracting', percent: 90, message: 'Building hierarchy view...', detail: 'Loading folder structure' });
+        setGraph(createKnowledgeGraph());
+        setFileContents(new Map());
+        setGraphViewMode('hierarchy');
+        setExpandedGroups(new Map());
+        setViewMode('exploring');
+        if (getActiveProviderConfig()) initializeAgent(name, baseUrl);
+      } else if (graphMode === 'summary') {
+        setProgress({ phase: 'extracting', percent: 50, message: 'Loading graph summary...', detail: 'Fetching cluster overview' });
+        const summary = await fetchGraphSummary(baseUrl, repoName || name);
+        setProgress({ phase: 'extracting', percent: 90, message: 'Building visualization...', detail: `${summary.clusterGroups.length} cluster groups` });
+        setGraph(createKnowledgeGraph());
+        setFileContents(new Map());
+        setGraphSummary(summary);
+        setGraphViewMode('summary');
+        setExpandedGroups(new Map());
+        setViewMode('exploring');
+        if (getActiveProviderConfig()) initializeAgent(name, baseUrl);
+      } else {
+        // Full-graph path
+        const result = await connectToServer(serverUrl, (phase, downloaded, total) => {
+          if (phase === 'validating') {
+            setProgress({ phase: 'extracting', percent: 5, message: 'Connecting to server...', detail: 'Validating server' });
+          } else if (phase === 'downloading') {
+            const pct = total ? Math.round((downloaded / total) * 90) + 5 : 50;
+            const mb = (downloaded / (1024 * 1024)).toFixed(1);
+            setProgress({ phase: 'extracting', percent: pct, message: 'Downloading graph...', detail: `${mb} MB downloaded` });
+          } else if (phase === 'extracting') {
+            setProgress({ phase: 'extracting', percent: 97, message: 'Processing...', detail: 'Extracting file contents' });
+          }
+        }, undefined, repoName);
+
+        handleServerConnect(result, baseUrl);
+        setGraphViewMode('full');
+      }
+
+      // Fetch available repos for the repo switcher
+      try {
+        const repos = await fetchRepos(baseUrl);
+        setAvailableRepos(repos);
+      } catch (e) {
+        console.warn('Failed to fetch repo list:', e);
+      }
+    } catch (err) {
+      console.error('Smart connect failed:', err);
+      setProgress({
+        phase: 'error',
+        percent: 0,
+        message: 'Failed to connect to server',
+        detail: err instanceof Error ? err.message : 'Unknown error',
+      });
+      setTimeout(() => {
+        setViewMode('onboarding');
+        setProgress(null);
+      }, 3000);
+    }
+  }, [handleServerConnect, setProgress, setViewMode, setServerBaseUrl, setAvailableRepos, setProjectName, setGraph, setFileContents, setGraphSummary, setGraphViewMode, setExpandedGroups, initializeAgent]);
+
   // Auto-connect when ?server query param is present (bookmarkable shortcut)
   const autoConnectRan = useRef(false);
   useEffect(() => {
@@ -198,108 +278,10 @@ const AppContent = () => {
     const cleanUrl = window.location.pathname + window.location.hash;
     window.history.replaceState(null, '', cleanUrl);
 
-    setProgress({ phase: 'extracting', percent: 0, message: 'Connecting to server...', detail: 'Validating server' });
-    setViewMode('loading');
-
     const serverUrl = params.get('server') || window.location.origin;
-
-    const baseUrl = normalizeServerUrl(serverUrl);
-
     const repoParam = params.get('repo') || undefined;
-
-    // Smart connect: check graph info first to decide LOD vs full mode
-    (async () => {
-      try {
-        setServerBaseUrl(baseUrl);
-
-        // Fetch repo info for project name
-        const repoInfo = await fetchRepoInfo(baseUrl, repoParam);
-        const name = repoInfo.repoPath.split('/').pop() || 'server-project';
-        setProjectName(name);
-
-        // Check if LOD or hierarchy mode should be used
-        let graphMode: 'full' | 'summary' | 'hierarchy' = 'full';
-        try {
-          const graphInfo = await fetchGraphInfo(baseUrl, repoParam || name);
-          graphMode = graphInfo.mode;
-        } catch {
-          // Older server without /api/graph/info — fall back to full mode
-        }
-
-        if (graphMode === 'hierarchy') {
-          // Hierarchy path: drill-down starts from root folders
-          setProgress({ phase: 'extracting', percent: 90, message: 'Building hierarchy view...', detail: 'Loading folder structure' });
-
-          const emptyGraph = createKnowledgeGraph();
-          setGraph(emptyGraph);
-          setFileContents(new Map());
-          setGraphViewMode('hierarchy');
-          setExpandedGroups(new Map());
-          setViewMode('exploring');
-
-          if (getActiveProviderConfig()) {
-            initializeAgent(name, baseUrl);
-          }
-        } else if (graphMode === 'summary') {
-          // LOD path: fetch summary instead of full graph
-          setProgress({ phase: 'extracting', percent: 50, message: 'Loading graph summary...', detail: 'Fetching cluster overview' });
-          const summary = await fetchGraphSummary(baseUrl, repoParam || name);
-
-          setProgress({ phase: 'extracting', percent: 90, message: 'Building visualization...', detail: `${summary.clusterGroups.length} cluster groups` });
-
-          // Convert summary to Sigma graph (no KnowledgeGraph needed for LOD)
-          // Set an empty KnowledgeGraph so the app doesn't break
-          const emptyGraph = createKnowledgeGraph();
-          setGraph(emptyGraph);
-          setFileContents(new Map());
-          setGraphSummary(summary);
-          setGraphViewMode('summary');
-          setExpandedGroups(new Map());
-          setViewMode('exploring');
-
-          if (getActiveProviderConfig()) {
-            initializeAgent(name, baseUrl);
-          }
-        } else {
-          // Full-graph path: existing behavior
-          const result = await connectToServer(serverUrl, (phase, downloaded, total) => {
-            if (phase === 'validating') {
-              setProgress({ phase: 'extracting', percent: 5, message: 'Connecting to server...', detail: 'Validating server' });
-            } else if (phase === 'downloading') {
-              const pct = total ? Math.round((downloaded / total) * 90) + 5 : 50;
-              const mb = (downloaded / (1024 * 1024)).toFixed(1);
-              setProgress({ phase: 'extracting', percent: pct, message: 'Downloading graph...', detail: `${mb} MB downloaded` });
-            } else if (phase === 'extracting') {
-              setProgress({ phase: 'extracting', percent: 97, message: 'Processing...', detail: 'Extracting file contents' });
-            }
-          }, undefined, repoParam);
-
-          handleServerConnect(result, baseUrl);
-          setGraphViewMode('full');
-        }
-
-        // Fetch available repos for the repo switcher
-        try {
-          const repos = await fetchRepos(baseUrl);
-          setAvailableRepos(repos);
-        } catch (e) {
-          console.warn('Failed to fetch repo list:', e);
-        }
-      } catch (err) {
-        console.error('Auto-connect failed:', err);
-        setProgress({
-          phase: 'error',
-          percent: 0,
-          message: 'Failed to connect to server',
-          detail: err instanceof Error ? err.message : 'Unknown error',
-        });
-        setTimeout(() => {
-          setViewMode('onboarding');
-          setProgress(null);
-        }, 3000);
-      }
-    })();
-  }, [handleServerConnect, setProgress, setViewMode, setServerBaseUrl, setAvailableRepos, setProjectName, setGraph, setFileContents, setGraphSummary, setGraphViewMode, setExpandedGroups, initializeAgent]);
+    smartConnect(serverUrl, repoParam);
+  }, [smartConnect]);
 
   const handleFocusNode = useCallback((nodeId: string) => {
     graphCanvasRef.current?.focusNode(nodeId);
@@ -318,19 +300,7 @@ const AppContent = () => {
       <DropZone
         onFileSelect={handleFileSelect}
         onGitClone={handleGitClone}
-        onServerConnect={async (result, serverUrl) => {
-          const baseUrl = serverUrl ? normalizeServerUrl(serverUrl) : undefined;
-          handleServerConnect(result, baseUrl);
-          if (baseUrl) {
-            setServerBaseUrl(baseUrl);
-            try {
-              const repos = await fetchRepos(baseUrl);
-              setAvailableRepos(repos);
-            } catch (e) {
-              console.warn('Failed to fetch repo list:', e);
-            }
-          }
-        }}
+        onServerValidated={(serverUrl) => smartConnect(serverUrl)}
       />
     );
   }

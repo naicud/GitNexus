@@ -1,13 +1,14 @@
 import { useState, useCallback, useRef, DragEvent } from 'react';
 import { Upload, FileArchive, Github, Loader2, ArrowRight, Key, Eye, EyeOff, Globe, X } from 'lucide-react';
 import { cloneRepository, parseGitHubUrl } from '../services/git-clone';
-import { connectToServer, type ConnectToServerResult } from '../services/server-connection';
+import { connectToServer, fetchRepoInfo, normalizeServerUrl, type ConnectToServerResult } from '../services/server-connection';
 import { FileEntry } from '../services/zip';
 
 interface DropZoneProps {
   onFileSelect: (file: File) => void;
   onGitClone?: (files: FileEntry[]) => void;
   onServerConnect?: (result: ConnectToServerResult, serverUrl?: string) => void;
+  onServerValidated?: (serverUrl: string) => void;
 }
 
 function formatBytes(bytes: number): string {
@@ -16,7 +17,7 @@ function formatBytes(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
-export const DropZone = ({ onFileSelect, onGitClone, onServerConnect }: DropZoneProps) => {
+export const DropZone = ({ onFileSelect, onGitClone, onServerConnect, onServerValidated }: DropZoneProps) => {
   const [isDragging, setIsDragging] = useState(false);
   const [activeTab, setActiveTab] = useState<'zip' | 'github' | 'server'>('zip');
   const [githubUrl, setGithubUrl] = useState('');
@@ -139,10 +140,19 @@ export const DropZone = ({ onFileSelect, onGitClone, onServerConnect }: DropZone
     setIsConnecting(true);
     setServerProgress({ phase: 'validating', downloaded: 0, total: null });
 
-    const abortController = new AbortController();
-    abortControllerRef.current = abortController;
-
     try {
+      // Smart path: validate server, let parent handle LOD routing
+      if (onServerValidated) {
+        const baseUrl = normalizeServerUrl(urlToUse);
+        await fetchRepoInfo(baseUrl);
+        onServerValidated(urlToUse);
+        return;
+      }
+
+      // Legacy full-download path
+      const abortController = new AbortController();
+      abortControllerRef.current = abortController;
+
       const result = await connectToServer(
         urlToUse,
         (phase, downloaded, total) => {

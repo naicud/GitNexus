@@ -1,6 +1,6 @@
 import { useState, useCallback, useRef, useEffect } from 'react';
 import { KnowledgeGraph, GraphNode } from '../core/graph/types';
-import type { GraphSummary, HierarchyResponse, HierarchyNode } from '../services/graph-lod';
+import { fetchGraphInfo, fetchGraphSummary, type GraphSummary, type HierarchyResponse, type HierarchyNode } from '../services/graph-lod';
 import type { RepoSummary, ConnectToServerResult } from '../services/server-connection';
 import { connectToServer } from '../services/server-connection';
 import { createKnowledgeGraph } from '../core/graph/graph';
@@ -331,42 +331,82 @@ export function useGraphState(switchRepoDeps?: SwitchRepoDeps): GraphState {
     setCodeReferenceFocus(null);
 
     try {
-      const result: ConnectToServerResult = await connectToServer(serverBaseUrl, (phase, downloaded, total) => {
-        if (phase === 'validating') {
-          setProgress({ phase: 'extracting', percent: 5, message: 'Switching repository...', detail: 'Validating' });
-        } else if (phase === 'downloading') {
-          const pct = total ? Math.round((downloaded / total) * 90) + 5 : 50;
-          const mb = (downloaded / (1024 * 1024)).toFixed(1);
-          setProgress({ phase: 'extracting', percent: pct, message: 'Downloading graph...', detail: `${mb} MB downloaded` });
-        } else if (phase === 'extracting') {
-          setProgress({ phase: 'extracting', percent: 97, message: 'Processing...', detail: 'Extracting file contents' });
-        }
-      }, undefined, repoName);
+      // Check LOD mode before downloading
+      let graphMode: 'full' | 'summary' | 'hierarchy' = 'full';
+      try {
+        const graphInfo = await fetchGraphInfo(serverBaseUrl, repoName);
+        graphMode = graphInfo.mode;
+      } catch {
+        // Older server without /api/graph/info — fall back to full
+      }
 
-      const repoPath = result.repoInfo.repoPath;
-      const pName = result.repoInfo.name || repoPath.split('/').pop() || 'server-project';
-      setProjectName(pName);
+      if (graphMode === 'hierarchy') {
+        setProgress({ phase: 'extracting', percent: 90, message: 'Building hierarchy view...', detail: 'Loading folder structure' });
+        setGraph(createKnowledgeGraph());
+        setFileContents(new Map());
+        setProjectName(repoName);
+        setGraphViewMode('hierarchy');
+        setGraphSummary(null);
+        setExpandedGroups(new Map());
+        setHierarchyExpandedNodes(new Map());
+        setHierarchyBreadcrumb([]);
+        setViewMode('exploring');
+        if (getActiveProviderConfig()) initializeAgent(repoName, serverBaseUrl ?? undefined);
+      } else if (graphMode === 'summary') {
+        setProgress({ phase: 'extracting', percent: 50, message: 'Loading graph summary...', detail: 'Fetching cluster overview' });
+        const summary = await fetchGraphSummary(serverBaseUrl, repoName);
+        setProgress({ phase: 'extracting', percent: 90, message: 'Building visualization...', detail: `${summary.clusterGroups.length} cluster groups` });
+        setGraph(createKnowledgeGraph());
+        setFileContents(new Map());
+        setProjectName(repoName);
+        setGraphSummary(summary);
+        setGraphViewMode('summary');
+        setExpandedGroups(new Map());
+        setHierarchyExpandedNodes(new Map());
+        setHierarchyBreadcrumb([]);
+        setViewMode('exploring');
+        if (getActiveProviderConfig()) initializeAgent(repoName, serverBaseUrl ?? undefined);
+      } else {
+        // Full-graph path (existing behavior)
+        const result: ConnectToServerResult = await connectToServer(serverBaseUrl, (phase, downloaded, total) => {
+          if (phase === 'validating') {
+            setProgress({ phase: 'extracting', percent: 5, message: 'Switching repository...', detail: 'Validating' });
+          } else if (phase === 'downloading') {
+            const pct = total ? Math.round((downloaded / total) * 90) + 5 : 50;
+            const mb = (downloaded / (1024 * 1024)).toFixed(1);
+            setProgress({ phase: 'extracting', percent: pct, message: 'Downloading graph...', detail: `${mb} MB downloaded` });
+          } else if (phase === 'extracting') {
+            setProgress({ phase: 'extracting', percent: 97, message: 'Processing...', detail: 'Extracting file contents' });
+          }
+        }, undefined, repoName);
 
-      const newGraph = createKnowledgeGraph();
-      for (const node of result.nodes) newGraph.addNode(node);
-      for (const rel of result.relationships) newGraph.addRelationship(rel);
-      setGraph(newGraph);
+        const repoPath = result.repoInfo.repoPath;
+        const pName = result.repoInfo.name || repoPath.split('/').pop() || 'server-project';
+        setProjectName(pName);
 
-      const fileMap = new Map<string, string>();
-      for (const [p, c] of Object.entries(result.fileContents)) fileMap.set(p, c);
-      setFileContents(fileMap);
+        const newGraph = createKnowledgeGraph();
+        for (const node of result.nodes) newGraph.addNode(node);
+        for (const rel of result.relationships) newGraph.addRelationship(rel);
+        setGraph(newGraph);
 
-      setViewMode('exploring');
+        const fileMap = new Map<string, string>();
+        for (const [p, c] of Object.entries(result.fileContents)) fileMap.set(p, c);
+        setFileContents(fileMap);
 
-      if (getActiveProviderConfig()) initializeAgent(pName, serverBaseUrl ?? undefined, fileMap);
+        setGraphViewMode('full');
+        setGraphSummary(null);
+        setViewMode('exploring');
 
-      startEmbeddings().catch((err) => {
-        if (err?.name === 'WebGPUNotAvailableError' || err?.message?.includes('WebGPU')) {
-          startEmbeddings('wasm').catch(console.warn);
-        } else {
-          console.warn('Embeddings auto-start failed:', err);
-        }
-      });
+        if (getActiveProviderConfig()) initializeAgent(pName, serverBaseUrl ?? undefined, fileMap);
+
+        startEmbeddings().catch((err) => {
+          if (err?.name === 'WebGPUNotAvailableError' || err?.message?.includes('WebGPU')) {
+            startEmbeddings('wasm').catch(console.warn);
+          } else {
+            console.warn('Embeddings auto-start failed:', err);
+          }
+        });
+      }
     } catch (err) {
       console.error('Repo switch failed:', err);
       setProgress({
