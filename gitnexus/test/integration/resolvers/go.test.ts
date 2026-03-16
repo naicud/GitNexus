@@ -343,3 +343,456 @@ describe('Go local definition shadows import', () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// Constructor-inferred type resolution: user := models.User{}; user.Save()
+// Go composite literal constructor pattern (no explicit type annotations)
+// ---------------------------------------------------------------------------
+
+describe('Go constructor-inferred type resolution', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'go-constructor-type-inference'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects User and Repo structs, both with Save methods', () => {
+    expect(getNodesByLabel(result, 'Struct')).toContain('User');
+    expect(getNodesByLabel(result, 'Struct')).toContain('Repo');
+    const saveMethods = getNodesByLabel(result, 'Method').filter(m => m === 'Save');
+    expect(saveMethods.length).toBe(2);
+  });
+
+  it('resolves user.Save() to models/user.go via constructor-inferred type', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const userSave = calls.find(c => c.target === 'Save' && c.targetFilePath === 'models/user.go');
+    expect(userSave).toBeDefined();
+    expect(userSave!.source).toBe('processEntities');
+  });
+
+  it('resolves repo.Save() to models/repo.go via constructor-inferred type', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const repoSave = calls.find(c => c.target === 'Save' && c.targetFilePath === 'models/repo.go');
+    expect(repoSave).toBeDefined();
+    expect(repoSave!.source).toBe('processEntities');
+  });
+
+  it('emits exactly 2 Save() CALLS edges (one per receiver type)', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCalls = calls.filter(c => c.target === 'Save');
+    expect(saveCalls.length).toBe(2);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Pointer-constructor-inferred type resolution: user := &models.User{...}; user.Save()
+// Go address-of composite literal constructor pattern (no explicit type annotations)
+// ---------------------------------------------------------------------------
+
+describe('Go pointer-constructor-inferred type resolution', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'go-pointer-constructor-inference'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects User and Repo structs, both with Save methods', () => {
+    expect(getNodesByLabel(result, 'Struct')).toContain('User');
+    expect(getNodesByLabel(result, 'Struct')).toContain('Repo');
+    const saveMethods = getNodesByLabel(result, 'Method').filter(m => m === 'Save');
+    expect(saveMethods.length).toBe(2);
+  });
+
+  it('resolves user.Save() to models/user.go via &User{} pointer-constructor-inferred type', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const userSave = calls.find(c => c.target === 'Save' && c.targetFilePath === 'models/user.go');
+    expect(userSave).toBeDefined();
+    expect(userSave!.source).toBe('process');
+  });
+
+  it('resolves repo.Save() to models/repo.go via &Repo{} pointer-constructor-inferred type', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const repoSave = calls.find(c => c.target === 'Save' && c.targetFilePath === 'models/repo.go');
+    expect(repoSave).toBeDefined();
+    expect(repoSave!.source).toBe('process');
+  });
+
+  it('emits exactly 2 Save() CALLS edges (one per receiver type)', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCalls = calls.filter(c => c.target === 'Save');
+    expect(saveCalls.length).toBe(2);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Parent resolution: struct embedding emits EXTENDS
+// ---------------------------------------------------------------------------
+
+describe('Go parent resolution (struct embedding)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'go-parent-resolution'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects BaseModel and User structs', () => {
+    expect(getNodesByLabel(result, 'Struct')).toEqual(['BaseModel', 'User']);
+  });
+
+  it('emits EXTENDS edge: User → BaseModel (struct embedding)', () => {
+    const extends_ = getRelationships(result, 'EXTENDS');
+    expect(extends_.length).toBe(1);
+    expect(extends_[0].source).toBe('User');
+    expect(extends_[0].target).toBe('BaseModel');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Go new() builtin type inference: user := new(User); user.Save()
+// ---------------------------------------------------------------------------
+
+describe('Go new() builtin type inference', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'go-new-builtin'),
+      () => {},
+    );
+  }, 60000);
+
+  it('resolves user.Save() via new(User) inference', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCall = calls.find(c => c.target === 'Save' && c.targetFilePath === 'models.go');
+    expect(saveCall).toBeDefined();
+    expect(saveCall!.source).toBe('main');
+  });
+
+  it('resolves user.Greet() via new(User) inference', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const greetCall = calls.find(c => c.target === 'Greet' && c.targetFilePath === 'models.go');
+    expect(greetCall).toBeDefined();
+    expect(greetCall!.source).toBe('main');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Go make() builtin type inference: sl := make([]User, 0); sl[0].Save()
+// ---------------------------------------------------------------------------
+
+describe('Go make() builtin type inference', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'go-make-builtin'),
+      () => {},
+    );
+  }, 60000);
+
+  it('resolves sl[0].Save() via make([]User, 0) slice inference', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCall = calls.find(c => c.target === 'Save' && c.targetFilePath === 'models.go');
+    expect(saveCall).toBeDefined();
+    expect(saveCall!.source).toBe('main');
+  });
+
+  it('resolves m["key"].Greet() via make(map[string]User) map inference', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const greetCall = calls.find(c => c.target === 'Greet' && c.targetFilePath === 'models.go');
+    expect(greetCall).toBeDefined();
+    expect(greetCall!.source).toBe('main');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Go type assertion inference: user := s.(User); user.Save()
+// ---------------------------------------------------------------------------
+
+describe('Go type assertion type inference', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'go-type-assertion'),
+      () => {},
+    );
+  }, 60000);
+
+  it('resolves user.Save() via type assertion s.(User)', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCall = calls.find(c => c.target === 'Save' && c.targetFilePath === 'models.go');
+    expect(saveCall).toBeDefined();
+    expect(saveCall!.source).toBe('process');
+  });
+
+  it('resolves user.Greet() via type assertion s.(User)', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const greetCall = calls.find(c => c.target === 'Greet' && c.targetFilePath === 'models.go');
+    expect(greetCall).toBeDefined();
+    expect(greetCall!.source).toBe('process');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Return type inference: user := GetUser("alice"); user.Save()
+// Go now has a CONSTRUCTOR_BINDING_SCANNER for short_var_declaration, so
+// return type inference works end-to-end for `user := GetUser()`.
+// ---------------------------------------------------------------------------
+
+describe('Go return type inference via explicit function return type', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'go-return-type-inference'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects GetUser, GetRepo, and competing Save methods', () => {
+    const allSymbols = [...getNodesByLabel(result, 'Function'), ...getNodesByLabel(result, 'Method')];
+    expect(allSymbols).toContain('GetUser');
+    expect(allSymbols).toContain('GetRepo');
+    const saveMethods = allSymbols.filter(s => s === 'Save');
+    expect(saveMethods.length).toBe(2);
+  });
+
+  it('resolves user.Save() to models/user.go via return type of GetUser()', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCall = calls.find(c =>
+      c.target === 'Save' && c.source === 'processUser' && c.targetFilePath.includes('user.go')
+    );
+    expect(saveCall).toBeDefined();
+  });
+
+  it('user.Save() does NOT resolve to models/repo.go (negative disambiguation)', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const wrongSave = calls.find(c =>
+      c.target === 'Save' && c.source === 'processUser' && c.targetFilePath.includes('repo.go')
+    );
+    expect(wrongSave).toBeUndefined();
+  });
+
+  it('resolves repo.Save() to models/repo.go via return type of GetRepo()', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCall = calls.find(c =>
+      c.target === 'Save' && c.source === 'processRepo' && c.targetFilePath.includes('repo.go')
+    );
+    expect(saveCall).toBeDefined();
+  });
+
+  it('repo.Save() does NOT resolve to models/user.go (negative disambiguation)', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const wrongSave = calls.find(c =>
+      c.target === 'Save' && c.source === 'processRepo' && c.targetFilePath.includes('user.go')
+    );
+    expect(wrongSave).toBeUndefined();
+  });
+
+  it('resolves user.Save() via cross-package factory call models.NewUser()', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCall = calls.find(c =>
+      c.target === 'Save' && c.source === 'processUserCrossPackage' && c.targetFilePath.includes('user.go')
+    );
+    expect(saveCall).toBeDefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Go multi-return factory inference: user, err := NewUser("alice"); user.Save()
+// ---------------------------------------------------------------------------
+
+describe('Go multi-return factory type inference', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'go-multi-return-inference'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects User and Repo structs with competing Save methods', () => {
+    const saveMethods = getNodesByLabel(result, 'Method').filter(m => m === 'Save');
+    expect(saveMethods.length).toBe(2);
+  });
+
+  it('resolves user.Save() to models/user.go via multi-return inference (user, err := NewUser())', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const userSave = calls.find(c =>
+      c.target === 'Save' && c.source === 'processUser' && c.targetFilePath.includes('user.go')
+    );
+    expect(userSave).toBeDefined();
+  });
+
+  it('user.Save() does NOT resolve to models/repo.go', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const wrongSave = calls.find(c =>
+      c.target === 'Save' && c.source === 'processUser' && c.targetFilePath.includes('repo.go')
+    );
+    expect(wrongSave).toBeUndefined();
+  });
+
+  it('resolves repo.Save() to models/repo.go via blank discard (repo, _ := NewRepo())', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const repoSave = calls.find(c =>
+      c.target === 'Save' && c.source === 'processRepo' && c.targetFilePath.includes('repo.go')
+    );
+    expect(repoSave).toBeDefined();
+  });
+
+  it('repo.Save() does NOT resolve to models/user.go', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const wrongSave = calls.find(c =>
+      c.target === 'Save' && c.source === 'processRepo' && c.targetFilePath.includes('user.go')
+    );
+    expect(wrongSave).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Nullable receiver: var user *models.User = findUser(); user.Save()
+// Go pointer types (*User) — extractSimpleTypeName strips pointer prefix.
+// ---------------------------------------------------------------------------
+
+describe('Go nullable receiver resolution (pointer types)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'go-nullable-receiver'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects User and Repo structs, both with Save methods', () => {
+    expect(getNodesByLabel(result, 'Struct')).toContain('User');
+    expect(getNodesByLabel(result, 'Struct')).toContain('Repo');
+    const saveMethods = getNodesByLabel(result, 'Method').filter(m => m === 'Save');
+    expect(saveMethods.length).toBe(2);
+  });
+
+  it('resolves user.Save() to User.Save via pointer receiver typing', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const userSave = calls.find(c => c.target === 'Save' && c.targetFilePath === 'models/user.go');
+    expect(userSave).toBeDefined();
+    expect(userSave!.source).toBe('processEntities');
+  });
+
+  it('resolves repo.Save() to Repo.Save via pointer receiver typing', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const repoSave = calls.find(c => c.target === 'Save' && c.targetFilePath === 'models/repo.go');
+    expect(repoSave).toBeDefined();
+    expect(repoSave!.source).toBe('processEntities');
+  });
+
+  it('user.Save() does NOT resolve to Repo.Save (negative disambiguation)', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCalls = calls.filter(c => c.target === 'Save' && c.source === 'processEntities');
+    expect(saveCalls.filter(c => c.targetFilePath === 'models/user.go').length).toBe(1);
+    expect(saveCalls.filter(c => c.targetFilePath === 'models/repo.go').length).toBe(1);
+  });
+
+  it('emits exactly 2 Save() CALLS edges (one per receiver type)', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCalls = calls.filter(c => c.target === 'Save');
+    expect(saveCalls.length).toBe(2);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Assignment chain propagation (Phase 4.3)
+// ---------------------------------------------------------------------------
+
+describe('Go assignment chain propagation', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'go-assignment-chain'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects User and Repo structs each with a Save method', () => {
+    expect(getNodesByLabel(result, 'Struct')).toContain('User');
+    expect(getNodesByLabel(result, 'Struct')).toContain('Repo');
+    const saveMethods = getNodesByLabel(result, 'Method').filter(m => m === 'Save');
+    expect(saveMethods.length).toBe(2);
+  });
+
+  it('resolves alias.Save() to User#Save via assignment chain', () => {
+    const calls = getRelationships(result, 'CALLS');
+    // Positive: alias.Save() must resolve to User#Save
+    const userSave = calls.find(c =>
+      c.target === 'Save' && c.source === 'processEntities' && c.targetFilePath.includes('user.go'),
+    );
+    expect(userSave).toBeDefined();
+  });
+
+  it('alias.Save() does NOT resolve to Repo#Save', () => {
+    const calls = getRelationships(result, 'CALLS');
+    // Negative: alias comes from User, so only one edge to user.go
+    const wrongCall = calls.filter(c =>
+      c.target === 'Save' && c.source === 'processEntities' && c.targetFilePath.includes('user.go'),
+    );
+    expect(wrongCall.length).toBe(1);
+  });
+
+  it('resolves rAlias.Save() to Repo#Save via assignment chain', () => {
+    const calls = getRelationships(result, 'CALLS');
+    // Positive: rAlias.Save() must resolve to Repo#Save
+    const repoSave = calls.find(c =>
+      c.target === 'Save' && c.source === 'processEntities' && c.targetFilePath.includes('repo.go'),
+    );
+    expect(repoSave).toBeDefined();
+  });
+
+  it('each alias resolves to its own struct, not the other', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const userSave = calls.find(c =>
+      c.target === 'Save' && c.source === 'processEntities' && c.targetFilePath.includes('user.go'),
+    );
+    const repoSave = calls.find(c =>
+      c.target === 'Save' && c.source === 'processEntities' && c.targetFilePath.includes('repo.go'),
+    );
+    expect(userSave).toBeDefined();
+    expect(repoSave).toBeDefined();
+    expect(userSave!.targetFilePath).not.toBe(repoSave!.targetFilePath);
+  });
+
+  // --- var form assignment chain ---
+
+  it('resolves var alias.Save() to User via var assignment chain', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const userSave = calls.find(c =>
+      c.target === 'Save' && c.source === 'processWithVar' && c.targetFilePath.includes('user.go'),
+    );
+    expect(userSave).toBeDefined();
+  });
+
+  it('resolves var rAlias.Save() to Repo via var assignment chain', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const repoSave = calls.find(c =>
+      c.target === 'Save' && c.source === 'processWithVar' && c.targetFilePath.includes('repo.go'),
+    );
+    expect(repoSave).toBeDefined();
+  });
+
+  it('var alias.Save() does NOT resolve to Repo (negative)', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const userSaves = calls.filter(c =>
+      c.target === 'Save' && c.source === 'processWithVar' && c.targetFilePath.includes('user.go'),
+    );
+    expect(userSaves.length).toBe(1);
+  });
+});

@@ -234,6 +234,49 @@ describe('C++ receiver-constrained resolution', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Constructor-inferred type resolution: auto user = User(); user.save() → User.save
+// Cross-file SymbolTable verification (no explicit type annotations)
+// ---------------------------------------------------------------------------
+
+describe('C++ constructor-inferred type resolution', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'cpp-constructor-type-inference'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects User and Repo classes, both with save methods', () => {
+    expect(getNodesByLabel(result, 'Class')).toContain('User');
+    expect(getNodesByLabel(result, 'Class')).toContain('Repo');
+    const saveMethods = getNodesByLabel(result, 'Method').filter(m => m === 'save');
+    expect(saveMethods.length).toBe(2);
+  });
+
+  it('resolves user.save() to models/User.h via constructor-inferred type', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const userSave = calls.find(c => c.target === 'save' && c.targetFilePath === 'models/User.h');
+    expect(userSave).toBeDefined();
+    expect(userSave!.source).toBe('processEntities');
+  });
+
+  it('resolves repo.save() to models/Repo.h via constructor-inferred type', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const repoSave = calls.find(c => c.target === 'save' && c.targetFilePath === 'models/Repo.h');
+    expect(repoSave).toBeDefined();
+    expect(repoSave!.source).toBe('processEntities');
+  });
+
+  it('emits exactly 2 save() CALLS edges (one per receiver type)', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCalls = calls.filter(c => c.target === 'save');
+    expect(saveCalls.length).toBe(2);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Variadic resolution: C-style variadic (...) doesn't get filtered by arity
 // ---------------------------------------------------------------------------
 
@@ -284,3 +327,326 @@ describe('C++ local definition shadows import', () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// this->save() resolves to enclosing class's own save method
+// ---------------------------------------------------------------------------
+
+describe('C++ this resolution', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'cpp-self-this-resolution'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects User and Repo classes, each with a save method', () => {
+    expect(getNodesByLabel(result, 'Class')).toContain('User');
+    expect(getNodesByLabel(result, 'Class')).toContain('Repo');
+    const saveMethods = getNodesByLabel(result, 'Method').filter(m => m === 'save');
+    expect(saveMethods.length).toBe(2);
+  });
+
+  it('resolves this->save() to User::save in the same file (not Repo::save)', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCall = calls.find(c => c.target === 'save');
+    expect(saveCall).toBeDefined();
+    expect(saveCall!.targetFilePath).toBe('src/User.cpp');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Parent class resolution: EXTENDS via base_class_clause
+// ---------------------------------------------------------------------------
+
+describe('C++ parent resolution', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'cpp-parent-resolution'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects BaseModel and User classes', () => {
+    expect(getNodesByLabel(result, 'Class')).toContain('BaseModel');
+    expect(getNodesByLabel(result, 'Class')).toContain('User');
+  });
+
+  it('emits EXTENDS edge: User → BaseModel (base_class_clause)', () => {
+    const extends_ = getRelationships(result, 'EXTENDS');
+    expect(extends_.length).toBe(1);
+    expect(extends_[0].source).toBe('User');
+    expect(extends_[0].target).toBe('BaseModel');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Brace-init constructor inference: auto x = User{}; x.save() → User.save
+// ---------------------------------------------------------------------------
+
+describe('C++ brace-init constructor inference', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'cpp-brace-init-inference'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects User and Repo classes, both with save methods', () => {
+    expect(getNodesByLabel(result, 'Class')).toEqual(['Repo', 'User']);
+    const saveMethods = getNodesByLabel(result, 'Method').filter(m => m === 'save');
+    expect(saveMethods.length).toBe(2);
+  });
+
+  it('resolves user.save() to User.save via brace-init', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const userSave = calls.find(c => c.target === 'save' && c.targetFilePath === 'models/User.h');
+    expect(userSave).toBeDefined();
+  });
+
+  it('resolves repo.save() to Repo.save via brace-init', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const repoSave = calls.find(c => c.target === 'save' && c.targetFilePath === 'models/Repo.h');
+    expect(repoSave).toBeDefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// C++ scoped brace-init: auto x = ns::HttpClient{}
+// ---------------------------------------------------------------------------
+
+describe('C++ scoped brace-init resolution (ns::Type{})', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'cpp-scoped-brace-init'),
+      () => {},
+    );
+  }, 60000);
+
+  it('resolves client.connect() via ns::HttpClient{} scoped brace-init', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const connectCall = calls.find(c => c.target === 'connect' && c.targetFilePath === 'models.h');
+    expect(connectCall).toBeDefined();
+    expect(connectCall!.source).toBe('run');
+  });
+
+  it('resolves client.send() via ns::HttpClient{} scoped brace-init', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const sendCall = calls.find(c => c.target === 'send' && c.targetFilePath === 'models.h');
+    expect(sendCall).toBeDefined();
+    expect(sendCall!.source).toBe('run');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Range-for with explicit type: for (User& user : users) { user.save(); }
+// ---------------------------------------------------------------------------
+
+describe('C++ range-for explicit type resolution', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'cpp-range-for'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects User class and save method', () => {
+    expect(getNodesByLabel(result, 'Class')).toContain('User');
+    expect(getNodesByLabel(result, 'Method')).toContain('save');
+  });
+
+  it('resolves user.save() inside range-for to User.save via explicit type', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCall = calls.find(c => c.target === 'save' && c.targetFilePath === 'user.h');
+    expect(saveCall).toBeDefined();
+    expect(saveCall!.source).toBe('processUsers');
+  });
+
+  it('emits HAS_METHOD edge from User to save', () => {
+    const hasMethod = getRelationships(result, 'HAS_METHOD');
+    const edge = hasMethod.find(e => e.source === 'User' && e.target === 'save');
+    expect(edge).toBeDefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Return type inference: auto user = getUser("alice"); user.save()
+// C++'s CONSTRUCTOR_BINDING_SCANNER captures auto declarations with
+// call_expression values, enabling return type inference from function results.
+// ---------------------------------------------------------------------------
+
+describe('C++ return type inference via auto + function call', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'cpp-return-type'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects User class and getUser function', () => {
+    expect(getNodesByLabel(result, 'Class')).toContain('User');
+    expect(getNodesByLabel(result, 'Function')).toContain('getUser');
+  });
+
+  it('detects save method on User', () => {
+    const methods = getNodesByLabel(result, 'Method');
+    expect(methods).toContain('save');
+  });
+
+  it('resolves user.save() to User#save via return type of getUser(): User', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCall = calls.find(c =>
+      c.target === 'save' && c.source === 'processUser' && c.targetFilePath.includes('user.h'),
+    );
+    expect(saveCall).toBeDefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Return-type inference with competing methods:
+// Two classes both have save(), factory functions disambiguate via return type
+// ---------------------------------------------------------------------------
+
+describe('C++ return-type inference via function return type', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'cpp-return-type-inference'),
+      () => {},
+    );
+  }, 60000);
+
+  it('resolves user.save() to User#save via return type of getUser()', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCall = calls.find(c =>
+      c.target === 'save' && c.source === 'processUser' && c.targetFilePath.includes('user.h')
+    );
+    expect(saveCall).toBeDefined();
+  });
+
+  it('user.save() does NOT resolve to Repo#save', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const wrongSave = calls.find(c =>
+      c.target === 'save' && c.source === 'processUser'
+    );
+    // Should resolve to exactly one target — if it resolves at all, check it's the right one
+    if (wrongSave) {
+      expect(wrongSave.targetFilePath).toContain('user.h');
+    }
+  });
+
+  it('resolves repo.save() to Repo#save via return type of getRepo()', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCall = calls.find(c =>
+      c.target === 'save' && c.source === 'processRepo' && c.targetFilePath.includes('repo.h')
+    );
+    expect(saveCall).toBeDefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Nullable receiver unwrapping: User* pointer type stripped for resolution
+// ---------------------------------------------------------------------------
+
+describe('C++ nullable receiver resolution (pointer types)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'cpp-nullable-receiver'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects User and Repo classes with competing save methods', () => {
+    expect(getNodesByLabel(result, 'Class')).toContain('User');
+    expect(getNodesByLabel(result, 'Class')).toContain('Repo');
+    const saveMethods = getNodesByLabel(result, 'Method').filter((m: string) => m === 'save');
+    expect(saveMethods.length).toBe(2);
+  });
+
+  it('resolves user->save() to User#save via pointer receiver typing', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const userSave = calls.find(c =>
+      c.target === 'save' && c.source === 'processEntities' && c.targetFilePath.includes('User.h'),
+    );
+    expect(userSave).toBeDefined();
+  });
+
+  it('resolves repo->save() to Repo#save via pointer receiver typing', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const repoSave = calls.find(c =>
+      c.target === 'save' && c.source === 'processEntities' && c.targetFilePath.includes('Repo.h'),
+    );
+    expect(repoSave).toBeDefined();
+  });
+
+  it('does NOT cross-contaminate (exactly 1 save per receiver file)', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCalls = calls.filter(c => c.target === 'save' && c.source === 'processEntities');
+    const userTargeted = saveCalls.filter(c => c.targetFilePath.includes('User.h'));
+    const repoTargeted = saveCalls.filter(c => c.targetFilePath.includes('Repo.h'));
+    expect(userTargeted.length).toBe(1);
+    expect(repoTargeted.length).toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// C++ assignment chain propagation: auto alias = u; alias.save()
+// Tests extractPendingAssignment for C++ auto declarations.
+// ---------------------------------------------------------------------------
+
+describe('C++ assignment chain propagation (auto alias)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'cpp-assignment-chain'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects User and Repo classes each with a save method', () => {
+    expect(getNodesByLabel(result, 'Class')).toContain('User');
+    expect(getNodesByLabel(result, 'Class')).toContain('Repo');
+    const saveMethods = getNodesByLabel(result, 'Method').filter(m => m === 'save');
+    expect(saveMethods.length).toBe(2);
+  });
+
+  it('resolves alias.save() to User#save via auto assignment chain', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const userSave = calls.find(c =>
+      c.target === 'save' && c.source === 'processEntities' && c.targetFilePath?.includes('User.h'),
+    );
+    expect(userSave).toBeDefined();
+  });
+
+  it('resolves rAlias.save() to Repo#save via auto assignment chain', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const repoSave = calls.find(c =>
+      c.target === 'save' && c.source === 'processEntities' && c.targetFilePath?.includes('Repo.h'),
+    );
+    expect(repoSave).toBeDefined();
+  });
+
+  it('each alias resolves to its own class, not the other', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCalls = calls.filter(c => c.target === 'save' && c.source === 'processEntities');
+    const userTargeted = saveCalls.filter(c => c.targetFilePath?.includes('User.h'));
+    const repoTargeted = saveCalls.filter(c => c.targetFilePath?.includes('Repo.h'));
+    expect(userTargeted.length).toBe(1);
+    expect(repoTargeted.length).toBe(1);
+  });
+});

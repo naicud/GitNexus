@@ -5,11 +5,11 @@
  * KuzuDB remains the default; Neptune is an optional AWS-managed alternative.
  */
 
-export type DbType = 'kuzu' | 'neptune';
+export type DbType = 'lbug' | 'neptune';
 
-export interface KuzuDbConfig {
-  type: 'kuzu';
-  kuzuPath: string;
+export interface LbugDbConfig {
+  type: 'lbug';
+  lbugPath: string;
 }
 
 export interface NeptuneDbConfig {
@@ -22,7 +22,7 @@ export interface NeptuneDbConfig {
   port: number;
 }
 
-export type DbConfig = KuzuDbConfig | NeptuneDbConfig;
+export type DbConfig = LbugDbConfig | NeptuneDbConfig;
 
 /**
  * Minimal query interface implemented by all DB adapters.

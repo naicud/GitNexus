@@ -1,9 +1,10 @@
 import type { SyntaxNode } from '../utils.js';
-import type { LanguageTypeConfig, ParameterExtractor, TypeBindingExtractor } from './types.js';
+import type { LanguageTypeConfig, ParameterExtractor, TypeBindingExtractor, InitializerExtractor, ClassNameLookup, ConstructorBindingScanner, PendingAssignmentExtractor } from './types.js';
 import { extractSimpleTypeName, extractVarName } from './shared.js';
 
 const DECLARATION_NODE_TYPES: ReadonlySet<string> = new Set([
   'assignment',
+  'named_expression',
 ]);
 
 /** Python: x: Foo = ... (PEP 484 annotations) */
@@ -14,7 +15,12 @@ const extractDeclaration: TypeBindingExtractor = (node: SyntaxNode, env: Map<str
   const typeNode = node.childForFieldName('type');
   if (!left || !typeNode) return;
   const varName = extractVarName(left);
-  const typeName = extractSimpleTypeName(typeNode);
+  // extractSimpleTypeName handles identifiers and qualified names.
+  // Python 3.10+ union syntax `User | None` is parsed as binary_operator,
+  // which extractSimpleTypeName doesn't handle. Fall back to raw text so
+  // stripNullable can process it at lookup time (e.g., "User | None" → "User").
+  const inner = typeNode.type === 'type' ? (typeNode.firstNamedChild ?? typeNode) : typeNode;
+  const typeName = extractSimpleTypeName(inner) ?? inner.text;
   if (varName && typeName) env.set(varName, typeName);
 };
 
@@ -37,8 +43,98 @@ const extractParameter: ParameterExtractor = (node: SyntaxNode, env: Map<string,
   if (varName && typeName) env.set(varName, typeName);
 };
 
+/** Python: user = User("alice") — infer type from call when callee is a known class.
+ *  Python constructors are syntactically identical to function calls, so we verify
+ *  against classNames (which may include cross-file SymbolTable lookups).
+ *  Also handles walrus operator: if (user := User("alice")): */
+const extractInitializer: InitializerExtractor = (node: SyntaxNode, env: Map<string, string>, classNames: ClassNameLookup): void => {
+  let left: SyntaxNode | null;
+  let right: SyntaxNode | null;
+
+  if (node.type === 'named_expression') {
+    // Walrus operator: (user := User("alice"))
+    // tree-sitter-python: named_expression has 'name' and 'value' fields
+    left = node.childForFieldName('name');
+    right = node.childForFieldName('value');
+  } else if (node.type === 'assignment') {
+    left = node.childForFieldName('left');
+    right = node.childForFieldName('right');
+    // Skip if already has type annotation — extractDeclaration handled it
+    if (node.childForFieldName('type')) return;
+  } else {
+    return;
+  }
+
+  if (!left || !right) return;
+  const varName = extractVarName(left);
+  if (!varName || env.has(varName)) return;
+  if (right.type !== 'call') return;
+  const func = right.childForFieldName('function');
+  if (!func) return;
+  // Support both direct calls (User()) and qualified calls (models.User())
+  // tree-sitter-python: direct → identifier, qualified → attribute
+  const calleeName = extractSimpleTypeName(func);
+  if (!calleeName) return;
+  if (classNames.has(calleeName)) {
+    env.set(varName, calleeName);
+  }
+};
+
+/** Python: user = User("alice") — scan assignment/walrus for constructor-like calls.
+ *  Returns {varName, calleeName} without checking classNames (caller validates). */
+const scanConstructorBinding: ConstructorBindingScanner = (node) => {
+  let left: SyntaxNode | null;
+  let right: SyntaxNode | null;
+
+  if (node.type === 'named_expression') {
+    left = node.childForFieldName('name');
+    right = node.childForFieldName('value');
+  } else if (node.type === 'assignment') {
+    left = node.childForFieldName('left');
+    right = node.childForFieldName('right');
+    if (node.childForFieldName('type')) return undefined;
+  } else {
+    return undefined;
+  }
+
+  if (!left || !right) return undefined;
+  if (left.type !== 'identifier') return undefined;
+  if (right.type !== 'call') return undefined;
+  const func = right.childForFieldName('function');
+  if (!func) return undefined;
+  const calleeName = extractSimpleTypeName(func);
+  if (!calleeName) return undefined;
+  return { varName: left.text, calleeName };
+};
+
+/** Python: alias = u → assignment with left/right fields.
+ *  Also handles walrus operator: alias := u → named_expression with name/value fields. */
+const extractPendingAssignment: PendingAssignmentExtractor = (node, scopeEnv) => {
+  let left: SyntaxNode | null;
+  let right: SyntaxNode | null;
+
+  if (node.type === 'assignment') {
+    left = node.childForFieldName('left');
+    right = node.childForFieldName('right');
+  } else if (node.type === 'named_expression') {
+    left = node.childForFieldName('name');
+    right = node.childForFieldName('value');
+  } else {
+    return undefined;
+  }
+
+  if (!left || !right) return undefined;
+  const lhs = left.type === 'identifier' ? left.text : undefined;
+  if (!lhs || scopeEnv.has(lhs)) return undefined;
+  if (right.type === 'identifier') return { lhs, rhs: right.text };
+  return undefined;
+};
+
 export const typeConfig: LanguageTypeConfig = {
   declarationNodeTypes: DECLARATION_NODE_TYPES,
   extractDeclaration,
   extractParameter,
+  extractInitializer,
+  scanConstructorBinding,
+  extractPendingAssignment,
 };

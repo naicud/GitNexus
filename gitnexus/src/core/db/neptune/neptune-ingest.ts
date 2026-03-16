@@ -317,7 +317,7 @@ export async function loadEmbeddingsToNeptune(
 }
 
 /**
- * Fetch node/edge counts from Neptune (equivalent to getKuzuStats).
+ * Fetch node/edge counts from Neptune (equivalent to getLbugStats).
  */
 export async function getNeptuneStats(
   config: NeptuneDbConfig,

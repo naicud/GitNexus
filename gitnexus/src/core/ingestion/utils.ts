@@ -125,7 +125,7 @@ export const BUILT_IN_NAMES = new Set([
   'print', 'len', 'range', 'str', 'int', 'float', 'list', 'dict', 'set', 'tuple',
   'append', 'extend', 'update',
   // NOTE: 'open', 'read', 'write', 'close' removed — these are real C POSIX syscalls
-  'super', 'type', 'isinstance', 'issubclass', 'getattr', 'setattr', 'hasattr',
+  'type', 'isinstance', 'issubclass', 'getattr', 'setattr', 'hasattr',
   'enumerate', 'zip', 'sorted', 'reversed', 'min', 'max', 'sum', 'abs',
   // Kotlin stdlib
   'println', 'print', 'readLine', 'require', 'requireNotNull', 'check', 'assert', 'lazy', 'error',
@@ -280,6 +280,9 @@ export const CLASS_CONTAINER_TYPES = new Set([
   // Ruby
   'class',
   'module',
+  // Kotlin
+  'object_declaration',
+  'companion_object',
 ]);
 
 export const CONTAINER_TYPE_TO_LABEL: Record<string, string> = {
@@ -297,6 +300,8 @@ export const CONTAINER_TYPE_TO_LABEL: Record<string, string> = {
   protocol_declaration: 'Interface',
   class: 'Class',
   module: 'Module',
+  object_declaration: 'Class',
+  companion_object: 'Class',
 };
 
 /** Walk up AST to find enclosing class/struct/interface/impl, return its generateId or null.
@@ -706,9 +711,19 @@ export const extractMethodSignature = (node: SyntaxNode | null | undefined): Met
   // Go: 'result' field is either a type_identifier or parameter_list (multi-return)
   const goResult = node.childForFieldName?.('result');
   if (goResult) {
-    returnType = goResult.type === 'parameter_list'
-      ? goResult.text   // multi-return: "(string, error)"
-      : goResult.text;  // single return: "int"
+    if (goResult.type === 'parameter_list') {
+      // Multi-return: extract first parameter's type only (e.g. (*User, error) → *User)
+      const firstParam = goResult.firstNamedChild;
+      if (firstParam?.type === 'parameter_declaration') {
+        const typeNode = firstParam.childForFieldName('type');
+        if (typeNode) returnType = typeNode.text;
+      } else if (firstParam) {
+        // Unnamed return types: (string, error) — first child is a bare type node
+        returnType = firstParam.text;
+      }
+    } else {
+      returnType = goResult.text;
+    }
   }
 
   // Rust: 'return_type' field — the value IS the type node (e.g. primitive_type, type_identifier).
@@ -728,12 +743,39 @@ export const extractMethodSignature = (node: SyntaxNode | null | undefined): Met
     }
   }
 
+  // C#: 'returns' field on method_declaration
+  if (!returnType) {
+    const csReturn = node.childForFieldName?.('returns');
+    if (csReturn && csReturn.text !== 'void') {
+      returnType = csReturn.text;
+    }
+  }
+
   // TS/Rust/Python/C#/Kotlin: type_annotation or return_type child
   if (!returnType) {
     for (const child of node.children) {
       if (child.type === 'type_annotation' || child.type === 'return_type') {
         const typeNode = child.children.find((c) => c.isNamed);
         if (typeNode) returnType = typeNode.text;
+      }
+    }
+  }
+
+  // Kotlin: fun getUser(): User — return type is a bare user_type child of
+  // function_declaration. The Kotlin grammar does NOT wrap it in type_annotation
+  // or return_type; it appears as a direct child after function_value_parameters.
+  // Note: Kotlin uses function_value_parameters (not a field), so we find it by type.
+  if (!returnType) {
+    let paramsEnd = -1;
+    for (let i = 0; i < node.childCount; i++) {
+      const child = node.child(i);
+      if (!child) continue;
+      if (child.type === 'function_value_parameters' || child.type === 'value_parameters') {
+        paramsEnd = child.endIndex;
+      }
+      if (paramsEnd >= 0 && child.type === 'user_type' && child.startIndex > paramsEnd) {
+        returnType = child.text;
+        break;
       }
     }
   }
@@ -789,6 +831,7 @@ const MEMBER_ACCESS_NODE_TYPES = new Set([
   'field_expression',            // Rust/C++: obj.method() / ptr->method()
   'selector_expression',         // Go: obj.Method()
   'navigation_suffix',           // Kotlin/Swift: obj.method() — nameNode sits inside navigation_suffix
+  'member_binding_expression',   // C#: user?.Method() — null-conditional access
 ]);
 
 /**
@@ -880,6 +923,11 @@ const SIMPLE_RECEIVER_TYPES = new Set([
   'name',              // PHP name node
   'this',              // TS/JS/Java/C# this.method()
   'self',              // Rust/Python self.method()
+  'super',             // TS/JS/Java/Kotlin/Ruby super.method()
+  'super_expression',  // Kotlin wraps super in super_expression
+  'base',              // C# base.Method()
+  'parent',            // PHP parent::method()
+  'constant',          // Ruby CONSTANT.method() (uppercase identifiers)
 ]);
 
 export const extractReceiverName = (
@@ -917,6 +965,25 @@ export const extractReceiverName = (
     receiver = parent.childForFieldName('receiver');
   }
 
+  // PHP scoped_call_expression (parent::method(), self::method()):
+  // nameNode's direct parent IS the scoped_call_expression (name is a direct child)
+  if (!receiver && (parent.type === 'scoped_call_expression' || callNode.type === 'scoped_call_expression')) {
+    const scopedCall = parent.type === 'scoped_call_expression' ? parent : callNode;
+    receiver = scopedCall.childForFieldName('scope');
+    // relative_scope wraps 'parent'/'self'/'static' — unwrap to get the keyword
+    if (receiver?.type === 'relative_scope') {
+      receiver = receiver.firstChild;
+    }
+  }
+
+  // C# null-conditional: user?.Save() → conditional_access_expression wraps member_binding_expression
+  if (!receiver && parent.type === 'member_binding_expression') {
+    const condAccess = parent.parent;
+    if (condAccess?.type === 'conditional_access_expression') {
+      receiver = condAccess.firstNamedChild;
+    }
+  }
+
   // Kotlin/Swift: navigation_expression target is the first child
   if (!receiver && parent.type === 'navigation_suffix') {
     const navExpr = parent.parent;
@@ -936,6 +1003,12 @@ export const extractReceiverName = (
   // Only capture simple identifiers — refuse complex expressions
   if (SIMPLE_RECEIVER_TYPES.has(receiver.type)) {
     return receiver.text;
+  }
+
+  // Python super().method(): receiver is a call node `super()` — extract the function name
+  if (receiver.type === 'call') {
+    const func = receiver.childForFieldName('function');
+    if (func?.text === 'super') return 'super';
   }
 
   return undefined;

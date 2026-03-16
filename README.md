@@ -51,7 +51,7 @@ https://github.com/user-attachments/assets/172685ba-8e54-4ea7-9ad1-e31a3398da72
 | **For**     | Daily development with Cursor, Claude Code, Windsurf, OpenCode | Quick exploration, demos, one-off analysis                   |
 | **Scale**   | Full repos, any size                                           | Limited by browser memory (~5k files), or unlimited via backend mode |
 | **Install** | `npm install -g gitnexus`                                    | No install —[gitnexus.vercel.app](https://gitnexus.vercel.app) |
-| **Storage** | KuzuDB native (fast, persistent)                               | KuzuDB WASM (in-memory, per session)                         |
+| **Storage** | LadybugDB native (fast, persistent)                               | LadybugDB WASM (in-memory, per session)                         |
 | **Parsing** | Tree-sitter native bindings                                    | Tree-sitter WASM                                             |
 | **Privacy** | Everything local, no network                                   | Everything in-browser, no server                             |
 
@@ -224,8 +224,8 @@ flowchart TD
         Server["server.ts"]
         Backend["LocalBackend"]
         Pool["Connection Pool"]
-        ConnA["KuzuDB conn A"]
-        ConnB["KuzuDB conn B"]
+        ConnA["LadybugDB conn A"]
+        ConnB["LadybugDB conn B"]
     end
 
     Setup -->|"writes global MCP config"| CursorConfig["~/.cursor/mcp.json"]
@@ -242,7 +242,7 @@ flowchart TD
     ConnB -->|"queries"| RepoB
 ```
 
-**How it works:** Each `gitnexus analyze` stores the index in `.gitnexus/` inside the repo (portable, gitignored) and registers a pointer in `~/.gitnexus/registry.json`. When an AI agent starts, the MCP server reads the registry and can serve any indexed repo. KuzuDB connections are opened lazily on first query and evicted after 5 minutes of inactivity (max 5 concurrent). If only one repo is indexed, the `repo` parameter is optional on all tools — agents don't need to change anything.
+**How it works:** Each `gitnexus analyze` stores the index in `.gitnexus/` inside the repo (portable, gitignored) and registers a pointer in `~/.gitnexus/registry.json`. When an AI agent starts, the MCP server reads the registry and can serve any indexed repo. LadybugDB connections are opened lazily on first query and evicted after 5 minutes of inactivity (max 5 concurrent). If only one repo is indexed, the `repo` parameter is optional on all tools — agents don't need to change anything.
 
 ---
 
@@ -263,7 +263,7 @@ npm install
 npm run dev
 ```
 
-The web UI uses the same indexing pipeline as the CLI but runs entirely in WebAssembly (Tree-sitter WASM, KuzuDB WASM, in-browser embeddings). It's great for quick exploration but limited by browser memory for larger repos.
+The web UI uses the same indexing pipeline as the CLI but runs entirely in WebAssembly (Tree-sitter WASM, LadybugDB WASM, in-browser embeddings). It's great for quick exploration but limited by browser memory for larger repos.
 
 **Local Backend Mode:** Run `gitnexus serve` and open the web UI locally — it auto-detects the server and shows all your indexed repos, with full AI chat support. No need to re-upload or re-index. The agent's tools (Cypher queries, search, code navigation) route through the backend HTTP API automatically.
 
@@ -320,14 +320,30 @@ GitNexus builds a complete knowledge graph of your codebase through a multi-phas
 
 1. **Structure** — Walks the file tree and maps folder/file relationships
 2. **Parsing** — Extracts functions, classes, methods, and interfaces using Tree-sitter ASTs
-3. **Resolution** — Resolves imports and function calls across files with language-aware logic
+3. **Resolution** — Resolves imports, function calls, heritage, constructor inference, and `self`/`this` receiver types across files with language-aware logic
 4. **Clustering** — Groups related symbols into functional communities
 5. **Processes** — Traces execution flows from entry points through call chains
 6. **Search** — Builds hybrid search indexes for fast retrieval
 
 ### Supported Languages
 
-TypeScript, JavaScript, Python, Java, Kotlin, C, C++, C#, Go, Ruby, Rust, PHP, Swift
+| Language | Imports | Named Bindings | Exports | Heritage | Type Annotations | Constructor Inference | Config | Frameworks | Entry Points |
+|----------|---------|----------------|---------|----------|-----------------|---------------------|--------|------------|-------------|
+| TypeScript | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| JavaScript | ✓ | ✓ | ✓ | ✓ | — | ✓ | ✓ | ✓ | ✓ |
+| Python | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Java | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | — | ✓ | ✓ |
+| Kotlin | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | — | ✓ | ✓ |
+| C# | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Go | ✓ | — | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Rust | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | — | ✓ | ✓ |
+| PHP | ✓ | ✓ | ✓ | — | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Ruby | ✓ | — | ✓ | ✓ | — | ✓ | — | ✓ | ✓ |
+| Swift | — | — | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| C | — | — | ✓ | — | ✓ | ✓ | — | ✓ | ✓ |
+| C++ | — | — | ✓ | ✓ | ✓ | ✓ | — | ✓ | ✓ |
+
+**Imports** — cross-file import resolution · **Named Bindings** — `import { X as Y }` / re-export tracking · **Exports** — public/exported symbol detection · **Heritage** — class inheritance, interfaces, mixins · **Type Annotations** — explicit type extraction for receiver resolution · **Constructor Inference** — infer receiver type from constructor calls (`self`/`this` resolution included for all languages) · **Config** — language toolchain config parsing (tsconfig, go.mod, etc.) · **Frameworks** — AST-based framework pattern detection · **Entry Points** — entry point scoring heuristics
 
 ---
 
@@ -466,7 +482,7 @@ The wiki generator reads the indexed graph structure, groups files into modules 
 | ------------------------- | ------------------------------------- | --------------------------------------- |
 | **Runtime**         | Node.js (native)                      | Browser (WASM)                          |
 | **Parsing**         | Tree-sitter native bindings           | Tree-sitter WASM                        |
-| **Database**        | KuzuDB native                         | KuzuDB WASM                             |
+| **Database**        | LadybugDB native                         | LadybugDB WASM                             |
 | **Embeddings**      | HuggingFace transformers.js (GPU/CPU) | transformers.js (WebGPU/WASM)           |
 | **Search**          | BM25 + semantic + RRF                 | BM25 + semantic + RRF                   |
 | **Agent Interface** | MCP (stdio)                           | LangChain ReAct agent                   |
@@ -487,9 +503,10 @@ The wiki generator reads the indexed graph structure, groups files into modules 
 
 ### Recently Completed
 
+- [X] Constructor-Inferred Type Resolution, `self`/`this` Receiver Mapping
 - [X] Wiki Generation, Multi-File Rename, Git-Diff Impact Analysis
 - [X] Process-Grouped Search, 360-Degree Context, Claude Code Hooks
-- [X] Multi-Repo MCP, Zero-Config Setup, 11 Language Support
+- [X] Multi-Repo MCP, Zero-Config Setup, 13 Language Support
 - [X] Community Detection, Process Detection, Confidence Scoring
 - [X] Hybrid Search, Vector Index
 
@@ -506,7 +523,7 @@ The wiki generator reads the indexed graph structure, groups files into modules 
 ## Acknowledgments
 
 - [Tree-sitter](https://tree-sitter.github.io/) — AST parsing
-- [KuzuDB](https://kuzudb.com/) — Embedded graph database with vector support
+- [LadybugDB](https://ladybugdb.com/) — Embedded graph database with vector support (formerly KuzuDB)
 - [Sigma.js](https://www.sigmajs.org/) — WebGL graph rendering
 - [transformers.js](https://huggingface.co/docs/transformers.js) — Browser ML
 - [Graphology](https://graphology.github.io/) — Graph data structures

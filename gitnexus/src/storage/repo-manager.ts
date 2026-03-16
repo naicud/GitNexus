@@ -28,7 +28,7 @@ export interface RepoMeta {
 export interface IndexedRepo {
   repoPath: string;
   storagePath: string;
-  kuzuPath: string;
+  lbugPath: string;
   metaPath: string;
   meta: RepoMeta;
 }
@@ -72,21 +72,66 @@ export const getStoragePaths = (repoPath: string) => {
   const storagePath = getStoragePath(repoPath);
   return {
     storagePath,
-    kuzuPath: path.join(storagePath, 'kuzu'),
+    lbugPath: path.join(storagePath, 'lbug'),
     metaPath: path.join(storagePath, 'meta.json'),
   };
 };
 
 /**
  * Get the database config for a registry entry.
- * Falls back to KuzuDB at the standard path for old entries that predate Neptune support.
+ * Falls back to LadybugDB at the standard path for old entries that predate Neptune support.
  */
 export const getDbConfig = (entry: RegistryEntry): DbConfig => {
   if (entry.db) return entry.db;
   return {
-    type: 'kuzu',
-    kuzuPath: path.join(entry.storagePath, 'kuzu'),
+    type: 'lbug',
+    lbugPath: path.join(entry.storagePath, 'lbug'),
   };
+};
+
+/**
+ * Check whether a KuzuDB index exists in the given storage path.
+ * Non-destructive — safe to call from status commands.
+ */
+export const hasKuzuIndex = async (storagePath: string): Promise<boolean> => {
+  try {
+    await fs.stat(path.join(storagePath, 'kuzu'));
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+/**
+ * Clean up stale KuzuDB files after migration to LadybugDB.
+ *
+ * Returns:
+ *   found        — true if .gitnexus/kuzu existed and was deleted
+ *   needsReindex — true if kuzu existed but lbug does not (re-analyze required)
+ *
+ * Callers own the user-facing messaging; this function only deletes files.
+ */
+export const cleanupOldKuzuFiles = async (
+  storagePath: string,
+): Promise<{ found: boolean; needsReindex: boolean }> => {
+  const oldPath = path.join(storagePath, 'kuzu');
+  const newPath = path.join(storagePath, 'lbug');
+  try {
+    await fs.stat(oldPath);
+    let needsReindex = false;
+    try {
+      await fs.stat(newPath);
+    } catch {
+      needsReindex = true;
+    }
+    for (const suffix of ['', '.wal', '.lock']) {
+      try { await fs.unlink(oldPath + suffix); } catch {}
+    }
+    try { await fs.rm(oldPath, { recursive: true, force: true }); } catch {}
+    return { found: true, needsReindex };
+  } catch {
+    return { found: false, needsReindex: false };
+  }
 };
 
 /**
@@ -268,7 +313,7 @@ export const updateRepoDb = async (repoName: string, db?: DbConfig): Promise<voi
     throw new Error(`Repository "${repoName}" not found in registry`);
   }
 
-  if (!db || db.type === 'kuzu') {
+  if (!db || db.type === 'lbug') {
     delete entry.db;
   } else {
     entry.db = db;

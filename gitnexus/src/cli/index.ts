@@ -34,11 +34,12 @@ program
   .option('--embed-api-key <key>', 'API key for cloud embedding providers')
   .option('--skills', 'Generate repo-specific skill files from detected communities')
    .option('-v, --verbose', 'Enable verbose ingestion warnings (default: false)')
-   .option('--db <type>', 'Database backend: kuzu (default) or neptune')
+   .option('--db <type>', 'Database backend: lbug (default) or neptune')
    .option('--neptune-endpoint <host>', 'Neptune cluster endpoint hostname')
    .option('--neptune-region <region>', 'AWS region for Neptune')
    .option('--neptune-port <port>', 'Neptune HTTP port (default: 8182)')
    .option('-y, --yes', 'Skip interactive prompts, use defaults/flags')
+   .addHelpText('after', '\nEnvironment variables:\n  GITNEXUS_NO_GITIGNORE=1  Skip .gitignore parsing (still reads .gitnexusignore)')
    .action(createLazyAction(() => import('./analyze.js'), 'analyzeCommand'));
 
 program

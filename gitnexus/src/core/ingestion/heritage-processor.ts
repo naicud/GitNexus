@@ -16,7 +16,6 @@
 
 import { KnowledgeGraph } from '../graph/types.js';
 import { ASTCache } from './ast-cache.js';
-import { SymbolTable, SymbolDefinition } from './symbol-table.js';
 import Parser from 'tree-sitter';
 import { isLanguageAvailable, loadParser, loadLanguage } from '../tree-sitter/parser-loader.js';
 import { LANGUAGE_QUERIES } from './tree-sitter-queries.js';
@@ -26,8 +25,7 @@ import { SupportedLanguages } from '../../config/supported-languages.js';
 import { getTreeSitterBufferSize } from './constants.js';
 import { preprocessCobolSource } from './cobol-preprocessor.js';
 import type { ExtractedHeritage } from './workers/parse-worker.js';
-import { resolveSymbol } from './symbol-resolver.js';
-import type { ImportMap, PackageMap } from './import-processor.js';
+import type { ResolutionContext } from './resolution-context.js';
 
 /** C#/Java convention: interfaces start with I followed by an uppercase letter */
 const INTERFACE_NAME_RE = /^I[A-Z]/;
@@ -43,14 +41,12 @@ const INTERFACE_NAME_RE = /^I[A-Z]/;
 const resolveExtendsType = (
   parentName: string,
   currentFilePath: string,
-  symbolTable: SymbolTable,
-  importMap: ImportMap,
+  ctx: ResolutionContext,
   language: SupportedLanguages,
-  packageMap?: PackageMap,
 ): { type: 'EXTENDS' | 'IMPLEMENTS'; idPrefix: string } => {
-  const resolved = resolveSymbol(parentName, currentFilePath, symbolTable, importMap, packageMap);
-  if (resolved) {
-    const isInterface = resolved.type === 'Interface';
+  const resolved = ctx.resolve(parentName, currentFilePath);
+  if (resolved && resolved.candidates.length > 0) {
+    const isInterface = resolved.candidates[0].type === 'Interface';
     return isInterface
       ? { type: 'IMPLEMENTS', idPrefix: 'Interface' }
       : { type: 'EXTENDS', idPrefix: 'Class' };
@@ -67,14 +63,34 @@ const resolveExtendsType = (
   return { type: 'EXTENDS', idPrefix: 'Class' };
 };
 
+/**
+ * Resolve a symbol ID for heritage, with fallback to generated ID.
+ * Uses ctx.resolve() → pick first candidate's nodeId → generate synthetic ID.
+ */
+const resolveHeritageId = (
+  name: string,
+  filePath: string,
+  ctx: ResolutionContext,
+  fallbackLabel: string,
+  fallbackKey?: string,
+): string => {
+  const resolved = ctx.resolve(name, filePath);
+  if (resolved && resolved.candidates.length > 0) {
+    // For global with multiple candidates, refuse (a wrong edge is worse than no edge)
+    if (resolved.tier === 'global' && resolved.candidates.length > 1) {
+      return generateId(fallbackLabel, fallbackKey ?? name);
+    }
+    return resolved.candidates[0].nodeId;
+  }
+  return generateId(fallbackLabel, fallbackKey ?? name);
+};
+
 export const processHeritage = async (
   graph: KnowledgeGraph,
   files: { path: string; content: string }[],
   astCache: ASTCache,
-  symbolTable: SymbolTable,
-  importMap: ImportMap,
-  packageMap?: PackageMap,
-  onProgress?: (current: number, total: number) => void
+  ctx: ResolutionContext,
+  onProgress?: (current: number, total: number) => void,
 ) => {
   const parser = await loadParser();
   const logSkipped = isVerboseIngestionEnabled();
@@ -103,8 +119,6 @@ export const processHeritage = async (
 
     // 3. Get AST
     let tree = astCache.get(file.path);
-    let wasReparsed = false;
-
     if (!tree) {
       // Use larger bufferSize for files > 32KB
       const parseContent = language === SupportedLanguages.COBOL
@@ -116,7 +130,6 @@ export const processHeritage = async (
         // Skip files that can't be parsed
         continue;
       }
-      wasReparsed = true;
       // Cache re-parsed tree for potential future use
       astCache.set(file.path, tree);
     }
@@ -152,14 +165,10 @@ export const processHeritage = async (
         const className = captureMap['heritage.class'].text;
         const parentClassName = captureMap['heritage.extends'].text;
 
-        const { type: relType, idPrefix } = resolveExtendsType(parentClassName, file.path, symbolTable, importMap, language, packageMap);
+        const { type: relType, idPrefix } = resolveExtendsType(parentClassName, file.path, ctx, language);
 
-        const childId = symbolTable.lookupExact(file.path, className) ||
-                        resolveSymbol(className, file.path, symbolTable, importMap, packageMap)?.nodeId ||
-                        generateId('Class', `${file.path}:${className}`);
-
-        const parentId = resolveSymbol(parentClassName, file.path, symbolTable, importMap, packageMap)?.nodeId ||
-                         generateId(idPrefix, `${parentClassName}`);
+        const childId = resolveHeritageId(className, file.path, ctx, 'Class', `${file.path}:${className}`);
+        const parentId = resolveHeritageId(parentClassName, file.path, ctx, idPrefix);
 
         if (childId && parentId && childId !== parentId) {
           graph.addRelationship({
@@ -178,19 +187,12 @@ export const processHeritage = async (
         const className = captureMap['heritage.class'].text;
         const interfaceName = captureMap['heritage.implements'].text;
 
-        // Resolve class and interface IDs
-        const classId = symbolTable.lookupExact(file.path, className) ||
-                        resolveSymbol(className, file.path, symbolTable, importMap, packageMap)?.nodeId ||
-                        generateId('Class', `${file.path}:${className}`);
-
-        const interfaceId = resolveSymbol(interfaceName, file.path, symbolTable, importMap, packageMap)?.nodeId ||
-                            generateId('Interface', `${interfaceName}`);
+        const classId = resolveHeritageId(className, file.path, ctx, 'Class', `${file.path}:${className}`);
+        const interfaceId = resolveHeritageId(interfaceName, file.path, ctx, 'Interface');
 
         if (classId && interfaceId) {
-          const relId = generateId('IMPLEMENTS', `${classId}->${interfaceId}`);
-          
           graph.addRelationship({
-            id: relId,
+            id: generateId('IMPLEMENTS', `${classId}->${interfaceId}`),
             sourceId: classId,
             targetId: interfaceId,
             type: 'IMPLEMENTS',
@@ -205,19 +207,12 @@ export const processHeritage = async (
         const structName = captureMap['heritage.class'].text;
         const traitName = captureMap['heritage.trait'].text;
 
-        // Resolve struct and trait IDs
-        const structId = symbolTable.lookupExact(file.path, structName) ||
-                         resolveSymbol(structName, file.path, symbolTable, importMap, packageMap)?.nodeId ||
-                         generateId('Struct', `${file.path}:${structName}`);
-
-        const traitId = resolveSymbol(traitName, file.path, symbolTable, importMap, packageMap)?.nodeId ||
-                        generateId('Trait', `${traitName}`);
+        const structId = resolveHeritageId(structName, file.path, ctx, 'Struct', `${file.path}:${structName}`);
+        const traitId = resolveHeritageId(traitName, file.path, ctx, 'Trait');
 
         if (structId && traitId) {
-          const relId = generateId('IMPLEMENTS', `${structId}->${traitId}`);
-          
           graph.addRelationship({
-            id: relId,
+            id: generateId('IMPLEMENTS', `${structId}->${traitId}`),
             sourceId: structId,
             targetId: traitId,
             type: 'IMPLEMENTS',
@@ -247,10 +242,8 @@ export const processHeritage = async (
 export const processHeritageFromExtracted = async (
   graph: KnowledgeGraph,
   extractedHeritage: ExtractedHeritage[],
-  symbolTable: SymbolTable,
-  importMap: ImportMap,
-  packageMap?: PackageMap,
-  onProgress?: (current: number, total: number) => void
+  ctx: ResolutionContext,
+  onProgress?: (current: number, total: number) => void,
 ) => {
   const total = extractedHeritage.length;
 
@@ -265,14 +258,10 @@ export const processHeritageFromExtracted = async (
     if (h.kind === 'extends') {
       const fileLanguage = getLanguageFromFilename(h.filePath);
       if (!fileLanguage) continue;
-      const { type: relType, idPrefix } = resolveExtendsType(h.parentName, h.filePath, symbolTable, importMap, fileLanguage, packageMap);
+      const { type: relType, idPrefix } = resolveExtendsType(h.parentName, h.filePath, ctx, fileLanguage);
 
-      const childId = symbolTable.lookupExact(h.filePath, h.className) ||
-                      resolveSymbol(h.className, h.filePath, symbolTable, importMap, packageMap)?.nodeId ||
-                      generateId('Class', `${h.filePath}:${h.className}`);
-
-      const parentId = resolveSymbol(h.parentName, h.filePath, symbolTable, importMap, packageMap)?.nodeId ||
-                       generateId(idPrefix, `${h.parentName}`);
+      const childId = resolveHeritageId(h.className, h.filePath, ctx, 'Class', `${h.filePath}:${h.className}`);
+      const parentId = resolveHeritageId(h.parentName, h.filePath, ctx, idPrefix);
 
       if (childId && parentId && childId !== parentId) {
         graph.addRelationship({
@@ -285,12 +274,8 @@ export const processHeritageFromExtracted = async (
         });
       }
     } else if (h.kind === 'implements') {
-      const classId = symbolTable.lookupExact(h.filePath, h.className) ||
-                      resolveSymbol(h.className, h.filePath, symbolTable, importMap, packageMap)?.nodeId ||
-                      generateId('Class', `${h.filePath}:${h.className}`);
-
-      const interfaceId = resolveSymbol(h.parentName, h.filePath, symbolTable, importMap, packageMap)?.nodeId ||
-                          generateId('Interface', `${h.parentName}`);
+      const classId = resolveHeritageId(h.className, h.filePath, ctx, 'Class', `${h.filePath}:${h.className}`);
+      const interfaceId = resolveHeritageId(h.parentName, h.filePath, ctx, 'Interface');
 
       if (classId && interfaceId) {
         graph.addRelationship({
@@ -303,12 +288,8 @@ export const processHeritageFromExtracted = async (
         });
       }
     } else if (h.kind === 'trait-impl' || h.kind === 'include' || h.kind === 'extend' || h.kind === 'prepend') {
-      const structId = symbolTable.lookupExact(h.filePath, h.className) ||
-                       resolveSymbol(h.className, h.filePath, symbolTable, importMap, packageMap)?.nodeId ||
-                       generateId('Struct', `${h.filePath}:${h.className}`);
-
-      const traitId = resolveSymbol(h.parentName, h.filePath, symbolTable, importMap, packageMap)?.nodeId ||
-                      generateId('Trait', `${h.parentName}`);
+      const structId = resolveHeritageId(h.className, h.filePath, ctx, 'Struct', `${h.filePath}:${h.className}`);
+      const traitId = resolveHeritageId(h.parentName, h.filePath, ctx, 'Trait');
 
       if (structId && traitId) {
         graph.addRelationship({

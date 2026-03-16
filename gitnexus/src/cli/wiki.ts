@@ -114,7 +114,7 @@ export const wikiCommand = async (
   }
 
   // ── Check for existing index ────────────────────────────────────────
-  const { storagePath, kuzuPath } = getStoragePaths(repoPath);
+  const { storagePath, lbugPath } = getStoragePaths(repoPath);
   const meta = await loadMeta(storagePath);
 
   if (!meta) {
@@ -243,7 +243,7 @@ export const wikiCommand = async (
   const generator = new WikiGenerator(
     repoPath,
     storagePath,
-    kuzuPath,
+    lbugPath,
     llmConfig,
     wikiOptions,
     (phase, percent, detail) => {

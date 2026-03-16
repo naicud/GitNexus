@@ -8,12 +8,12 @@ import path from 'path';
 import { execFileSync } from 'child_process';
 import v8 from 'v8';
 import { runPipelineFromRepo } from '../core/ingestion/pipeline.js';
-import { initKuzu, loadGraphToKuzu, getKuzuStats, executeQuery, executeWithReusedStatement, closeKuzu, createFTSIndex, loadCachedEmbeddings } from '../core/kuzu/kuzu-adapter.js';
+import { initLbug, loadGraphToLbug, getLbugStats, executeQuery, executeWithReusedStatement, closeLbug, createFTSIndex, loadCachedEmbeddings } from '../core/lbug/lbug-adapter.js';
 // Embedding imports are lazy (dynamic import) so onnxruntime-node is never
 // loaded when embeddings are not requested. This avoids crashes on Node
 // versions whose ABI is not yet supported by the native binary (#89).
 // disposeEmbedder intentionally not called — ONNX Runtime segfaults on cleanup (see #38)
-import { getStoragePaths, saveMeta, loadMeta, addToGitignore, registerRepo, getGlobalRegistryPath } from '../storage/repo-manager.js';
+import { getStoragePaths, saveMeta, loadMeta, addToGitignore, registerRepo, getGlobalRegistryPath, cleanupOldKuzuFiles } from '../storage/repo-manager.js';
 import { getCurrentCommit, isGitRepo, getGitRoot } from '../storage/git.js';
 import { generateAIContextFiles } from './ai-context.js';
 import { generateSkillFiles, type GeneratedSkillInfo } from './skill-gen.js';
@@ -51,7 +51,7 @@ export interface AnalyzeOptions {
   embeddings?: boolean;
   skills?: boolean;
   verbose?: boolean;
-  db?: string;               // 'kuzu' | 'neptune'
+  db?: string;               // 'lbug' | 'neptune'
   neptuneEndpoint?: string;
   neptuneRegion?: string;
   neptunePort?: string;
@@ -73,7 +73,7 @@ const PHASE_LABELS: Record<string, string> = {
   communities: 'Detecting communities',
   processes: 'Detecting processes',
   complete: 'Pipeline complete',
-  kuzu: 'Loading into KuzuDB',
+  lbug: 'Loading into LadybugDB',
   neptune: 'Loading into Neptune',
   fts: 'Creating search indexes',
   embeddings: 'Generating embeddings',
@@ -157,7 +157,7 @@ export const analyzeCommand = async (
   }
 
   // Resolve DB backend
-  const dbTypeRaw = options?.db ?? process.env.GITNEXUS_DB_TYPE ?? 'kuzu';
+  const dbTypeRaw = options?.db ?? process.env.GITNEXUS_DB_TYPE ?? 'lbug';
   const isNeptune = dbTypeRaw === 'neptune';
   let neptuneConfig: NeptuneDbConfig | null = null;
 
@@ -174,7 +174,16 @@ export const analyzeCommand = async (
   // Resolve embedding config (always, even if --embeddings not set, for registry persistence)
   const embedConfig = resolveEmbeddingConfig(options ?? {});
 
-  const { storagePath, kuzuPath } = getStoragePaths(repoPath);
+  const { storagePath, lbugPath } = getStoragePaths(repoPath);
+
+  // Clean up stale KuzuDB files from before the LadybugDB migration.
+  if (!isNeptune) {
+    const kuzuResult = await cleanupOldKuzuFiles(storagePath);
+    if (kuzuResult.found && kuzuResult.needsReindex) {
+      console.log('  Migrating from KuzuDB to LadybugDB — rebuilding index...\n');
+    }
+  }
+
   const currentCommit = getCurrentCommit(repoPath);
   const existingMeta = await loadMeta(storagePath);
 
@@ -183,11 +192,15 @@ export const analyzeCommand = async (
     return;
   }
 
+  if (process.env.GITNEXUS_NO_GITIGNORE) {
+    console.log('  GITNEXUS_NO_GITIGNORE is set — skipping .gitignore (still reading .gitnexusignore)\n');
+  }
+
   // Multi-phase progress display
   const { createMultiProgress } = await import('./tui/components/multi-progress.js');
   const mp = createMultiProgress([
     { name: 'pipeline', label: 'Running pipeline', weight: 60 },
-    { name: 'db', label: isNeptune ? 'Loading into Neptune' : 'Loading into KuzuDB', weight: 25 },
+    { name: 'db', label: isNeptune ? 'Loading into Neptune' : 'Loading into LadybugDB', weight: 25 },
     { name: 'fts', label: 'Creating search indexes', weight: 5 },
     { name: 'embeddings', label: 'Generating embeddings', weight: 8 },
     { name: 'finalize', label: 'Finalizing', weight: 2 },
@@ -200,7 +213,7 @@ export const analyzeCommand = async (
     aborted = true;
     mp.stop();
     console.log('\n  Interrupted — cleaning up...');
-    (isNeptune ? Promise.resolve() : closeKuzu()).catch(() => {}).finally(() => process.exit(130));
+    (isNeptune ? Promise.resolve() : closeLbug()).catch(() => {}).finally(() => process.exit(130));
   };
   process.on('SIGINT', sigintHandler);
 
@@ -221,13 +234,13 @@ export const analyzeCommand = async (
   if (!isNeptune && options?.embeddings && existingMeta && !options?.force && !dimsChanged && !providerChanged) {
     try {
       mp.update(0, 'Caching embeddings...');
-      await initKuzu(kuzuPath, embedConfig.dimensions);
+      await initLbug(lbugPath);
       const cached = await loadCachedEmbeddings();
       cachedEmbeddingNodeIds = cached.embeddingNodeIds;
       cachedEmbeddings = cached.embeddings;
-      await closeKuzu();
+      await closeLbug();
     } catch {
-      try { await closeKuzu(); } catch {}
+      try { await closeLbug(); } catch {}
     }
   }
 
@@ -267,30 +280,29 @@ export const analyzeCommand = async (
     dbTime = ((Date.now() - t0Neptune) / 1000).toFixed(1);
     dbWarnings = neptuneResult.warnings;
   } else {
-    // ── KuzuDB path (existing, unchanged) ─────────────────────────
-    await closeKuzu();
-    const kuzuFiles = [kuzuPath, `${kuzuPath}.wal`, `${kuzuPath}.lock`];
-    for (const f of kuzuFiles) {
+    // ── LadybugDB path ─────────────────────────────────────────────
+    await closeLbug();
+    const lbugFiles = [lbugPath, `${lbugPath}.wal`, `${lbugPath}.lock`];
+    for (const f of lbugFiles) {
       try { await fs.rm(f, { recursive: true, force: true }); } catch {}
     }
 
-    const t0Kuzu = Date.now();
-    await initKuzu(kuzuPath, options?.embeddings ? embedConfig.dimensions : undefined);
-    let kuzuMsgCount = 0;
-    const kuzuResult = await loadGraphToKuzu(pipelineResult.graph, pipelineResult.repoPath, storagePath, (msg) => {
-      kuzuMsgCount++;
-      const progress = Math.min(100, Math.round((kuzuMsgCount / (kuzuMsgCount + 10)) * 100));
+    const t0Lbug = Date.now();
+    await initLbug(lbugPath);
+    let lbugMsgCount = 0;
+    const lbugResult = await loadGraphToLbug(pipelineResult.graph, pipelineResult.repoPath, storagePath, (msg) => {
+      lbugMsgCount++;
+      const progress = Math.min(100, Math.round((lbugMsgCount / (lbugMsgCount + 10)) * 100));
       mp.update(progress, msg);
     });
-    dbTime = ((Date.now() - t0Kuzu) / 1000).toFixed(1);
-    dbWarnings = kuzuResult.warnings;
+    dbTime = ((Date.now() - t0Lbug) / 1000).toFixed(1);
+    dbWarnings = lbugResult.warnings;
   }
 
   // ── Phase 3: FTS ───────────────────────────────────────────────────
   mp.setPhase('fts');
   const t0Fts = Date.now();
   if (!isNeptune) {
-
     try {
       await createFTSIndex('File', 'file_fts', ['name', 'content']);
       await createFTSIndex('Function', 'function_fts', ['name', 'content']);
@@ -323,7 +335,7 @@ export const analyzeCommand = async (
   mp.setPhase('embeddings');
   const stats = isNeptune && neptuneConfig
     ? await getNeptuneStats(neptuneConfig)
-    : await getKuzuStats();
+    : await getLbugStats();
   let embeddingTime = '0.0';
   let embeddingSkipped = !options?.embeddings;
   let embeddingSkipReason = 'off (use --embeddings to enable)';
@@ -341,7 +353,6 @@ export const analyzeCommand = async (
     if (isNeptune && neptuneConfig) {
       // Neptune path: run pipeline collecting embeddings in-memory, then bulk-store
       const neptuneEmbeddings: Array<{ nodeId: string; embedding: number[] }> = [];
-      // Create a lightweight in-memory collector instead of KuzuDB insert
       const collectInsert = async (_cypher: string, paramsList: Array<Record<string, any>>) => {
         for (const p of paramsList) {
           neptuneEmbeddings.push({ nodeId: p.nodeId as string, embedding: p.embedding as number[] });
@@ -349,7 +360,6 @@ export const analyzeCommand = async (
       };
 
       await runEmbeddingPipeline(
-        // For Neptune, we need to query Neptune to get node lists
         async (cypher: string) => {
           const { NeptunedataClient, ExecuteOpenCypherQueryCommand } = await import('@aws-sdk/client-neptunedata');
           const client = new NeptunedataClient({
@@ -383,7 +393,7 @@ export const analyzeCommand = async (
         await loadEmbeddingsToNeptune(neptuneConfig, neptuneEmbeddings, (msg) => mp.update(97, msg));
       }
     } else {
-      // KuzuDB path
+      // LadybugDB path
       await runEmbeddingPipeline(
         executeQuery,
         executeWithReusedStatement,
@@ -431,7 +441,7 @@ export const analyzeCommand = async (
   await saveMeta(storagePath, meta);
   const dbConfig: DbConfig = isNeptune && neptuneConfig
     ? neptuneConfig
-    : { type: 'kuzu', kuzuPath };
+    : { type: 'lbug', lbugPath };
   const embeddingMeta = options?.embeddings
     ? { provider: embedConfig.provider, model: embedConfig.model, dimensions: embedConfig.dimensions, endpoint: embedConfig.endpoint }
     : undefined;
@@ -477,7 +487,7 @@ export const analyzeCommand = async (
   }, generatedSkills);
 
   if (!isNeptune) {
-    await closeKuzu();
+    await closeLbug();
   }
   // Note: we intentionally do NOT call disposeEmbedder() here.
   // ONNX Runtime's native cleanup segfaults on macOS and some Linux configs.
@@ -499,7 +509,7 @@ export const analyzeCommand = async (
     'Edges': stats.edges.toLocaleString(),
     'Clusters': String(pipelineResult.communityResult?.stats.totalCommunities || 0),
     'Flows': String(pipelineResult.processResult?.stats.totalProcesses || 0),
-    'Database': `${isNeptune ? 'Neptune' : 'KuzuDB'} (${dbTime}s)`,
+    'Database': `${isNeptune ? 'Neptune' : 'LadybugDB'} (${dbTime}s)`,
     'FTS': ftsTime + 's',
     'Embeddings': embeddingSkipped ? embeddingSkipReason : embeddingTime + 's',
     'Path': repoPath,
@@ -526,7 +536,7 @@ export const analyzeCommand = async (
 
   console.log('');
 
-  // KuzuDB's native module holds open handles that prevent Node from exiting.
+  // LadybugDB's native module holds open handles that prevent Node from exiting.
   // ONNX Runtime also registers native atexit hooks that segfault on some
   // platforms (#38, #40). Force-exit to ensure clean termination.
   process.exit(0);

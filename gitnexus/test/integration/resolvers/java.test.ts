@@ -358,3 +358,422 @@ describe('Java local definition shadows import', () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// Constructor-inferred type resolution: var user = new User(); user.save()
+// Java 10+ local variable type inference (no explicit type annotations)
+// ---------------------------------------------------------------------------
+
+describe('Java constructor-inferred type resolution', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'java-constructor-type-inference'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects User and Repo classes, both with save methods', () => {
+    expect(getNodesByLabel(result, 'Class')).toContain('User');
+    expect(getNodesByLabel(result, 'Class')).toContain('Repo');
+    const saveMethods = getNodesByLabel(result, 'Method').filter(m => m === 'save');
+    expect(saveMethods.length).toBe(2);
+  });
+
+  it('resolves user.save() to models/User.java via constructor-inferred type', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const userSave = calls.find(c => c.target === 'save' && c.targetFilePath === 'models/User.java');
+    expect(userSave).toBeDefined();
+    expect(userSave!.source).toBe('processEntities');
+  });
+
+  it('resolves repo.save() to models/Repo.java via constructor-inferred type', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const repoSave = calls.find(c => c.target === 'save' && c.targetFilePath === 'models/Repo.java');
+    expect(repoSave).toBeDefined();
+    expect(repoSave!.source).toBe('processEntities');
+  });
+
+  it('emits exactly 2 save() CALLS edges (one per receiver type)', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCalls = calls.filter(c => c.target === 'save');
+    expect(saveCalls.length).toBe(2);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// For-each loop element typing: for (User user : users) user.save()
+// Java: explicit type in enhanced_for_statement binds loop variable
+// ---------------------------------------------------------------------------
+
+describe('Java for-each loop element type resolution', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'java-foreach'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects User and Repo classes, both with save methods', () => {
+    expect(getNodesByLabel(result, 'Class')).toContain('User');
+    expect(getNodesByLabel(result, 'Class')).toContain('Repo');
+    const saveMethods = getNodesByLabel(result, 'Method').filter(m => m === 'save');
+    expect(saveMethods.length).toBe(2);
+  });
+
+  it('resolves user.save() in for-each to User#save (not Repo#save)', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const userSave = calls.find(c => c.target === 'save' && c.targetFilePath === 'models/User.java');
+    expect(userSave).toBeDefined();
+    expect(userSave!.source).toBe('processEntities');
+  });
+
+  it('resolves repo.save() in for-each to Repo#save (not User#save)', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const repoSave = calls.find(c => c.target === 'save' && c.targetFilePath === 'models/Repo.java');
+    expect(repoSave).toBeDefined();
+    expect(repoSave!.source).toBe('processEntities');
+  });
+
+  it('emits exactly 2 save() CALLS edges (one per receiver type)', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCalls = calls.filter(c => c.target === 'save');
+    expect(saveCalls.length).toBe(2);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// this.save() resolves to enclosing class's own save method
+// ---------------------------------------------------------------------------
+
+describe('Java this resolution', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'java-self-this-resolution'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects User and Repo classes, each with a save method', () => {
+    expect(getNodesByLabel(result, 'Class')).toEqual(['Repo', 'User']);
+    const saveMethods = getNodesByLabel(result, 'Method').filter(m => m === 'save');
+    expect(saveMethods.length).toBe(2);
+  });
+
+  it('resolves this.save() inside User.process to User.save, not Repo.save', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCall = calls.find(c => c.target === 'save' && c.source === 'process');
+    expect(saveCall).toBeDefined();
+    expect(saveCall!.targetFilePath).toBe('src/models/User.java');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Parent class resolution: EXTENDS + IMPLEMENTS edges
+// ---------------------------------------------------------------------------
+
+describe('Java parent resolution', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'java-parent-resolution'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects BaseModel and User classes plus Serializable interface', () => {
+    expect(getNodesByLabel(result, 'Class')).toEqual(['BaseModel', 'User']);
+    expect(getNodesByLabel(result, 'Interface')).toEqual(['Serializable']);
+  });
+
+  it('emits EXTENDS edge: User → BaseModel', () => {
+    const extends_ = getRelationships(result, 'EXTENDS');
+    expect(extends_.length).toBe(1);
+    expect(extends_[0].source).toBe('User');
+    expect(extends_[0].target).toBe('BaseModel');
+  });
+
+  it('emits IMPLEMENTS edge: User → Serializable', () => {
+    const implements_ = getRelationships(result, 'IMPLEMENTS');
+    expect(implements_.length).toBe(1);
+    expect(implements_[0].source).toBe('User');
+    expect(implements_[0].target).toBe('Serializable');
+  });
+
+  it('all heritage edges point to real graph nodes', () => {
+    for (const edge of [...getRelationships(result, 'EXTENDS'), ...getRelationships(result, 'IMPLEMENTS')]) {
+      const target = result.graph.getNode(edge.rel.targetId);
+      expect(target).toBeDefined();
+      expect(target!.properties.name).toBe(edge.target);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// super.save() resolves to parent class's save method
+// ---------------------------------------------------------------------------
+
+describe('Java super resolution', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'java-super-resolution'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects BaseModel, User, and Repo classes', () => {
+    expect(getNodesByLabel(result, 'Class')).toEqual(['BaseModel', 'Repo', 'User']);
+  });
+
+  it('resolves super.save() inside User to BaseModel.save, not Repo.save', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const superSave = calls.find(c => c.source === 'save' && c.target === 'save'
+      && c.targetFilePath === 'src/models/BaseModel.java');
+    expect(superSave).toBeDefined();
+    const repoSave = calls.find(c => c.target === 'save' && c.targetFilePath === 'src/models/Repo.java');
+    expect(repoSave).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// super.save() resolves to generic parent class's save method
+// ---------------------------------------------------------------------------
+
+describe('Java generic parent super resolution', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'java-generic-parent-resolution'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects BaseModel, User, and Repo classes', () => {
+    expect(getNodesByLabel(result, 'Class')).toEqual(['BaseModel', 'Repo', 'User']);
+  });
+
+  it('resolves super.save() inside User to BaseModel.save, not Repo.save', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const superSave = calls.find(c => c.source === 'save' && c.target === 'save'
+      && c.targetFilePath === 'src/models/BaseModel.java');
+    expect(superSave).toBeDefined();
+    const repoSave = calls.find(c => c.target === 'save' && c.targetFilePath === 'src/models/Repo.java');
+    expect(repoSave).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Return type inference: var user = svc.getUser("alice"); user.save()
+// Java's CONSTRUCTOR_BINDING_SCANNER handles `var` declarations with
+// method_invocation values, enabling end-to-end return type inference.
+// ---------------------------------------------------------------------------
+
+describe('Java return type inference via explicit method return type', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'java-return-type-inference'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects User and UserService classes', () => {
+    expect(getNodesByLabel(result, 'Class')).toContain('User');
+    expect(getNodesByLabel(result, 'Class')).toContain('UserService');
+  });
+
+  it('detects save and getUser methods', () => {
+    const methods = getNodesByLabel(result, 'Method');
+    expect(methods).toContain('save');
+    expect(methods).toContain('getUser');
+  });
+
+  it('resolves user.save() to User#save via return type of getUser(): User', () => {
+    // Java's CONSTRUCTOR_BINDING_SCANNER binds `var user = svc.getUser()` to the
+    // return type of getUser (User), so the subsequent user.save() call resolves
+    // to User#save rather than an unresolved target.
+    const calls = getRelationships(result, 'CALLS');
+    const saveCall = calls.find(c =>
+      c.target === 'save' && c.source === 'processUser' && c.targetFilePath.includes('models')
+    );
+    expect(saveCall).toBeDefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Nullable receiver: Java uses explicit type annotations (User user = findUser())
+// Tests that regular typed receiver resolution works with competing save() methods
+// when the variable is assigned from a factory method returning the same type.
+// Note: Java Optional<User> stores just "Optional" in TypeEnv (generics stripped),
+// so this test uses plain typed variables to validate receiver disambiguation.
+// ---------------------------------------------------------------------------
+
+describe('Java nullable receiver resolution (typed factory return)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'java-nullable-receiver'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects User and Repo classes, both with save methods', () => {
+    expect(getNodesByLabel(result, 'Class')).toContain('User');
+    expect(getNodesByLabel(result, 'Class')).toContain('Repo');
+    const saveMethods = getNodesByLabel(result, 'Method').filter(m => m === 'save');
+    expect(saveMethods.length).toBe(2);
+  });
+
+  it('resolves user.save() to User.save via receiver typing', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const userSave = calls.find(c => c.target === 'save' && c.targetFilePath === 'models/User.java');
+    expect(userSave).toBeDefined();
+    expect(userSave!.source).toBe('processEntities');
+  });
+
+  it('resolves repo.save() to Repo.save via receiver typing', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const repoSave = calls.find(c => c.target === 'save' && c.targetFilePath === 'models/Repo.java');
+    expect(repoSave).toBeDefined();
+    expect(repoSave!.source).toBe('processEntities');
+  });
+
+  it('user.save() does NOT resolve to Repo.save (negative disambiguation)', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCalls = calls.filter(c => c.target === 'save' && c.source === 'processEntities');
+    // Each save() call should resolve to exactly one target file
+    expect(saveCalls.filter(c => c.targetFilePath === 'models/User.java').length).toBe(1);
+    expect(saveCalls.filter(c => c.targetFilePath === 'models/Repo.java').length).toBe(1);
+  });
+
+  it('emits exactly 2 save() CALLS edges (one per receiver type)', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCalls = calls.filter(c => c.target === 'save');
+    expect(saveCalls.length).toBe(2);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Assignment chain propagation (Phase 4.3)
+// ---------------------------------------------------------------------------
+
+describe('Java assignment chain propagation', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'java-assignment-chain'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects User and Repo classes each with a save method', () => {
+    expect(getNodesByLabel(result, 'Class')).toContain('User');
+    expect(getNodesByLabel(result, 'Class')).toContain('Repo');
+    const saveMethods = getNodesByLabel(result, 'Method').filter(m => m === 'save');
+    expect(saveMethods.length).toBe(2);
+  });
+
+  it('resolves alias.save() to User#save via assignment chain', () => {
+    const calls = getRelationships(result, 'CALLS');
+    // Positive: alias.save() must resolve to User#save
+    const userSave = calls.find(c =>
+      c.target === 'save' && c.source === 'processEntities' && c.targetFilePath.includes('User.java'),
+    );
+    expect(userSave).toBeDefined();
+  });
+
+  it('alias.save() does NOT resolve to Repo#save', () => {
+    const calls = getRelationships(result, 'CALLS');
+    // Negative: alias comes from User, so only one edge to User.java
+    const wrongCall = calls.filter(c =>
+      c.target === 'save' && c.source === 'processEntities' && c.targetFilePath.includes('User.java'),
+    );
+    expect(wrongCall.length).toBe(1);
+  });
+
+  it('resolves rAlias.save() to Repo#save via assignment chain', () => {
+    const calls = getRelationships(result, 'CALLS');
+    // Positive: rAlias.save() must resolve to Repo#save
+    const repoSave = calls.find(c =>
+      c.target === 'save' && c.source === 'processEntities' && c.targetFilePath.includes('Repo.java'),
+    );
+    expect(repoSave).toBeDefined();
+  });
+
+  it('each alias resolves to its own class, not the other', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const userSave = calls.find(c =>
+      c.target === 'save' && c.source === 'processEntities' && c.targetFilePath.includes('User.java'),
+    );
+    const repoSave = calls.find(c =>
+      c.target === 'save' && c.source === 'processEntities' && c.targetFilePath.includes('Repo.java'),
+    );
+    expect(userSave).toBeDefined();
+    expect(repoSave).toBeDefined();
+    expect(userSave!.targetFilePath).not.toBe(repoSave!.targetFilePath);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Java Optional<User> receiver resolution — extractSimpleTypeName unwraps
+// Optional<User> to "User" via NULLABLE_WRAPPER_TYPES, enabling receiver
+// disambiguation when the declaration type is Optional<T>.
+// ---------------------------------------------------------------------------
+
+describe('Java Optional<User> receiver resolution via wrapper unwrapping', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'java-optional-receiver'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects User and Repo classes each with a save method', () => {
+    expect(getNodesByLabel(result, 'Class')).toContain('User');
+    expect(getNodesByLabel(result, 'Class')).toContain('Repo');
+    const saveMethods = getNodesByLabel(result, 'Method').filter(m => m === 'save');
+    expect(saveMethods.length).toBe(2);
+  });
+
+  it('resolves user.save() to User#save with Optional<User> in scope', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const userSave = calls.find(c =>
+      c.target === 'save' && c.source === 'processEntities' && c.targetFilePath?.includes('User.java'),
+    );
+    expect(userSave).toBeDefined();
+  });
+
+  it('resolves repo.save() to Repo#save alongside Optional usage', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const repoSave = calls.find(c =>
+      c.target === 'save' && c.source === 'processEntities' && c.targetFilePath?.includes('Repo.java'),
+    );
+    expect(repoSave).toBeDefined();
+  });
+
+  it('disambiguates user.save() and repo.save() to different files', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const userSave = calls.find(c =>
+      c.target === 'save' && c.source === 'processEntities' && c.targetFilePath?.includes('User.java'),
+    );
+    const repoSave = calls.find(c =>
+      c.target === 'save' && c.source === 'processEntities' && c.targetFilePath?.includes('Repo.java'),
+    );
+    expect(userSave).toBeDefined();
+    expect(repoSave).toBeDefined();
+    expect(userSave!.targetFilePath).not.toBe(repoSave!.targetFilePath);
+  });
+});

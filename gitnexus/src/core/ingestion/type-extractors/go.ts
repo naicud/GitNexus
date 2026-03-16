@@ -1,5 +1,5 @@
 import type { SyntaxNode } from '../utils.js';
-import type { LanguageTypeConfig, ParameterExtractor, TypeBindingExtractor } from './types.js';
+import type { ConstructorBindingScanner, LanguageTypeConfig, ParameterExtractor, TypeBindingExtractor, PendingAssignmentExtractor } from './types.js';
 import { extractSimpleTypeName, extractVarName } from './shared.js';
 
 const DECLARATION_NODE_TYPES: ReadonlySet<string> = new Set([
@@ -59,7 +59,51 @@ const extractGoShortVarDeclaration = (node: SyntaxNode, env: Map<string, string>
   // Pair each LHS name with its corresponding RHS value
   const count = Math.min(lhsNodes.length, rhsNodes.length);
   for (let i = 0; i < count; i++) {
-    const valueNode = rhsNodes[i];
+    let valueNode = rhsNodes[i];
+    // Unwrap &User{} — unary_expression (address-of) wrapping composite_literal
+    if (valueNode.type === 'unary_expression' && valueNode.firstNamedChild?.type === 'composite_literal') {
+      valueNode = valueNode.firstNamedChild;
+    }
+    // Go built-in new(User) — call_expression with 'new' callee and type argument
+    // Go built-in make([]User, 0) / make(map[string]User) — extract element/value type
+    if (valueNode.type === 'call_expression') {
+      const funcNode = valueNode.childForFieldName('function');
+      if (funcNode?.text === 'new') {
+        const args = valueNode.childForFieldName('arguments');
+        if (args?.firstNamedChild) {
+          const typeName = extractSimpleTypeName(args.firstNamedChild);
+          const varName = extractVarName(lhsNodes[i]);
+          if (varName && typeName) env.set(varName, typeName);
+        }
+      } else if (funcNode?.text === 'make') {
+        const args = valueNode.childForFieldName('arguments');
+        const firstArg = args?.firstNamedChild;
+        if (firstArg) {
+          let innerType: SyntaxNode | null = null;
+          if (firstArg.type === 'slice_type') {
+            innerType = firstArg.childForFieldName('element');
+          } else if (firstArg.type === 'map_type') {
+            innerType = firstArg.childForFieldName('value');
+          }
+          if (innerType) {
+            const typeName = extractSimpleTypeName(innerType);
+            const varName = extractVarName(lhsNodes[i]);
+            if (varName && typeName) env.set(varName, typeName);
+          }
+        }
+      }
+      continue;
+    }
+    // Go type assertion: user := iface.(User) — type_assertion_expression with 'type' field
+    if (valueNode.type === 'type_assertion_expression') {
+      const typeNode = valueNode.childForFieldName('type');
+      if (typeNode) {
+        const typeName = extractSimpleTypeName(typeNode);
+        const varName = extractVarName(lhsNodes[i]);
+        if (varName && typeName) env.set(varName, typeName);
+      }
+      continue;
+    }
     if (valueNode.type !== 'composite_literal') continue;
     const typeNode = valueNode.childForFieldName('type');
     if (!typeNode) continue;
@@ -97,8 +141,93 @@ const extractParameter: ParameterExtractor = (node: SyntaxNode, env: Map<string,
   if (varName && typeName) env.set(varName, typeName);
 };
 
+/** Go: user := NewUser(...) — infer type from single-assignment call expression */
+const scanConstructorBinding: ConstructorBindingScanner = (node) => {
+  if (node.type !== 'short_var_declaration') return undefined;
+  const left = node.childForFieldName('left');
+  const right = node.childForFieldName('right');
+  if (!left || !right) return undefined;
+  const leftIds = left.type === 'expression_list' ? left.namedChildren : [left];
+  const rightExprs = right.type === 'expression_list' ? right.namedChildren : [right];
+
+  // Multi-return: user, err := NewUser() — bind first var when second is err/ok/_
+  if (leftIds.length === 2 && rightExprs.length === 1) {
+    const secondVar = leftIds[1];
+    const isErrorOrDiscard =
+      secondVar.text === '_' ||
+      secondVar.text === 'err' ||
+      secondVar.text === 'ok' ||
+      secondVar.text === 'error';
+    if (isErrorOrDiscard && leftIds[0].type === 'identifier') {
+      if (rightExprs[0].type !== 'call_expression') return undefined;
+      const func = rightExprs[0].childForFieldName('function');
+      if (!func) return undefined;
+      if (func.text === 'new' || func.text === 'make') return undefined;
+      const calleeName = extractSimpleTypeName(func);
+      if (!calleeName) return undefined;
+      return { varName: leftIds[0].text, calleeName };
+    }
+  }
+
+  // Single assignment only
+  if (leftIds.length !== 1 || leftIds[0].type !== 'identifier') return undefined;
+  if (rightExprs.length !== 1 || rightExprs[0].type !== 'call_expression') return undefined;
+  const func = rightExprs[0].childForFieldName('function');
+  if (!func) return undefined;
+  // Skip new() and make() — already handled by extractDeclaration
+  if (func.text === 'new' || func.text === 'make') return undefined;
+  const calleeName = extractSimpleTypeName(func);
+  if (!calleeName) return undefined;
+  return { varName: leftIds[0].text, calleeName };
+};
+
+/** Go: alias := u (short_var_declaration) or var b = u (var_spec) */
+const extractPendingAssignment: PendingAssignmentExtractor = (node, scopeEnv) => {
+  if (node.type === 'short_var_declaration') {
+    const left = node.childForFieldName('left');
+    const right = node.childForFieldName('right');
+    if (!left || !right) return undefined;
+    const lhsNode = left.type === 'expression_list' ? left.firstNamedChild : left;
+    const rhsNode = right.type === 'expression_list' ? right.firstNamedChild : right;
+    if (!lhsNode || !rhsNode) return undefined;
+    if (lhsNode.type !== 'identifier') return undefined;
+    const lhs = lhsNode.text;
+    if (scopeEnv.has(lhs)) return undefined;
+    if (rhsNode.type === 'identifier') return { lhs, rhs: rhsNode.text };
+    return undefined;
+  }
+  if (node.type === 'var_spec' || node.type === 'var_declaration') {
+    // var_declaration contains var_spec children; var_spec has name + expression_list value
+    const specs: SyntaxNode[] = [];
+    if (node.type === 'var_declaration') {
+      for (let i = 0; i < node.namedChildCount; i++) {
+        const c = node.namedChild(i);
+        if (c?.type === 'var_spec') specs.push(c);
+      }
+    } else {
+      specs.push(node);
+    }
+    for (const spec of specs) {
+      const nameNode = spec.childForFieldName('name');
+      if (!nameNode || nameNode.type !== 'identifier') continue;
+      const lhs = nameNode.text;
+      if (scopeEnv.has(lhs)) continue;
+      // Check if the last named child is a bare identifier (no type annotation between name and value)
+      let exprList: SyntaxNode | null = null;
+      for (let i = 0; i < spec.childCount; i++) {
+        if (spec.child(i)?.type === 'expression_list') { exprList = spec.child(i); break; }
+      }
+      const rhsNode = exprList?.firstNamedChild;
+      if (rhsNode?.type === 'identifier') return { lhs, rhs: rhsNode.text };
+    }
+  }
+  return undefined;
+};
+
 export const typeConfig: LanguageTypeConfig = {
   declarationNodeTypes: DECLARATION_NODE_TYPES,
   extractDeclaration,
   extractParameter,
+  scanConstructorBinding,
+  extractPendingAssignment,
 };

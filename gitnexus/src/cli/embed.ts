@@ -10,8 +10,8 @@ import path from 'path';
 import { resolveEmbeddingConfig, type EmbedOptions } from './embed-config.js';
 import { getStoragePaths, loadMeta, saveMeta, readRegistry, registerRepo, getDbConfig } from '../storage/repo-manager.js';
 import { getGitRoot, isGitRepo } from '../storage/git.js';
-import { initKuzu, closeKuzu, executeQuery, executeWithReusedStatement, loadCachedEmbeddings, getKuzuStats } from '../core/kuzu/kuzu-adapter.js';
-import { getEmbeddingSchema, EMBEDDING_TABLE_NAME } from '../core/kuzu/schema.js';
+import { initLbug, closeLbug, executeQuery, executeWithReusedStatement, loadCachedEmbeddings, getLbugStats } from '../core/lbug/lbug-adapter.js';
+import { getEmbeddingSchema, EMBEDDING_TABLE_NAME } from '../core/lbug/schema.js';
 import type { NeptuneDbConfig } from '../core/db/interfaces.js';
 
 export interface EmbedCommandOptions extends EmbedOptions {
@@ -83,7 +83,7 @@ export const embedCommand = async (
   }
 
   // ── Validate index exists ──────────────────────────────────────────
-  const { storagePath, kuzuPath } = getStoragePaths(repoPath);
+  const { storagePath, lbugPath } = getStoragePaths(repoPath);
   const meta = await loadMeta(storagePath);
   if (!meta) {
     console.log('  No GitNexus index found. Run `gitnexus analyze` first.\n');
@@ -125,7 +125,7 @@ export const embedCommand = async (
     aborted = true;
     mp.stop();
     console.log('\n  Interrupted — cleaning up...');
-    (isNeptune ? Promise.resolve() : closeKuzu()).catch(() => {}).finally(() => process.exit(130));
+    (isNeptune ? Promise.resolve() : closeLbug()).catch(() => {}).finally(() => process.exit(130));
   };
   process.on('SIGINT', sigintHandler);
 
@@ -141,21 +141,21 @@ export const embedCommand = async (
     // Neptune doesn't support local embedding storage, but we proceed
     // with the pipeline using Neptune query executor
   } else {
-    // KuzuDB path
+    // LadybugDB path
     if (dimsChanged) {
       mp.update(20, `Dimension change detected (${prevEmbed!.dimensions} -> ${embedConfig.dimensions}), recreating table...`);
-      await initKuzu(kuzuPath);
+      await initLbug(lbugPath);
       try {
         await executeQuery(`DROP TABLE ${EMBEDDING_TABLE_NAME}`);
       } catch { /* table may not exist */ }
       try {
         await executeQuery(getEmbeddingSchema(embedConfig.dimensions));
       } catch { /* may already exist at new dims */ }
-      await closeKuzu();
-      // Re-init with new dimensions
-      await initKuzu(kuzuPath, embedConfig.dimensions);
+      await closeLbug();
+      // Re-init
+      await initLbug(lbugPath);
     } else {
-      await initKuzu(kuzuPath, embedConfig.dimensions);
+      await initLbug(lbugPath);
     }
 
     if (opts.force) {
@@ -187,7 +187,7 @@ export const embedCommand = async (
 
   const stats = isNeptune && neptuneConfig
     ? await (await import('../core/db/neptune/neptune-ingest.js')).getNeptuneStats(neptuneConfig)
-    : await getKuzuStats();
+    : await getLbugStats();
 
   const labels = getEmbeddableLabels(stats.nodes);
 
@@ -233,7 +233,7 @@ export const embedCommand = async (
       await loadEmbeddingsToNeptune(neptuneConfig, neptuneEmbeddings, (msg) => mp.update(97, msg));
     }
   } else {
-    // KuzuDB path
+    // LadybugDB path
     await runEmbeddingPipeline(
       executeQuery,
       executeWithReusedStatement,
@@ -279,7 +279,7 @@ export const embedCommand = async (
   await registerRepo(repoPath, meta, registryEntry?.db, embeddingMeta);
 
   if (!isNeptune) {
-    await closeKuzu();
+    await closeLbug();
   }
 
   const totalTime = ((Date.now() - t0) / 1000).toFixed(1);

@@ -14,10 +14,10 @@ import path from 'path';
 import fs from 'fs/promises';
 import { AwsClient } from 'aws4fetch';
 import { loadMeta, listRegisteredRepos, updateRepoDb } from '../storage/repo-manager.js';
-import { executeQuery, executeParameterizedQuery, closeKuzu, withKuzuDb } from '../core/kuzu/kuzu-adapter.js';
-import { NODE_TABLES } from '../core/kuzu/schema.js';
+import { executeQuery, executeParameterizedQuery, closeLbug, withLbugDb } from '../core/lbug/lbug-adapter.js';
+import { NODE_TABLES } from '../core/lbug/schema.js';
 import { GraphNode, GraphRelationship } from '../core/graph/types.js';
-import { searchFTSFromKuzu } from '../core/search/bm25-index.js';
+import { searchFTSFromLbug } from '../core/search/bm25-index.js';
 import { hybridSearch } from '../core/search/hybrid-search.js';
 // Embedding imports are lazy (dynamic import) to avoid loading onnxruntime-node
 // at server startup — crashes on unsupported Node ABI versions (#89)
@@ -26,10 +26,10 @@ import { mountMCPEndpoints } from './mcp-http.js';
 import type { DbConfig, NeptuneDbConfig } from '../core/db/interfaces.js';
 import { NeptuneAdapter } from '../core/db/neptune/neptune-adapter.js';
 
-/** Resolve DB config for a registry entry. Falls back to KuzuDB. */
+/** Resolve DB config for a registry entry. Falls back to LadybugDB. */
 function getDbConfigFromEntry(entry: { storagePath: string; db?: DbConfig }): DbConfig {
   if ((entry as any).db) return (entry as any).db;
-  return { type: 'kuzu', kuzuPath: path.join(entry.storagePath, 'kuzu') };
+  return { type: 'lbug', lbugPath: path.join(entry.storagePath, 'lbug') };
 }
 
 const NODE_HARD_CAP = 20000;
@@ -445,8 +445,8 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
       }
 
       // KuzuDB path
-      const kuzuPath = path.join(entry.storagePath, 'kuzu');
-      const summary = await withKuzuDb(kuzuPath, async () => {
+      const lbugPath = path.join(entry.storagePath, 'lbug');
+      const summary = await withLbugDb(lbugPath, async () => {
         // Try community-based first
         const commRows = await executeQuery(
           `MATCH (c:Community) RETURN c.id AS id, c.heuristicLabel AS heuristicLabel, c.symbolCount AS symbolCount, c.cohesion AS cohesion`
@@ -639,8 +639,8 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
         }
 
         // KuzuDB structural expand
-        const kuzuPath = path.join(entry.storagePath, 'kuzu');
-        const result = await withKuzuDb(kuzuPath, () =>
+        const lbugPath = path.join(entry.storagePath, 'lbug');
+        const result = await withLbugDb(lbugPath, () =>
           structuralExpand(executeQuery, executeParameterizedQuery)
         );
         return res.json(result);
@@ -652,8 +652,8 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
         return;
       }
 
-      const kuzuPath = path.join(entry.storagePath, 'kuzu');
-      const result = await withKuzuDb(kuzuPath, async () => {
+      const lbugPath = path.join(entry.storagePath, 'lbug');
+      const result = await withLbugDb(lbugPath, async () => {
         const nodeRows = await executeQuery(`
           MATCH (n)-[:CodeRelation {type: 'MEMBER_OF'}]->(c:Community)
           WHERE c.heuristicLabel = '${groupLabel.replace(/'/g, "\\'")}'
@@ -832,8 +832,8 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
         }
       }
 
-      const kuzuPath = path.join(entry.storagePath, 'kuzu');
-      const result = await withKuzuDb(kuzuPath, async () => {
+      const lbugPath = path.join(entry.storagePath, 'lbug');
+      const result = await withLbugDb(lbugPath, async () => {
         // Get the center node (parameterized to prevent injection)
         const centerRows = await executeParameterizedQuery(
           `MATCH (n) WHERE n.id = $nodeId
@@ -1101,8 +1101,8 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
       }
 
       // KuzuDB path
-      const kuzuPath = path.join(entry.storagePath, 'kuzu');
-      const result = await withKuzuDb(kuzuPath, async () => {
+      const lbugPath = path.join(entry.storagePath, 'lbug');
+      const result = await withLbugDb(lbugPath, async () => {
         if (!parentId) {
           // L0: Return Folder nodes
           const rows = await executeQuery(
@@ -1308,8 +1308,8 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
       }
 
       // KuzuDB path
-      const kuzuPath = path.join(entry.storagePath, 'kuzu');
-      const result = await withKuzuDb(kuzuPath, async () => {
+      const lbugPath = path.join(entry.storagePath, 'lbug');
+      const result = await withLbugDb(lbugPath, async () => {
         const safeNodeId = nodeId.replace(/'/g, "\\'");
         // Get the target node
         const targetRows = await executeQuery(
@@ -1397,8 +1397,8 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
         return;
       }
 
-      const kuzuPath = path.join(entry.storagePath, 'kuzu');
-      const result = await withKuzuDb(kuzuPath, async () => {
+      const lbugPath = path.join(entry.storagePath, 'lbug');
+      const result = await withLbugDb(lbugPath, async () => {
         // Inbound counts: other nodes → this node, grouped by relationship type
         const inboundRows = await executeParameterizedQuery(
           `MATCH (other)-[r:CodeRelation]->(n)
@@ -1449,8 +1449,8 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
         return;
       }
 
-      const kuzuPath = path.join(entry.storagePath, 'kuzu');
-      const result = await withKuzuDb(kuzuPath, async () => {
+      const lbugPath = path.join(entry.storagePath, 'lbug');
+      const result = await withLbugDb(lbugPath, async () => {
         // Node type counts
         const nodeRows = await executeQuery(
           `MATCH (n) RETURN labels(n)[0] AS nodeType, count(*) AS cnt`,
@@ -1490,6 +1490,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
         res.status(404).json({ error: 'Repository not found' });
         return;
       }
+
 
       const dbConfig = getDbConfigFromEntry(entry);
 
@@ -1563,9 +1564,9 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
         }
       }
 
-      // KuzuDB path (default)
-      const kuzuPath = path.join(entry.storagePath, 'kuzu');
-      const result = await withKuzuDb(kuzuPath, async () => buildGraph());
+      // LadybugDB path (default)
+      const lbugPath = path.join(entry.storagePath, 'lbug');
+      const result = await withLbugDb(lbugPath, async () => buildGraph());
       res.json(result);
     } catch (err: any) {
       res.status(500).json({ error: err.message || 'Failed to build graph' });
@@ -1587,6 +1588,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
         return;
       }
 
+
       const dbConfig = getDbConfigFromEntry(entry);
 
       // Neptune path
@@ -1602,9 +1604,9 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
         }
       }
 
-      // KuzuDB path (default)
-      const kuzuPath = path.join(entry.storagePath, 'kuzu');
-      const result = await withKuzuDb(kuzuPath, () => executeQuery(cypher));
+      // LadybugDB path (default)
+      const lbugPath = path.join(entry.storagePath, 'lbug');
+      const result = await withLbugDb(lbugPath, () => executeQuery(cypher));
       res.json({ result });
     } catch (err: any) {
       res.status(500).json({ error: err.message || 'Query failed' });
@@ -1626,10 +1628,12 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
         return;
       }
 
+
       const parsedLimit = Number(req.body.limit ?? 10);
       const limit = Number.isFinite(parsedLimit)
         ? Math.max(1, Math.min(100, Math.trunc(parsedLimit)))
         : 10;
+
 
       const dbConfig = getDbConfigFromEntry(entry);
 
@@ -1652,9 +1656,9 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
         }
       }
 
-      // KuzuDB path (default)
-      const kuzuPath = path.join(entry.storagePath, 'kuzu');
-      const results = await withKuzuDb(kuzuPath, async () => {
+      // LadybugDB path (default)
+      const lbugPath = path.join(entry.storagePath, 'lbug');
+      const results = await withLbugDb(lbugPath, async () => {
         const { isEmbedderReady } = await import('../core/embeddings/embedder.js');
         if (isEmbedderReady()) {
           const { semanticSearch } = await import('../core/embeddings/embedding-pipeline.js');
@@ -1669,7 +1673,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
           return hybridSearch(query, limit, executeQuery, wrappedSemantic);
         }
         // FTS-only fallback when embeddings aren't loaded
-        return searchFTSFromKuzu(query, limit);
+        return searchFTSFromLbug(query, limit);
       });
       res.json({ results });
     } catch (err: any) {
@@ -2033,11 +2037,11 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
     console.log(`GitNexus server running on http://${host}:${port}`);
   });
 
-  // Graceful shutdown — close Express + KuzuDB cleanly
+  // Graceful shutdown — close Express + LadybugDB cleanly
   const shutdown = async () => {
     server.close();
     await cleanupMcp();
-    await closeKuzu();
+    await closeLbug();
     await backend.disconnect();
     process.exit(0);
   };

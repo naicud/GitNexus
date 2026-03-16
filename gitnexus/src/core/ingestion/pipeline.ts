@@ -4,9 +4,6 @@ import { processParsing } from './parsing-processor.js';
 import {
   processImports,
   processImportsFromExtracted,
-  createImportMap,
-  createPackageMap,
-  createNamedImportMap,
   buildImportResolutionContext
 } from './import-processor.js';
 import { processCalls, processCallsFromExtracted, processRoutesFromExtracted } from './call-processor.js';
@@ -14,7 +11,7 @@ import { processHeritage, processHeritageFromExtracted } from './heritage-proces
 import { computeMRO } from './mro-processor.js';
 import { processCommunities } from './community-processor.js';
 import { processProcesses } from './process-processor.js';
-import { createSymbolTable } from './symbol-table.js';
+import { createResolutionContext } from './resolution-context.js';
 import { createASTCache } from './ast-cache.js';
 import { PipelineProgress, PipelineResult } from '../../types/pipeline.js';
 import { walkRepositoryPaths, readFileContents } from './filesystem-walker.js';
@@ -248,15 +245,13 @@ export const runPipelineFromRepo = async (
   onProgress: (progress: PipelineProgress) => void
 ): Promise<PipelineResult> => {
   const graph = createKnowledgeGraph();
-  const symbolTable = createSymbolTable();
+  const ctx = createResolutionContext();
+  const symbolTable = ctx.symbols;
   let astCache = createASTCache(AST_CACHE_CAP);
-  const importMap = createImportMap();
-  const packageMap = createPackageMap();
-  const namedImportMap = createNamedImportMap();
 
   const cleanup = () => {
     astCache.clear();
-    symbolTable.clear();
+    ctx.clear();
   };
 
   try {
@@ -478,31 +473,62 @@ export const runPipelineFromRepo = async (
           workerPool,
         );
 
+        const chunkBasePercent = 20 + ((filesParsedSoFar / totalParseable) * 62);
+
         if (chunkWorkerData && !chunkWorkerData.sequentialFallback) {
           // Full worker path — all languages resolved by workers
-          await processImportsFromExtracted(graph, allPathObjects, chunkWorkerData.imports, importMap, undefined, repoPath, importCtx, packageMap, namedImportMap);
+          await processImportsFromExtracted(graph, allPathObjects, chunkWorkerData.imports, ctx, (current, total) => {
+            onProgress({
+              phase: 'parsing',
+              percent: Math.round(chunkBasePercent),
+              message: `Resolving imports (chunk ${chunkIdx + 1}/${numChunks})...`,
+              detail: `${current}/${total} files`,
+              stats: { filesProcessed: filesParsedSoFar, totalFiles: totalParseable, nodesCreated: graph.nodeCount },
+            });
+          }, repoPath, importCtx);
           await Promise.all([
             processCallsFromExtracted(
               graph,
               chunkWorkerData.calls,
-              symbolTable, importMap,
-              packageMap,
-              undefined,
-              namedImportMap
+              ctx,
+              (current, total) => {
+                onProgress({
+                  phase: 'parsing',
+                  percent: Math.round(chunkBasePercent),
+                  message: `Resolving calls (chunk ${chunkIdx + 1}/${numChunks})...`,
+                  detail: `${current}/${total} files`,
+                  stats: { filesProcessed: filesParsedSoFar, totalFiles: totalParseable, nodesCreated: graph.nodeCount },
+                });
+              },
+              chunkWorkerData.constructorBindings,
             ),
             processHeritageFromExtracted(
               graph,
               chunkWorkerData.heritage,
-              symbolTable,
-              importMap,
-              packageMap
+              ctx,
+              (current, total) => {
+                onProgress({
+                  phase: 'parsing',
+                  percent: Math.round(chunkBasePercent),
+                  message: `Resolving heritage (chunk ${chunkIdx + 1}/${numChunks})...`,
+                  detail: `${current}/${total} records`,
+                  stats: { filesProcessed: filesParsedSoFar, totalFiles: totalParseable, nodesCreated: graph.nodeCount },
+                });
+              },
             ),
             processRoutesFromExtracted(
               graph,
               chunkWorkerData.routes ?? [],
-              symbolTable,
-              importMap,
-              packageMap
+              ctx,
+              (current, total) => {
+                onProgress({
+                  phase: 'parsing',
+                  percent: Math.round(chunkBasePercent),
+                  message: `Resolving routes (chunk ${chunkIdx + 1}/${numChunks})...`,
+                  detail: `${current}/${total} routes`,
+                  stats: { filesProcessed: filesParsedSoFar, totalFiles: totalParseable, nodesCreated: graph.nodeCount },
+                });
+              },
             ),
           ]);
         } else {
@@ -513,18 +539,15 @@ export const runPipelineFromRepo = async (
           }
           // Resolve COBOL calls/imports collected by sequential parsing
           if (chunkWorkerData) {
-            await processImportsFromExtracted(graph, allPathObjects, chunkWorkerData.imports, importMap, undefined, repoPath, importCtx, packageMap, namedImportMap);
+            await processImportsFromExtracted(graph, allPathObjects, chunkWorkerData.imports, ctx, undefined, repoPath, importCtx);
             await processCallsFromExtracted(
               graph,
               chunkWorkerData.calls,
-              symbolTable, importMap,
-              packageMap,
-              undefined,
-              namedImportMap
+              ctx,
             );
           }
           // Tree-sitter import/call processing for non-COBOL files
-          await processImports(graph, chunkFiles, astCache, importMap, undefined, repoPath, allPaths, packageMap, namedImportMap);
+          await processImports(graph, chunkFiles, astCache, ctx, undefined, repoPath, allPaths);
           sequentialChunkPaths.push(chunkPaths);
         }
 
@@ -545,12 +568,20 @@ export const runPipelineFromRepo = async (
         .filter(p => chunkContents.has(p))
         .map(p => ({ path: p, content: chunkContents.get(p)! }));
       astCache = createASTCache(chunkFiles.length);
-      const rubyHeritage = await processCalls(graph, chunkFiles, astCache, symbolTable, importMap, packageMap, undefined, namedImportMap);
-      await processHeritage(graph, chunkFiles, astCache, symbolTable, importMap, packageMap);
+      const rubyHeritage = await processCalls(graph, chunkFiles, astCache, ctx);
+      await processHeritage(graph, chunkFiles, astCache, ctx);
       if (rubyHeritage.length > 0) {
-        await processHeritageFromExtracted(graph, rubyHeritage, symbolTable, importMap, packageMap);
+        await processHeritageFromExtracted(graph, rubyHeritage, ctx);
       }
       astCache.clear();
+    }
+
+    // Log resolution cache stats
+    if (isDev) {
+      const rcStats = ctx.getStats();
+      const total = rcStats.cacheHits + rcStats.cacheMisses;
+      const hitRate = total > 0 ? ((rcStats.cacheHits / total) * 100).toFixed(1) : '0';
+      console.log(`🔍 Resolution cache: ${rcStats.cacheHits} hits, ${rcStats.cacheMisses} misses (${hitRate}% hit rate)`);
     }
 
     // Free import resolution context — suffix index + resolve cache no longer needed

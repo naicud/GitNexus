@@ -1,6 +1,6 @@
 import { KnowledgeGraph, GraphNode, GraphRelationship } from '../graph/types.js';
 import Parser from 'tree-sitter';
-import { loadParser, loadLanguage } from '../tree-sitter/parser-loader.js';
+import { loadParser, loadLanguage, isLanguageAvailable } from '../tree-sitter/parser-loader.js';
 import { LANGUAGE_QUERIES } from './tree-sitter-queries.js';
 import { generateId } from '../../lib/utils.js';
 import { SymbolTable } from './symbol-table.js';
@@ -10,8 +10,9 @@ import { isNodeExported } from './export-detection.js';
 import { preprocessCobolSource, extractCobolSymbolsWithRegex } from './cobol-preprocessor.js';
 import { SupportedLanguages } from '../../config/supported-languages.js';
 import { detectFrameworkFromAST } from './framework-detection.js';
+import { typeConfigs } from './type-extractors/index.js';
 import { WorkerPool } from './workers/worker-pool.js';
-import type { ParseWorkerResult, ParseWorkerInput, ExtractedImport, ExtractedCall, ExtractedHeritage, ExtractedRoute } from './workers/parse-worker.js';
+import type { ParseWorkerResult, ParseWorkerInput, ExtractedImport, ExtractedCall, ExtractedHeritage, ExtractedRoute, FileConstructorBindings } from './workers/parse-worker.js';
 import { getTreeSitterBufferSize, TREE_SITTER_MAX_BUFFER } from './constants.js';
 
 export type FileProgressCallback = (current: number, total: number, filePath: string) => void;
@@ -21,6 +22,7 @@ export interface WorkerExtractedData {
   calls: ExtractedCall[];
   heritage: ExtractedHeritage[];
   routes: ExtractedRoute[];
+  constructorBindings: FileConstructorBindings[];
   /** True when data came from the sequential fallback (only COBOL data present;
    *  non-COBOL files still need tree-sitter-based import/call processing). */
   sequentialFallback?: boolean;
@@ -49,7 +51,7 @@ const processParsingWithWorkers = async (
     if (lang) parseableFiles.push({ path: file.path, content: file.content });
   }
 
-  if (parseableFiles.length === 0) return { imports: [], calls: [], heritage: [], routes: [] };
+  if (parseableFiles.length === 0) return { imports: [], calls: [], heritage: [], routes: [], constructorBindings: [] };
 
   const total = files.length;
 
@@ -66,6 +68,7 @@ const processParsingWithWorkers = async (
   const allCalls: ExtractedCall[] = [];
   const allHeritage: ExtractedHeritage[] = [];
   const allRoutes: ExtractedRoute[] = [];
+  const allConstructorBindings: FileConstructorBindings[] = [];
   for (const result of chunkResults) {
     for (const node of result.nodes) {
       graph.addNode({
@@ -82,6 +85,7 @@ const processParsingWithWorkers = async (
     for (const sym of result.symbols) {
       symbolTable.add(sym.filePath, sym.name, sym.nodeId, sym.type, {
         parameterCount: sym.parameterCount,
+        returnType: sym.returnType,
         ownerId: sym.ownerId,
       });
     }
@@ -90,11 +94,26 @@ const processParsingWithWorkers = async (
     allCalls.push(...result.calls);
     allHeritage.push(...result.heritage);
     allRoutes.push(...result.routes);
+    allConstructorBindings.push(...result.constructorBindings);
+  }
+
+  // Merge and log skipped languages from workers
+  const skippedLanguages = new Map<string, number>();
+  for (const result of chunkResults) {
+    for (const [lang, count] of Object.entries(result.skippedLanguages)) {
+      skippedLanguages.set(lang, (skippedLanguages.get(lang) || 0) + count);
+    }
+  }
+  if (skippedLanguages.size > 0) {
+    const summary = Array.from(skippedLanguages.entries())
+      .map(([lang, count]) => `${lang}: ${count}`)
+      .join(', ');
+    console.warn(`  Skipped unsupported languages: ${summary}`);
   }
 
   // Final progress
   onFileProgress?.(total, total, 'done');
-  return { imports: allImports, calls: allCalls, heritage: allHeritage, routes: allRoutes };
+  return { imports: allImports, calls: allCalls, heritage: allHeritage, routes: allRoutes, constructorBindings: allConstructorBindings };
 };
 
 // ============================================================================
@@ -110,6 +129,7 @@ const processParsingSequential = async (
 ): Promise<WorkerExtractedData | null> => {
   const parser = await loadParser();
   const total = files.length;
+  const skippedLanguages = new Map<string, number>();
 
   // Collect COBOL extracted data so the pipeline can resolve calls/imports
   // (tree-sitter-based processCalls/processImports skip COBOL files)
@@ -424,6 +444,12 @@ const processParsingSequential = async (
         }
       }
 
+      continue; // COBOL handled via regex — skip tree-sitter path
+    }
+
+    // Skip unsupported languages (e.g. Swift when tree-sitter-swift not installed)
+    if (!isLanguageAvailable(language)) {
+      skippedLanguages.set(language, (skippedLanguages.get(language) || 0) + 1);
       continue;
     }
 
@@ -433,7 +459,7 @@ const processParsingSequential = async (
     try {
       await loadLanguage(language, file.path);
     } catch {
-      continue;  // parser unavailable — already warned in pipeline
+      continue;  // parser unavailable — safety net
     }
 
     const parseContent = file.content;
@@ -523,6 +549,14 @@ const processParsingSequential = async (
         ? extractMethodSignature(definitionNode)
         : undefined;
 
+      // Language-specific return type fallback (e.g. Ruby YARD @return [Type])
+      if (methodSig && !methodSig.returnType && definitionNode) {
+        const tc = typeConfigs[language as keyof typeof typeConfigs];
+        if (tc?.extractReturnType) {
+          methodSig.returnType = tc.extractReturnType(definitionNode);
+        }
+      }
+
       const node: GraphNode = {
         id: nodeId,
         label: nodeLabel as any,
@@ -553,6 +587,7 @@ const processParsingSequential = async (
 
       symbolTable.add(file.path, nodeName, nodeId, nodeLabel, {
         parameterCount: methodSig?.parameterCount,
+        returnType: methodSig?.returnType,
         ownerId: enclosingClassId ?? undefined,
       });
 
@@ -585,10 +620,17 @@ const processParsingSequential = async (
     });
   }
 
+  if (skippedLanguages.size > 0) {
+    const summary = Array.from(skippedLanguages.entries())
+      .map(([lang, count]) => `${lang}: ${count}`)
+      .join(', ');
+    console.warn(`  Skipped unsupported languages: ${summary}`);
+  }
+
   // Return collected COBOL extracted data (if any) so the pipeline can resolve
   // calls/imports via processCallsFromExtracted / processImportsFromExtracted.
   if (cobolImports.length > 0 || cobolCalls.length > 0) {
-    return { imports: cobolImports, calls: cobolCalls, heritage: [], routes: [], sequentialFallback: true };
+    return { imports: cobolImports, calls: cobolCalls, heritage: [], routes: [], constructorBindings: [], sequentialFallback: true };
   }
   return null;
 };

@@ -17,7 +17,7 @@
 import path from 'path';
 import { getStoragePaths, loadMeta } from '../storage/repo-manager.js';
 import { getGitRoot } from '../storage/git.js';
-import { initKuzu, executeQuery, closeKuzu } from '../core/kuzu/kuzu-adapter.js';
+import { initLbug, executeQuery, closeLbug } from '../core/lbug/lbug-adapter.js';
 import { analyzeDeadCode } from '../core/analysis/dead-code.js';
 import { computeMetrics } from '../core/analysis/metrics.js';
 import { scoreModernization } from '../core/analysis/mod-scorer.js';
@@ -51,9 +51,9 @@ export async function assessCommand(targetPath: string | undefined, options: Ass
   console.log(`\nModernization Assessment: ${repoName}`);
   console.log('='.repeat(40));
 
-  // Open KuzuDB
-  const kuzuPath = path.join(storagePath, 'kuzu');
-  await initKuzu(kuzuPath);
+  // Open LadybugDB
+  const lbugPath = path.join(storagePath, 'lbug');
+  await initLbug(lbugPath);
 
   const runQuery = async (cypher: string): Promise<any[]> => {
     return executeQuery(cypher);
@@ -150,6 +150,6 @@ export async function assessCommand(targetPath: string | undefined, options: Ass
       }
     }
   } finally {
-    await closeKuzu();
+    await closeLbug();
   }
 }

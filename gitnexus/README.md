@@ -96,11 +96,11 @@ GitNexus builds a complete knowledge graph of your codebase through a multi-phas
 5. **Processes** — Traces execution flows from entry points through call chains
 6. **Search** — Builds hybrid search indexes for fast retrieval
 
-The result is a **KuzuDB graph database** stored locally in `.gitnexus/` with full-text search and semantic embeddings. Alternatively, you can use [AWS Neptune](#database-backends) as a managed cloud backend.
+The result is a **LadybugDB graph database** stored locally in `.gitnexus/` with full-text search and semantic embeddings. Alternatively, you can use [AWS Neptune](#database-backends) as a managed cloud backend.
 
 ## Database Backends
 
-| | KuzuDB (default) | AWS Neptune |
+| | LadybugDB (default) | AWS Neptune |
 |---|---|---|
 | **Storage** | Local `.gitnexus/` directory | Managed AWS cluster |
 | **Setup** | Zero config | VPC, IAM, cluster provisioning |
@@ -109,7 +109,7 @@ The result is a **KuzuDB graph database** stored locally in `.gitnexus/` with fu
 | **Multi-repo** | Automatic via registry | One cluster per repo (v1) |
 | **Cost** | Free | AWS Neptune pricing |
 
-KuzuDB is the default and recommended for most users. Neptune is for teams that need a managed, always-on graph database in AWS.
+LadybugDB is the default and recommended for most users. Neptune is for teams that need a managed, always-on graph database in AWS.
 
 ```bash
 # Index with Neptune backend
@@ -180,7 +180,7 @@ gitnexus analyze --embeddings \
 
 See the [embeddings guide](../docs/embeddings.md) for detailed provider setup, GPU acceleration, and troubleshooting.
 
-> **Note:** Neptune does not support embeddings in v1. Embeddings are stored in KuzuDB only.
+> **Note:** Neptune does not support embeddings in v1. Embeddings are stored in LadybugDB only.
 
 ## MCP Tools
 
@@ -290,7 +290,7 @@ Installed automatically by both `gitnexus analyze` (per-repo) and `gitnexus setu
 
 ## Privacy
 
-- **KuzuDB (default):** All processing happens locally on your machine. No code is sent to any server.
+- **LadybugDB (default):** All processing happens locally on your machine. No code is sent to any server.
 - **Neptune:** Code metadata (symbol names, file paths, relationships) is sent to your AWS Neptune cluster. Source code content is not stored in the graph.
 - Index stored in `.gitnexus/` inside your repo (gitignored)
 - Global registry at `~/.gitnexus/` stores only paths and metadata

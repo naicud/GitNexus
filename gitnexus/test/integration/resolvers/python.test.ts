@@ -342,6 +342,53 @@ describe('Python local definition shadows import', () => {
 // Constructor-call resolution: User("alice") resolves to User class
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Constructor-inferred type resolution: user = User(); user.save() → User.save
+// Cross-file SymbolTable verification (no explicit type annotations)
+// ---------------------------------------------------------------------------
+
+describe('Python constructor-inferred type resolution', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'python-constructor-type-inference'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects User and Repo classes, both with save methods', () => {
+    expect(getNodesByLabel(result, 'Class')).toContain('User');
+    expect(getNodesByLabel(result, 'Class')).toContain('Repo');
+    const saveFns = getNodesByLabel(result, 'Function').filter(m => m === 'save');
+    expect(saveFns.length).toBe(2);
+  });
+
+  it('resolves user.save() to models/user.py via constructor-inferred type', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const userSave = calls.find(c => c.target === 'save' && c.targetFilePath === 'models/user.py');
+    expect(userSave).toBeDefined();
+    expect(userSave!.source).toBe('process_entities');
+  });
+
+  it('resolves repo.save() to models/repo.py via constructor-inferred type', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const repoSave = calls.find(c => c.target === 'save' && c.targetFilePath === 'models/repo.py');
+    expect(repoSave).toBeDefined();
+    expect(repoSave!.source).toBe('process_entities');
+  });
+
+  it('emits exactly 2 save() CALLS edges (one per receiver type)', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCalls = calls.filter(c => c.target === 'save');
+    expect(saveCalls.length).toBe(2);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Constructor-call resolution: User("alice") resolves to User class
+// ---------------------------------------------------------------------------
+
 describe('Python constructor-call resolution', () => {
   let result: PipelineResult;
 
@@ -379,5 +426,526 @@ describe('Python constructor-call resolution', () => {
     expect(saveCall).toBeDefined();
     expect(saveCall!.source).toBe('process');
     expect(saveCall!.targetFilePath).toBe('models.py');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// self.save() resolves to enclosing class's own save method
+// ---------------------------------------------------------------------------
+
+describe('Python self resolution', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'python-self-this-resolution'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects User and Repo classes, each with a save function', () => {
+    expect(getNodesByLabel(result, 'Class')).toEqual(['Repo', 'User']);
+    const saveFns = getNodesByLabel(result, 'Function').filter(m => m === 'save');
+    expect(saveFns.length).toBe(2);
+  });
+
+  it('resolves self.save() inside User.process to User.save, not Repo.save', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCall = calls.find(c => c.target === 'save' && c.source === 'process');
+    expect(saveCall).toBeDefined();
+    expect(saveCall!.targetFilePath).toBe('models/user.py');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Parent class resolution: EXTENDS edge
+// ---------------------------------------------------------------------------
+
+describe('Python parent resolution', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'python-parent-resolution'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects BaseModel and User classes', () => {
+    expect(getNodesByLabel(result, 'Class')).toEqual(['BaseModel', 'User']);
+  });
+
+  it('emits EXTENDS edge: User → BaseModel', () => {
+    const extends_ = getRelationships(result, 'EXTENDS');
+    expect(extends_.length).toBe(1);
+    expect(extends_[0].source).toBe('User');
+    expect(extends_[0].target).toBe('BaseModel');
+  });
+
+  it('EXTENDS edge points to real graph node in base.py', () => {
+    const extends_ = getRelationships(result, 'EXTENDS');
+    const target = result.graph.getNode(extends_[0].rel.targetId);
+    expect(target).toBeDefined();
+    expect(target!.properties.filePath).toBe('models/base.py');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// super().save() resolves to parent class's save method
+// ---------------------------------------------------------------------------
+
+describe('Python super resolution', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'python-super-resolution'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects BaseModel, User, and Repo classes', () => {
+    expect(getNodesByLabel(result, 'Class')).toEqual(['BaseModel', 'Repo', 'User']);
+  });
+
+  it('resolves super().save() inside User to BaseModel.save, not Repo.save', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const superSave = calls.find(c => c.source === 'save' && c.target === 'save'
+      && c.targetFilePath === 'models/base.py');
+    expect(superSave).toBeDefined();
+    const repoSave = calls.find(c => c.target === 'save' && c.targetFilePath === 'models/repo.py');
+    expect(repoSave).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Python qualified constructor: user = models.User("alice"); user.save()
+// ---------------------------------------------------------------------------
+
+describe('Python qualified constructor inference', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'python-qualified-constructor'),
+      () => {},
+    );
+  }, 60000);
+
+  it('resolves user.save() via qualified constructor (models.User)', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCall = calls.find(c => c.target === 'save' && c.targetFilePath === 'models.py');
+    expect(saveCall).toBeDefined();
+    expect(saveCall!.source).toBe('main');
+  });
+
+  it('resolves user.greet() via qualified constructor (models.User)', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const greetCall = calls.find(c => c.target === 'greet' && c.targetFilePath === 'models.py');
+    expect(greetCall).toBeDefined();
+    expect(greetCall!.source).toBe('main');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Walrus operator: if (user := User("alice")): user.save()
+// ---------------------------------------------------------------------------
+
+describe('Python walrus operator type inference', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'python-walrus-operator'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects User class with save and greet methods', () => {
+    expect(getNodesByLabel(result, 'Class')).toContain('User');
+    expect(getNodesByLabel(result, 'Function')).toContain('save');
+    expect(getNodesByLabel(result, 'Function')).toContain('greet');
+  });
+
+  it('resolves user.save() via walrus operator constructor inference', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCall = calls.find(c => c.target === 'save' && c.targetFilePath === 'models.py');
+    expect(saveCall).toBeDefined();
+    expect(saveCall!.source).toBe('process');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Class-level annotations: file-scope `user: User` disambiguates method calls
+// ---------------------------------------------------------------------------
+
+describe('Python class-level annotation resolution', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'python-class-annotations'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects User and Repo classes, both with save methods', () => {
+    expect(getNodesByLabel(result, 'Class')).toContain('User');
+    expect(getNodesByLabel(result, 'Class')).toContain('Repo');
+    const saveFns = getNodesByLabel(result, 'Function').filter(m => m === 'save');
+    expect(saveFns.length).toBe(2);
+  });
+
+  it('resolves active_user.save() to User.save via file-level annotation', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const userSave = calls.find(c => c.target === 'save' && c.targetFilePath === 'user.py');
+    expect(userSave).toBeDefined();
+    expect(userSave!.source).toBe('process');
+  });
+
+  it('resolves active_repo.save() to Repo.save via file-level annotation', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const repoSave = calls.find(c => c.target === 'save' && c.targetFilePath === 'repo.py');
+    expect(repoSave).toBeDefined();
+    expect(repoSave!.source).toBe('process');
+  });
+
+  it('emits exactly 2 save() CALLS edges (one per receiver type)', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCalls = calls.filter(c => c.target === 'save');
+    expect(saveCalls.length).toBe(2);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Return type inference: user = get_user('alice'); user.save()
+// Python's scanner captures ALL call assignments, enabling return type inference.
+// ---------------------------------------------------------------------------
+
+describe('Python return type inference', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'python-return-type-inference'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects User class', () => {
+    expect(getNodesByLabel(result, 'Class')).toContain('User');
+  });
+
+  it('detects get_user and save symbols', () => {
+    // Python methods inside classes may be labeled Method or Function depending on nesting
+    const allSymbols = [...getNodesByLabel(result, 'Function'), ...getNodesByLabel(result, 'Method')];
+    expect(allSymbols).toContain('get_user');
+    expect(allSymbols).toContain('save');
+  });
+
+  it('resolves user.save() to User#save via return type inference from get_user() -> User', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCall = calls.find(c =>
+      c.target === 'save' && c.source === 'process_user'
+    );
+    expect(saveCall).toBeDefined();
+    expect(saveCall!.targetFilePath).toContain('models.py');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Issue #289: static/classmethod classes must have HAS_METHOD edges
+// ---------------------------------------------------------------------------
+
+describe('Python static/classmethod class resolution (issue #289)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'python-static-class-methods'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects UserService and AdminService classes', () => {
+    expect(getNodesByLabel(result, 'Class')).toContain('UserService');
+    expect(getNodesByLabel(result, 'Class')).toContain('AdminService');
+  });
+
+  it('detects all static/class methods as symbols', () => {
+    const allSymbols = [...getNodesByLabel(result, 'Function'), ...getNodesByLabel(result, 'Method')];
+    expect(allSymbols).toContain('find_user');
+    expect(allSymbols).toContain('create_user');
+    expect(allSymbols).toContain('from_config');
+    expect(allSymbols).toContain('delete_user');
+  });
+
+  it('emits HAS_METHOD edges linking static methods to their enclosing class', () => {
+    // This is the core of issue #289: without HAS_METHOD, context() and impact()
+    // return empty for classes whose methods are all @staticmethod/@classmethod
+    const hasMethod = getRelationships(result, 'HAS_METHOD');
+
+    const userServiceMethods = hasMethod.filter(e => e.source === 'UserService');
+    expect(userServiceMethods.length).toBeGreaterThanOrEqual(3); // find_user, create_user, from_config
+
+    const adminServiceMethods = hasMethod.filter(e => e.source === 'AdminService');
+    expect(adminServiceMethods.length).toBeGreaterThanOrEqual(2); // find_user, delete_user
+  });
+
+  it('resolves unique static method calls (create_user, delete_user, from_config)', () => {
+    const calls = getRelationships(result, 'CALLS');
+    // delete_user is unique to AdminService — should resolve
+    const deleteCall = calls.find(c =>
+      c.target === 'delete_user' && c.source === 'process' && c.targetFilePath.includes('service.py'),
+    );
+    expect(deleteCall).toBeDefined();
+
+    // create_user is unique to UserService — should resolve
+    const createCall = calls.find(c =>
+      c.target === 'create_user' && c.source === 'process' && c.targetFilePath.includes('service.py'),
+    );
+    expect(createCall).toBeDefined();
+  });
+
+  it('does not emit ambiguous find_user() when both classes define it (known limitation)', () => {
+    // UserService.find_user() and AdminService.find_user() are ambiguous — the pipeline
+    // refuses to guess. Static method calls like ClassName.method() don't have a typed
+    // receiver variable, so receiver-constrained disambiguation doesn't apply.
+    // This is expected: no false edges is better than wrong edges.
+    const calls = getRelationships(result, 'CALLS');
+    const findCalls = calls.filter(c =>
+      c.target === 'find_user' && c.source === 'process',
+    );
+    // Either 0 (refused ambiguous) or 2 (both resolved) — not 1 (wrong guess)
+    expect(findCalls.length === 0 || findCalls.length === 2).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Nullable receiver: user: User | None = find_user(); user.save()
+// Python 3.10+ union syntax — stripNullable unwraps `User | None` → `User`
+// ---------------------------------------------------------------------------
+
+describe('Python nullable receiver resolution', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'python-nullable-receiver'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects User and Repo classes, both with save functions', () => {
+    expect(getNodesByLabel(result, 'Class')).toContain('User');
+    expect(getNodesByLabel(result, 'Class')).toContain('Repo');
+    const saveFns = getNodesByLabel(result, 'Function').filter(m => m === 'save');
+    expect(saveFns.length).toBe(2);
+  });
+
+  it('resolves user.save() to User.save via nullable receiver typing', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const userSave = calls.find(c => c.target === 'save' && c.targetFilePath === 'user.py');
+    expect(userSave).toBeDefined();
+    expect(userSave!.source).toBe('process_entities');
+  });
+
+  it('resolves repo.save() to Repo.save via nullable receiver typing', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const repoSave = calls.find(c => c.target === 'save' && c.targetFilePath === 'repo.py');
+    expect(repoSave).toBeDefined();
+    expect(repoSave!.source).toBe('process_entities');
+  });
+
+  it('user.save() does NOT resolve to Repo.save (negative disambiguation)', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCalls = calls.filter(c => c.target === 'save' && c.source === 'process_entities');
+    // Each save() call should resolve to exactly one target file
+    const userSaveToRepo = saveCalls.filter(c => c.targetFilePath === 'repo.py');
+    const repoSaveToUser = saveCalls.filter(c => c.targetFilePath === 'user.py');
+    // Exactly 1 edge to each file (not 2 to either)
+    expect(userSaveToRepo.length).toBe(1);
+    expect(repoSaveToUser.length).toBe(1);
+  });
+
+  it('emits exactly 2 save() CALLS edges (one per receiver type)', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCalls = calls.filter(c => c.target === 'save');
+    expect(saveCalls.length).toBe(2);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Assignment chain propagation (Phase 4.3)
+// ---------------------------------------------------------------------------
+
+describe('Python assignment chain propagation', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'python-assignment-chain'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects User and Repo classes each with a save method', () => {
+    expect(getNodesByLabel(result, 'Class')).toContain('User');
+    expect(getNodesByLabel(result, 'Class')).toContain('Repo');
+    const saveFns = getNodesByLabel(result, 'Function').filter(m => m === 'save');
+    expect(saveFns.length).toBe(2);
+  });
+
+  it('resolves alias.save() to User#save via assignment chain', () => {
+    const calls = getRelationships(result, 'CALLS');
+    // Positive: alias.save() must resolve to User#save
+    const userSave = calls.find(c =>
+      c.target === 'save' && c.source === 'process' && c.targetFilePath.includes('user.py'),
+    );
+    expect(userSave).toBeDefined();
+  });
+
+  it('alias.save() does NOT resolve to Repo#save', () => {
+    const calls = getRelationships(result, 'CALLS');
+    // Negative: only one save call from process to User#save
+    const wrongCall = calls.filter(c =>
+      c.target === 'save' && c.source === 'process' && c.targetFilePath.includes('user.py'),
+    );
+    expect(wrongCall.length).toBe(1);
+  });
+
+  it('resolves r_alias.save() to Repo#save via assignment chain', () => {
+    const calls = getRelationships(result, 'CALLS');
+    // Positive: r_alias.save() must resolve to Repo#save
+    const repoSave = calls.find(c =>
+      c.target === 'save' && c.source === 'process' && c.targetFilePath.includes('repo.py'),
+    );
+    expect(repoSave).toBeDefined();
+  });
+
+  it('each alias resolves to its own class, not the other', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const userSave = calls.find(c =>
+      c.target === 'save' && c.source === 'process' && c.targetFilePath.includes('user.py'),
+    );
+    const repoSave = calls.find(c =>
+      c.target === 'save' && c.source === 'process' && c.targetFilePath.includes('repo.py'),
+    );
+    expect(userSave).toBeDefined();
+    expect(repoSave).toBeDefined();
+    expect(userSave!.targetFilePath).not.toBe(repoSave!.targetFilePath);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Python nullable (User | None) + assignment chain combined.
+// Python 3.10+ union syntax is parsed as binary_operator by tree-sitter,
+// stored as raw text "User | None" in TypeEnv. stripNullable's
+// NULLABLE_KEYWORDS.has() path must resolve it at lookup time.
+// ---------------------------------------------------------------------------
+
+describe('Python nullable (User | None) + assignment chain combined', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'python-nullable-chain'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects User and Repo classes each with a save method', () => {
+    expect(getNodesByLabel(result, 'Class')).toContain('User');
+    expect(getNodesByLabel(result, 'Class')).toContain('Repo');
+    const saveFns = getNodesByLabel(result, 'Function').filter(m => m === 'save');
+    expect(saveFns.length).toBe(2);
+  });
+
+  it('resolves alias.save() to User#save when source is User | None', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const userSave = calls.find(c =>
+      c.target === 'save' && c.source === 'nullable_chain_user' && c.targetFilePath?.includes('user.py'),
+    );
+    expect(userSave).toBeDefined();
+  });
+
+  it('alias.save() from User | None does NOT resolve to Repo#save (negative)', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const wrongCall = calls.find(c =>
+      c.target === 'save' && c.source === 'nullable_chain_user' && c.targetFilePath?.includes('repo.py'),
+    );
+    expect(wrongCall).toBeUndefined();
+  });
+
+  it('resolves alias.save() to Repo#save when source is Repo | None', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const repoSave = calls.find(c =>
+      c.target === 'save' && c.source === 'nullable_chain_repo' && c.targetFilePath?.includes('repo.py'),
+    );
+    expect(repoSave).toBeDefined();
+  });
+
+  it('alias.save() from Repo | None does NOT resolve to User#save (negative)', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const wrongCall = calls.find(c =>
+      c.target === 'save' && c.source === 'nullable_chain_repo' && c.targetFilePath?.includes('user.py'),
+    );
+    expect(wrongCall).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Python walrus operator (:=) assignment chain.
+// Tests that extractPendingAssignment handles named_expression nodes
+// in addition to regular assignment nodes.
+// ---------------------------------------------------------------------------
+
+describe('Python walrus operator (:=) assignment chain', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'python-walrus-chain'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects User and Repo classes each with a save function', () => {
+    expect(getNodesByLabel(result, 'Class')).toContain('User');
+    expect(getNodesByLabel(result, 'Class')).toContain('Repo');
+    const saveFns = getNodesByLabel(result, 'Function').filter(m => m === 'save');
+    expect(saveFns.length).toBe(2);
+  });
+
+  it('resolves alias.save() to User#save via regular + walrus chains', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const userSave = calls.find(c =>
+      c.target === 'save' && c.source === 'walrus_chain_user' && c.targetFilePath?.includes('user.py'),
+    );
+    expect(userSave).toBeDefined();
+  });
+
+  it('save() in walrus_chain_user does NOT resolve to Repo#save (negative)', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const wrongCall = calls.find(c =>
+      c.target === 'save' && c.source === 'walrus_chain_user' && c.targetFilePath?.includes('repo.py'),
+    );
+    expect(wrongCall).toBeUndefined();
+  });
+
+  it('resolves alias.save() to Repo#save via regular + walrus chains', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const repoSave = calls.find(c =>
+      c.target === 'save' && c.source === 'walrus_chain_repo' && c.targetFilePath?.includes('repo.py'),
+    );
+    expect(repoSave).toBeDefined();
+  });
+
+  it('save() in walrus_chain_repo does NOT resolve to User#save (negative)', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const wrongCall = calls.find(c =>
+      c.target === 'save' && c.source === 'walrus_chain_repo' && c.targetFilePath?.includes('user.py'),
+    );
+    expect(wrongCall).toBeUndefined();
   });
 });

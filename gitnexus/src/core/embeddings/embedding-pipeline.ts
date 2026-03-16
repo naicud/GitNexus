@@ -2,10 +2,10 @@
  * Embedding Pipeline Module
  *
  * Orchestrates the embedding process:
- * 1. Query embeddable nodes from KuzuDB (paginated)
+ * 1. Query embeddable nodes from LadybugDB (paginated)
  * 2. Generate text representations
  * 3. Batch embed using the injected IEmbeddingProvider
- * 4. Update KuzuDB with embeddings
+ * 4. Update LadybugDB with embeddings
  * 5. Create vector index for semantic search
  */
 
@@ -101,9 +101,26 @@ const batchInsertEmbeddings = async (
   await executeWithReusedStatement(cypher, paramsList);
 };
 
+/**
+ * Create the vector index for semantic search
+ * Now indexes the separate CodeEmbedding table
+ */
+let vectorExtensionLoaded = false;
+
 const createVectorIndex = async (
   executeQuery: (cypher: string) => Promise<any[]>
 ): Promise<void> => {
+  // LadybugDB v0.15+ requires explicit VECTOR extension loading (once per session)
+  if (!vectorExtensionLoaded) {
+    try {
+      await executeQuery('INSTALL VECTOR');
+      await executeQuery('LOAD EXTENSION VECTOR');
+      vectorExtensionLoaded = true;
+    } catch {
+      vectorExtensionLoaded = true;
+    }
+  }
+
   try {
     await executeQuery(
       `CALL CREATE_VECTOR_INDEX('CodeEmbedding', 'code_embedding_idx', 'embedding', metric := 'cosine')`,
@@ -237,35 +254,61 @@ export const semanticSearch = async (
   const embResults = await executeQuery(vectorQuery);
   if (embResults.length === 0) return [];
 
-  const results: SemanticSearchResult[] = [];
-
+  // Group results by label for batched metadata queries
+  const byLabel = new Map<string, Array<{ nodeId: string; distance: number }>>();
   for (const embRow of embResults) {
     const nodeId = embRow.nodeId ?? embRow[0];
     const distance = embRow.distance ?? embRow[1];
-
     const labelEndIdx = nodeId.indexOf(':');
     const label = labelEndIdx > 0 ? nodeId.substring(0, labelEndIdx) : 'Unknown';
+    if (!byLabel.has(label)) byLabel.set(label, []);
+    byLabel.get(label)!.push({ nodeId, distance });
+  }
 
+  // Batch-fetch metadata per label
+  const results: SemanticSearchResult[] = [];
+
+  for (const [label, items] of byLabel) {
+    const idList = items.map(i => `'${i.nodeId.replace(/'/g, "''")}'`).join(', ');
     try {
-      const nodeQuery = label === 'File'
-        ? `MATCH (n:File {id: '${nodeId.replace(/'/g, "''")}'}) RETURN n.name AS name, n.filePath AS filePath`
-        : `MATCH (n:${label} {id: '${nodeId.replace(/'/g, "''")}'}) RETURN n.name AS name, n.filePath AS filePath, n.startLine AS startLine, n.endLine AS endLine`;
-
+      let nodeQuery: string;
+      if (label === 'File') {
+        nodeQuery = `
+          MATCH (n:File) WHERE n.id IN [${idList}]
+          RETURN n.id AS id, n.name AS name, n.filePath AS filePath
+        `;
+      } else {
+        nodeQuery = `
+          MATCH (n:${label}) WHERE n.id IN [${idList}]
+          RETURN n.id AS id, n.name AS name, n.filePath AS filePath,
+                 n.startLine AS startLine, n.endLine AS endLine
+        `;
+      }
       const nodeRows = await executeQuery(nodeQuery);
-      if (nodeRows.length > 0) {
-        const nodeRow = nodeRows[0];
-        results.push({
-          nodeId,
-          name: nodeRow.name ?? nodeRow[0] ?? '',
-          label,
-          filePath: nodeRow.filePath ?? nodeRow[1] ?? '',
-          distance,
-          startLine: label !== 'File' ? (nodeRow.startLine ?? nodeRow[2]) : undefined,
-          endLine: label !== 'File' ? (nodeRow.endLine ?? nodeRow[3]) : undefined,
-        });
+      const rowMap = new Map<string, any>();
+      for (const row of nodeRows) {
+        const id = row.id ?? row[0];
+        rowMap.set(id, row);
+      }
+      for (const item of items) {
+        const nodeRow = rowMap.get(item.nodeId);
+        if (nodeRow) {
+          results.push({
+            nodeId: item.nodeId,
+            name: nodeRow.name ?? nodeRow[1] ?? '',
+            label,
+            filePath: nodeRow.filePath ?? nodeRow[2] ?? '',
+            distance: item.distance,
+            startLine: label !== 'File' ? (nodeRow.startLine ?? nodeRow[3]) : undefined,
+            endLine: label !== 'File' ? (nodeRow.endLine ?? nodeRow[4]) : undefined,
+          });
+        }
       }
     } catch { /* table might not exist, skip */ }
   }
+
+  // Re-sort by distance since batch queries may have mixed order
+  results.sort((a, b) => a.distance - b.distance);
 
   return results;
 };
