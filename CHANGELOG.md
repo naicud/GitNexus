@@ -23,6 +23,7 @@ All notable changes to GitNexus will be documented in this file.
 - **Call expression matching** in tree-sitter queries (#234 via #237) — @ex-nihilo-jg
 - **DeepSeek model configurations** (#217) — @JasonOA888
 - 282+ new unit tests, 178 integration resolver tests across 9 languages, 53 test files, 1146 total tests passing
+- **AWS Neptune graph database backend** — optional managed cloud alternative to KuzuDB. CLI flags `--db neptune --neptune-endpoint <host> --neptune-region <region>`, env vars (`GITNEXUS_DB_TYPE`, `GITNEXUS_NEPTUNE_ENDPOINT`, `GITNEXUS_NEPTUNE_REGION`), IAM SigV4 authentication via AWS SDK credential chain, UNWIND batch ingestion (batch size 500), `/api/db/test` connection test endpoint, Web UI database settings panel, transparent MCP tool dispatch. v1 limitations: no FTS indexes (falls back to CONTAINS predicate), no embeddings support, one Neptune cluster per repository. See [docs/neptune-setup.md](docs/neptune-setup.md) — @naicud
 
 ### Fixed
 

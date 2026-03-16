@@ -17,8 +17,13 @@ import {
   listRegisteredRepos,
   type RegistryEntry,
 } from '../../storage/repo-manager.js';
+import type { NeptuneDbConfig } from '../../core/db/interfaces.js';
+import { NeptuneAdapter } from '../../core/db/neptune/neptune-adapter.js';
 // AI context generation is CLI-only (gitnexus analyze)
 // import { generateAIContextFiles } from '../../cli/ai-context.js';
+
+/** Per-repo Neptune adapters (HTTP is stateless — no pool needed) */
+const neptuneAdapters = new Map<string, NeptuneAdapter>();
 
 /**
  * Quick test-file detection for filtering impact results.
@@ -81,6 +86,10 @@ interface RepoHandle {
   indexedAt: string;
   lastCommit: string;
   stats?: RegistryEntry['stats'];
+  /** DB backend config — present when repo has a non-default DB (e.g. Neptune) */
+  db?: { type: 'kuzu' | 'neptune'; endpoint?: string; region?: string; port?: number; kuzuPath?: string };
+  /** Embedding config used during indexing — for query-time provider matching */
+  embedding?: { provider: string; model: string; dimensions: number; endpoint?: string };
 }
 
 export class LocalBackend {
@@ -124,6 +133,8 @@ export class LocalBackend {
         indexedAt: entry.indexedAt,
         lastCommit: entry.lastCommit,
         stats: entry.stats,
+        db: (entry as any).db,
+        embedding: entry.embedding,
       };
 
       this.repos.set(id, handle);
@@ -147,6 +158,11 @@ export class LocalBackend {
         this.repos.delete(id);
         this.contextCache.delete(id);
         this.initializedRepos.delete(id);
+        const neptune = neptuneAdapters.get(id);
+        if (neptune) {
+          neptune.close().catch(() => {});
+          neptuneAdapters.delete(id);
+        }
       }
     }
   }
@@ -238,11 +254,21 @@ export class LocalBackend {
   // ─── Lazy KuzuDB Init ────────────────────────────────────────────
 
   private async ensureInitialized(repoId: string): Promise<void> {
-    // Always check the actual pool — the idle timer may have evicted the connection
-    if (this.initializedRepos.has(repoId) && isKuzuReady(repoId)) return;
-
     const handle = this.repos.get(repoId);
     if (!handle) throw new Error(`Unknown repo: ${repoId}`);
+
+    // Neptune path: create adapter if not yet registered (HTTP stateless — no init needed)
+    if (handle.db?.type === 'neptune') {
+      if (!neptuneAdapters.has(repoId)) {
+        neptuneAdapters.set(repoId, new NeptuneAdapter(handle.db as NeptuneDbConfig));
+      }
+      this.initializedRepos.add(repoId);
+      return;
+    }
+
+    // KuzuDB path (unchanged below)
+    // Always check the actual pool — the idle timer may have evicted the connection
+    if (this.initializedRepos.has(repoId) && isKuzuReady(repoId)) return;
 
     try {
       await initKuzu(repoId, handle.kuzuPath);
@@ -310,6 +336,8 @@ export class LocalBackend {
         return this.detectChanges(repo, params);
       case 'rename':
         return this.rename(repo, params);
+      case 'assess':
+        return this.assess(repo, params);
       // Legacy aliases for backwards compatibility
       case 'search':
         return this.query(repo, params);
@@ -353,10 +381,28 @@ export class LocalBackend {
     
     // Step 1: Run hybrid search to get matching symbols
     const searchLimit = processLimit * maxSymbolsPerProcess; // fetch enough raw results
-    const [bm25Results, semanticResults] = await Promise.all([
-      this.bm25Search(repo, searchQuery, searchLimit),
-      this.semanticSearch(repo, searchQuery, searchLimit),
-    ]);
+    const isNeptune = neptuneAdapters.has(repo.id);
+
+    let bm25Results: any[];
+    let semanticResults: any[];
+
+    if (isNeptune) {
+      // Neptune: text predicate search (no FTS / no embeddings)
+      bm25Results = await this.runParameterized(repo.id, `
+        MATCH (n)
+        WHERE n.name CONTAINS $q OR n.content CONTAINS $q
+        RETURN n.id AS nodeId, n.name AS name, labels(n)[0] AS type,
+               n.filePath AS filePath, n.startLine AS startLine, 1.0 AS score
+        ORDER BY n.name
+        LIMIT 50
+      `, { q: searchQuery });
+      semanticResults = [];
+    } else {
+      [bm25Results, semanticResults] = await Promise.all([
+        this.bm25Search(repo, searchQuery, searchLimit),
+        this.semanticSearch(repo, searchQuery, searchLimit),
+      ]);
+    }
     
     // Merge via reciprocal rank fusion
     const scoreMap = new Map<string, { score: number; data: any }>();
@@ -408,7 +454,7 @@ export class LocalBackend {
       // Find processes this symbol participates in
       let processRows: any[] = [];
       try {
-        processRows = await executeParameterized(repo.id, `
+        processRows = await this.runParameterized(repo.id, `
           MATCH (n {id: $nodeId})-[r:CodeRelation {type: 'STEP_IN_PROCESS'}]->(p:Process)
           RETURN p.id AS pid, p.label AS label, p.heuristicLabel AS heuristicLabel, p.processType AS processType, p.stepCount AS stepCount, r.step AS step
         `, { nodeId: sym.nodeId });
@@ -418,7 +464,7 @@ export class LocalBackend {
       let cohesion = 0;
       let module: string | undefined;
       try {
-        const cohesionRows = await executeParameterized(repo.id, `
+        const cohesionRows = await this.runParameterized(repo.id, `
           MATCH (n {id: $nodeId})-[:CodeRelation {type: 'MEMBER_OF'}]->(c:Community)
           RETURN c.cohesion AS cohesion, c.heuristicLabel AS module
           LIMIT 1
@@ -433,7 +479,7 @@ export class LocalBackend {
       let content: string | undefined;
       if (includeContent) {
         try {
-          const contentRows = await executeParameterized(repo.id, `
+          const contentRows = await this.runParameterized(repo.id, `
             MATCH (n {id: $nodeId})
             RETURN n.content AS content
           `, { nodeId: sym.nodeId });
@@ -551,7 +597,7 @@ export class LocalBackend {
     for (const bm25Result of bm25Results) {
       const fullPath = bm25Result.filePath;
       try {
-        const symbols = await executeParameterized(repo.id, `
+        const symbols = await this.runParameterized(repo.id, `
           MATCH (n)
           WHERE n.filePath = $filePath
           RETURN n.id AS id, n.name AS name, labels(n)[0] AS type, n.filePath AS filePath, n.startLine AS startLine, n.endLine AS endLine
@@ -598,17 +644,27 @@ export class LocalBackend {
    */
   private async semanticSearch(repo: RepoHandle, query: string, limit: number): Promise<any[]> {
     try {
-      // Check if embedding table exists before loading the model (avoids heavy model init when embeddings are off)
-      const tableCheck = await executeQuery(repo.id, `MATCH (e:CodeEmbedding) RETURN COUNT(*) AS cnt LIMIT 1`);
+      // Neptune path: use app-side cosine similarity search
+      if (repo.db?.type === 'neptune') {
+        const { embedQuery, getEmbeddingDims } = await import('../core/embedder.js');
+        const queryVec = await embedQuery(query, repo.embedding);
+        const { neptuneSemanticSearch } = await import('../../core/db/neptune/neptune-vector-search.js');
+        const adapter = neptuneAdapters.get(repo.id);
+        if (!adapter) return [];
+        return neptuneSemanticSearch(adapter, queryVec, limit);
+      }
+
+      // KuzuDB path: use vector index
+      const tableCheck = await this.runQuery(repo.id, `MATCH (e:CodeEmbedding) RETURN COUNT(*) AS cnt LIMIT 1`);
       if (!tableCheck.length || (tableCheck[0].cnt ?? tableCheck[0][0]) === 0) return [];
 
       const { embedQuery, getEmbeddingDims } = await import('../core/embedder.js');
-      const queryVec = await embedQuery(query);
-      const dims = getEmbeddingDims();
+      const queryVec = await embedQuery(query, repo.embedding);
+      const dims = getEmbeddingDims(repo.embedding);
       const queryVecStr = `[${queryVec.join(',')}]`;
-      
+
       const vectorQuery = `
-        CALL QUERY_VECTOR_INDEX('CodeEmbedding', 'code_embedding_idx', 
+        CALL QUERY_VECTOR_INDEX('CodeEmbedding', 'code_embedding_idx',
           CAST(${queryVecStr} AS FLOAT[${dims}]), ${limit})
         YIELD node AS emb, distance
         WITH emb, distance
@@ -616,29 +672,28 @@ export class LocalBackend {
         RETURN emb.nodeId AS nodeId, distance
         ORDER BY distance
       `;
-      
-      const embResults = await executeQuery(repo.id, vectorQuery);
-      
+
+      const embResults = await this.runQuery(repo.id, vectorQuery);
+
       if (embResults.length === 0) return [];
-      
+
       const results: any[] = [];
-      
+
       for (const embRow of embResults) {
         const nodeId = embRow.nodeId ?? embRow[0];
         const distance = embRow.distance ?? embRow[1];
-        
+
         const labelEndIdx = nodeId.indexOf(':');
         const label = labelEndIdx > 0 ? nodeId.substring(0, labelEndIdx) : 'Unknown';
-        
-        // Validate label against known node types to prevent Cypher injection
+
         if (!VALID_NODE_LABELS.has(label)) continue;
-        
+
         try {
           const nodeQuery = label === 'File'
             ? `MATCH (n:File {id: $nodeId}) RETURN n.name AS name, n.filePath AS filePath`
             : `MATCH (n:\`${label}\` {id: $nodeId}) RETURN n.name AS name, n.filePath AS filePath, n.startLine AS startLine, n.endLine AS endLine`;
 
-          const nodeRows = await executeParameterized(repo.id, nodeQuery, { nodeId });
+          const nodeRows = await this.runParameterized(repo.id, nodeQuery, { nodeId });
           if (nodeRows.length > 0) {
             const nodeRow = nodeRows[0];
             results.push({
@@ -653,7 +708,7 @@ export class LocalBackend {
           }
         } catch {}
       }
-      
+
       return results;
     } catch {
       // Expected when embeddings are disabled — silently fall back to BM25-only
@@ -679,7 +734,7 @@ export class LocalBackend {
     }
 
     try {
-      const result = await executeQuery(repo.id, params.query);
+      const result = await this.runQuery(repo.id, params.query);
       return result;
     } catch (err: any) {
       return { error: err.message || 'Query failed' };
@@ -771,7 +826,7 @@ export class LocalBackend {
       try {
         // Fetch more raw communities than the display limit so aggregation has enough data
         const rawLimit = Math.max(limit * 5, 200);
-        const clusters = await executeQuery(repo.id, `
+        const clusters = await this.runQuery(repo.id, `
           MATCH (c:Community)
           RETURN c.id AS id, c.label AS label, c.heuristicLabel AS heuristicLabel, c.cohesion AS cohesion, c.symbolCount AS symbolCount
           ORDER BY c.symbolCount DESC
@@ -792,7 +847,7 @@ export class LocalBackend {
     
     if (params.showProcesses !== false) {
       try {
-        const processes = await executeQuery(repo.id, `
+        const processes = await this.runQuery(repo.id, `
           MATCH (p:Process)
           RETURN p.id AS id, p.label AS label, p.heuristicLabel AS heuristicLabel, p.processType AS processType, p.stepCount AS stepCount
           ORDER BY p.stepCount DESC
@@ -836,7 +891,7 @@ export class LocalBackend {
     let symbols: any[];
     
     if (uid) {
-      symbols = await executeParameterized(repo.id, `
+      symbols = await this.runParameterized(repo.id, `
         MATCH (n {id: $uid})
         RETURN n.id AS id, n.name AS name, labels(n)[0] AS type, n.filePath AS filePath, n.startLine AS startLine, n.endLine AS endLine${include_content ? ', n.content AS content' : ''}
         LIMIT 1
@@ -857,7 +912,7 @@ export class LocalBackend {
         queryParams = { symName: name! };
       }
 
-      symbols = await executeParameterized(repo.id, `
+      symbols = await this.runParameterized(repo.id, `
         MATCH (n) ${whereClause}
         RETURN n.id AS id, n.name AS name, labels(n)[0] AS type, n.filePath AS filePath, n.startLine AS startLine, n.endLine AS endLine${include_content ? ', n.content AS content' : ''}
         LIMIT 10
@@ -888,7 +943,7 @@ export class LocalBackend {
     const symId = sym.id || sym[0];
 
     // Categorized incoming refs
-    const incomingRows = await executeParameterized(repo.id, `
+    const incomingRows = await this.runParameterized(repo.id, `
       MATCH (caller)-[r:CodeRelation]->(n {id: $symId})
       WHERE r.type IN ['CALLS', 'IMPORTS', 'EXTENDS', 'IMPLEMENTS']
       RETURN r.type AS relType, caller.id AS uid, caller.name AS name, caller.filePath AS filePath, labels(caller)[0] AS kind
@@ -896,7 +951,7 @@ export class LocalBackend {
     `, { symId });
 
     // Categorized outgoing refs
-    const outgoingRows = await executeParameterized(repo.id, `
+    const outgoingRows = await this.runParameterized(repo.id, `
       MATCH (n {id: $symId})-[r:CodeRelation]->(target)
       WHERE r.type IN ['CALLS', 'IMPORTS', 'EXTENDS', 'IMPLEMENTS']
       RETURN r.type AS relType, target.id AS uid, target.name AS name, target.filePath AS filePath, labels(target)[0] AS kind
@@ -906,7 +961,7 @@ export class LocalBackend {
     // Process participation
     let processRows: any[] = [];
     try {
-      processRows = await executeParameterized(repo.id, `
+      processRows = await this.runParameterized(repo.id, `
         MATCH (n {id: $symId})-[r:CodeRelation {type: 'STEP_IN_PROCESS'}]->(p:Process)
         RETURN p.id AS pid, p.heuristicLabel AS label, r.step AS step, p.stepCount AS stepCount
       `, { symId });
@@ -964,7 +1019,7 @@ export class LocalBackend {
     }
     
     if (type === 'cluster') {
-      const clusters = await executeParameterized(repo.id, `
+      const clusters = await this.runParameterized(repo.id, `
         MATCH (c:Community)
         WHERE c.label = $clusterName OR c.heuristicLabel = $clusterName
         RETURN c.id AS id, c.label AS label, c.heuristicLabel AS heuristicLabel, c.cohesion AS cohesion, c.symbolCount AS symbolCount
@@ -983,7 +1038,7 @@ export class LocalBackend {
         weightedCohesion += (c.cohesion || 0) * s;
       }
 
-      const members = await executeParameterized(repo.id, `
+      const members = await this.runParameterized(repo.id, `
         MATCH (n)-[:CodeRelation {type: 'MEMBER_OF'}]->(c:Community)
         WHERE c.label = $clusterName OR c.heuristicLabel = $clusterName
         RETURN DISTINCT n.name AS name, labels(n)[0] AS type, n.filePath AS filePath
@@ -1006,7 +1061,7 @@ export class LocalBackend {
     }
     
     if (type === 'process') {
-      const processes = await executeParameterized(repo.id, `
+      const processes = await this.runParameterized(repo.id, `
         MATCH (p:Process)
         WHERE p.label = $processName OR p.heuristicLabel = $processName
         RETURN p.id AS id, p.label AS label, p.heuristicLabel AS heuristicLabel, p.processType AS processType, p.stepCount AS stepCount
@@ -1016,7 +1071,7 @@ export class LocalBackend {
 
       const proc = processes[0];
       const procId = proc.id || proc[0];
-      const steps = await executeParameterized(repo.id, `
+      const steps = await this.runParameterized(repo.id, `
         MATCH (n)-[r:CodeRelation {type: 'STEP_IN_PROCESS'}]->(p {id: $procId})
         RETURN n.name AS name, labels(n)[0] AS type, n.filePath AS filePath, r.step AS step
         ORDER BY r.step
@@ -1089,7 +1144,7 @@ export class LocalBackend {
     for (const file of changedFiles) {
       const normalizedFile = file.replace(/\\/g, '/');
       try {
-        const symbols = await executeParameterized(repo.id, `
+        const symbols = await this.runParameterized(repo.id, `
           MATCH (n) WHERE n.filePath CONTAINS $filePath
           RETURN n.id AS id, n.name AS name, labels(n)[0] AS type, n.filePath AS filePath
           LIMIT 20
@@ -1110,7 +1165,7 @@ export class LocalBackend {
     const affectedProcesses = new Map<string, any>();
     for (const sym of changedSymbols) {
       try {
-        const procs = await executeParameterized(repo.id, `
+        const procs = await this.runParameterized(repo.id, `
           MATCH (n {id: $nodeId})-[r:CodeRelation {type: 'STEP_IN_PROCESS'}]->(p:Process)
           RETURN p.id AS pid, p.heuristicLabel AS label, p.processType AS processType, p.stepCount AS stepCount, r.step AS step
         `, { nodeId: sym.id });
@@ -1336,7 +1391,7 @@ export class LocalBackend {
     const relTypeFilter = relationTypes.map(t => `'${t}'`).join(', ');
     const confidenceFilter = minConfidence > 0 ? ` AND r.confidence >= ${minConfidence}` : '';
 
-    const targets = await executeParameterized(repo.id, `
+    const targets = await this.runParameterized(repo.id, `
       MATCH (n)
       WHERE n.name = $targetName
       RETURN n.id AS id, n.name AS name, labels(n)[0] AS type, n.filePath AS filePath
@@ -1361,7 +1416,7 @@ export class LocalBackend {
         : `MATCH (n)-[r:CodeRelation]->(callee) WHERE n.id IN [${idList}] AND r.type IN [${relTypeFilter}]${confidenceFilter} RETURN n.id AS sourceId, callee.id AS id, callee.name AS name, labels(callee)[0] AS type, callee.filePath AS filePath, r.type AS relType, r.confidence AS confidence`;
       
       try {
-        const related = await executeQuery(repo.id, query);
+        const related = await this.runQuery(repo.id, query);
         
         for (const rel of related) {
           const relId = rel.id || rel[1];
@@ -1405,21 +1460,21 @@ export class LocalBackend {
 
       // Affected processes: which execution flows are broken and at which step
       const [processRows, moduleRows, directModuleRows] = await Promise.all([
-        executeQuery(repo.id, `
+        this.runQuery(repo.id, `
           MATCH (s)-[r:CodeRelation {type: 'STEP_IN_PROCESS'}]->(p:Process)
           WHERE s.id IN [${allIds}]
           RETURN p.heuristicLabel AS name, COUNT(DISTINCT s.id) AS hits, MIN(r.step) AS minStep, p.stepCount AS stepCount
           ORDER BY hits DESC
           LIMIT 20
         `).catch(() => []),
-        executeQuery(repo.id, `
+        this.runQuery(repo.id, `
           MATCH (s)-[:CodeRelation {type: 'MEMBER_OF'}]->(c:Community)
           WHERE s.id IN [${allIds}]
           RETURN c.heuristicLabel AS name, COUNT(DISTINCT s.id) AS hits
           ORDER BY hits DESC
           LIMIT 20
         `).catch(() => []),
-        d1Ids ? executeQuery(repo.id, `
+        d1Ids ? this.runQuery(repo.id, `
           MATCH (s)-[:CodeRelation {type: 'MEMBER_OF'}]->(c:Community)
           WHERE s.id IN [${d1Ids}]
           RETURN DISTINCT c.heuristicLabel AS name
@@ -1489,7 +1544,7 @@ export class LocalBackend {
 
     try {
       const rawLimit = Math.max(limit * 5, 200);
-      const clusters = await executeQuery(repo.id, `
+      const clusters = await this.runQuery(repo.id, `
         MATCH (c:Community)
         RETURN c.id AS id, c.label AS label, c.heuristicLabel AS heuristicLabel, c.cohesion AS cohesion, c.symbolCount AS symbolCount
         ORDER BY c.symbolCount DESC
@@ -1517,7 +1572,7 @@ export class LocalBackend {
     await this.ensureInitialized(repo.id);
 
     try {
-      const processes = await executeQuery(repo.id, `
+      const processes = await this.runQuery(repo.id, `
         MATCH (p:Process)
         RETURN p.id AS id, p.label AS label, p.heuristicLabel AS heuristicLabel, p.processType AS processType, p.stepCount AS stepCount
         ORDER BY p.stepCount DESC
@@ -1545,7 +1600,7 @@ export class LocalBackend {
     const repo = await this.resolveRepo(repoName);
     await this.ensureInitialized(repo.id);
 
-    const clusters = await executeParameterized(repo.id, `
+    const clusters = await this.runParameterized(repo.id, `
       MATCH (c:Community)
       WHERE c.label = $clusterName OR c.heuristicLabel = $clusterName
       RETURN c.id AS id, c.label AS label, c.heuristicLabel AS heuristicLabel, c.cohesion AS cohesion, c.symbolCount AS symbolCount
@@ -1564,7 +1619,7 @@ export class LocalBackend {
       weightedCohesion += (c.cohesion || 0) * s;
     }
 
-    const members = await executeParameterized(repo.id, `
+    const members = await this.runParameterized(repo.id, `
       MATCH (n)-[:CodeRelation {type: 'MEMBER_OF'}]->(c:Community)
       WHERE c.label = $clusterName OR c.heuristicLabel = $clusterName
       RETURN DISTINCT n.name AS name, labels(n)[0] AS type, n.filePath AS filePath
@@ -1594,7 +1649,7 @@ export class LocalBackend {
     const repo = await this.resolveRepo(repoName);
     await this.ensureInitialized(repo.id);
 
-    const processes = await executeParameterized(repo.id, `
+    const processes = await this.runParameterized(repo.id, `
       MATCH (p:Process)
       WHERE p.label = $processName OR p.heuristicLabel = $processName
       RETURN p.id AS id, p.label AS label, p.heuristicLabel AS heuristicLabel, p.processType AS processType, p.stepCount AS stepCount
@@ -1604,7 +1659,7 @@ export class LocalBackend {
 
     const proc = processes[0];
     const procId = proc.id || proc[0];
-    const steps = await executeParameterized(repo.id, `
+    const steps = await this.runParameterized(repo.id, `
       MATCH (n)-[r:CodeRelation {type: 'STEP_IN_PROCESS'}]->(p {id: $procId})
       RETURN n.name AS name, labels(n)[0] AS type, n.filePath AS filePath, r.step AS step
       ORDER BY r.step
@@ -1621,7 +1676,108 @@ export class LocalBackend {
     };
   }
 
+  // ─── Modernization Assessment ───────────────────────────────────
+
+  /** In-memory assessment cache, invalidated on repo refresh */
+  private assessCache = new Map<string, { deadCode: any; metrics: any; modernization: any; timestamp: number }>();
+
+  private async assess(repo: RepoHandle, params: { section?: string }): Promise<any> {
+    await this.ensureInitialized(repo.id);
+    const section = params.section || 'summary';
+
+    // Use cached results if fresh (5 minutes)
+    let cached = this.assessCache.get(repo.id);
+    if (cached && Date.now() - cached.timestamp < 5 * 60 * 1000) {
+      return this.formatAssessSection(cached, section, repo.name);
+    }
+
+    // Run analysis
+    const queryFn = (cypher: string) => this.runQuery(repo.id, cypher);
+
+    const { analyzeDeadCode } = await import('../../core/analysis/dead-code.js');
+    const { computeMetrics } = await import('../../core/analysis/metrics.js');
+    const { scoreModernization } = await import('../../core/analysis/mod-scorer.js');
+
+    const deadCode = await analyzeDeadCode(queryFn);
+    const metrics = await computeMetrics(queryFn);
+    const modernization = await scoreModernization(metrics, deadCode, queryFn);
+
+    cached = { deadCode, metrics, modernization, timestamp: Date.now() };
+    this.assessCache.set(repo.id, cached);
+
+    return this.formatAssessSection(cached, section, repo.name);
+  }
+
+  private formatAssessSection(
+    data: { deadCode: any; metrics: any; modernization: any },
+    section: string,
+    repoName: string,
+  ): any {
+    const { deadCode, metrics, modernization } = data;
+
+    if (section === 'summary') {
+      return {
+        repoName,
+        overallScore: modernization.overallScore,
+        deadCodePct: deadCode.summary.deadCodePct,
+        totalPrograms: metrics.global.totalPrograms,
+        totalCommunities: metrics.global.totalCommunities,
+        extractCandidates: modernization.candidates.filter((c: any) => c.recommendation === 'extract').length,
+        refactorFirst: modernization.candidates.filter((c: any) => c.recommendation === 'refactor-first').length,
+        leaveInPlace: modernization.candidates.filter((c: any) => c.recommendation === 'leave-in-place').length,
+      };
+    }
+
+    if (section === 'dead-code') {
+      return deadCode;
+    }
+
+    if (section === 'metrics') {
+      return {
+        global: metrics.global,
+        topFanOut: [...metrics.programs].sort((a: any, b: any) => b.fanOut - a.fanOut).slice(0, 20),
+        topFanIn: [...metrics.programs].sort((a: any, b: any) => b.fanIn - a.fanIn).slice(0, 20),
+        topCopybooks: [...metrics.copybooks].sort((a: any, b: any) => b.fanIn - a.fanIn).slice(0, 20),
+        communities: metrics.communities,
+      };
+    }
+
+    if (section === 'modernization') {
+      return modernization;
+    }
+
+    // full
+    return { repoName, deadCode, metrics, modernization };
+  }
+
+  // ─── Neptune-aware query dispatch ───────────────────────────────
+
+  /**
+   * Execute a Cypher query against the correct backend for a given repo.
+   */
+  private async runQuery(repoId: string, cypher: string): Promise<any[]> {
+    if (neptuneAdapters.has(repoId)) {
+      return neptuneAdapters.get(repoId)!.executeQuery(cypher);
+    }
+    return executeQuery(repoId, cypher);
+  }
+
+  /**
+   * Execute a parameterized Cypher query against the correct backend.
+   */
+  private async runParameterized(repoId: string, cypher: string, params: Record<string, unknown>): Promise<any[]> {
+    if (neptuneAdapters.has(repoId)) {
+      return neptuneAdapters.get(repoId)!.executeParameterized(cypher, params);
+    }
+    return executeParameterized(repoId, cypher, params);
+  }
+
   async disconnect(): Promise<void> {
+    // Close all Neptune adapters
+    for (const [id, adapter] of neptuneAdapters) {
+      adapter.close().catch(() => {});
+    }
+    neptuneAdapters.clear();
     await closeKuzu(); // close all connections
     // Note: we intentionally do NOT call disposeEmbedder() here.
     // ONNX Runtime's native cleanup segfaults on macOS and some Linux configs,

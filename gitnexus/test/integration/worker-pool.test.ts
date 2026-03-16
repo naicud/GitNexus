@@ -123,6 +123,18 @@ describe('worker pool integration', () => {
     pool = undefined; // already terminated
   });
 
+  it.skipIf(!hasDistWorker)('workers signal readiness and dispatch completes within 5s', async () => {
+    const workerUrl = pathToFileURL(DIST_WORKER) as URL;
+    const start = Date.now();
+    pool = createWorkerPool(workerUrl, 2);
+    const results = await pool.dispatch<any, any>([
+      { path: 'test.ts', content: 'export const x = 1;' },
+    ]);
+    const elapsed = Date.now() - start;
+    expect(results).toHaveLength(1);
+    expect(elapsed).toBeLessThan(5000);
+  });
+
   it('fails gracefully with invalid worker path', () => {
     const badUrl = pathToFileURL('/nonexistent/worker.js') as URL;
     // createWorkerPool validates the worker script exists before spawning

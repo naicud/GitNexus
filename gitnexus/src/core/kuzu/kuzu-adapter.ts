@@ -10,6 +10,7 @@ import {
   SCHEMA_QUERIES,
   EMBEDDING_TABLE_NAME,
   NodeTableName,
+  getEmbeddingSchema,
 } from './schema.js';
 import { streamAllCSVsToDisk } from './csv-generator.js';
 
@@ -39,8 +40,8 @@ const runWithSessionLock = async <T>(operation: () => Promise<T>): Promise<T> =>
 
 const normalizeCopyPath = (filePath: string): string => filePath.replace(/\\/g, '/');
 
-export const initKuzu = async (dbPath: string) => {
-  return runWithSessionLock(() => ensureKuzuInitialized(dbPath));
+export const initKuzu = async (dbPath: string, embeddingDims?: number) => {
+  return runWithSessionLock(() => ensureKuzuInitialized(dbPath, embeddingDims));
 };
 
 /**
@@ -54,15 +55,15 @@ export const withKuzuDb = async <T>(dbPath: string, operation: () => Promise<T>)
   });
 };
 
-const ensureKuzuInitialized = async (dbPath: string) => {
+const ensureKuzuInitialized = async (dbPath: string, embeddingDims?: number) => {
   if (conn && currentDbPath === dbPath) {
     return { db, conn };
   }
-  await doInitKuzu(dbPath);
+  await doInitKuzu(dbPath, embeddingDims);
   return { db, conn };
 };
 
-const doInitKuzu = async (dbPath: string) => {
+const doInitKuzu = async (dbPath: string, embeddingDims?: number) => {
   // Different database requested — close the old one first
   if (conn || db) {
     try { if (conn) await conn.close(); } catch {}
@@ -100,7 +101,12 @@ const doInitKuzu = async (dbPath: string) => {
   db = new kuzu.Database(dbPath);
   conn = new kuzu.Connection(db);
 
-  for (const schemaQuery of SCHEMA_QUERIES) {
+  // Build schema queries with configurable embedding dimensions
+  const schemaQueries = embeddingDims && embeddingDims !== 384
+    ? [...SCHEMA_QUERIES.filter(q => !q.includes(EMBEDDING_TABLE_NAME)), getEmbeddingSchema(embeddingDims)]
+    : SCHEMA_QUERIES;
+
+  for (const schemaQuery of schemaQueries) {
     try {
       await conn.query(schemaQuery);
     } catch (err) {
@@ -466,6 +472,14 @@ export const batchInsertNodesToKuzu = async (
   return { inserted, failed };
 };
 
+/** Normalize kuzu getAll() — large DBs may return paged results [[page1...], [page2...]] */
+const flattenRows = (rows: any[]): any[] => {
+  if (rows.length > 0 && Array.isArray(rows[0])) {
+    return rows.flat();
+  }
+  return rows;
+};
+
 export const executeQuery = async (cypher: string): Promise<any[]> => {
   if (!conn) {
     throw new Error('KuzuDB not initialized. Call initKuzu first.');
@@ -476,7 +490,26 @@ export const executeQuery = async (cypher: string): Promise<any[]> => {
   // Query returns QueryResult for single queries, QueryResult[] for multi-statement
   const result = Array.isArray(queryResult) ? queryResult[0] : queryResult;
   const rows = await result.getAll();
-  return rows;
+  return flattenRows(rows);
+};
+
+/**
+ * Execute a parameterized Cypher query (safe against injection).
+ * Uses conn.prepare() + conn.execute() to bind parameters safely.
+ */
+export const executeParameterizedQuery = async (
+  cypher: string,
+  params: Record<string, any>,
+): Promise<any[]> => {
+  if (!conn) {
+    throw new Error('KuzuDB not initialized. Call initKuzu first.');
+  }
+
+  const stmt = await conn.prepare(cypher);
+  const queryResult = await conn.execute(stmt, params);
+  const result = Array.isArray(queryResult) ? queryResult[0] : queryResult;
+  const rows = await result.getAll();
+  return flattenRows(rows);
 };
 
 export const executeWithReusedStatement = async (

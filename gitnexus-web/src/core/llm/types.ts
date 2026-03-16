@@ -129,6 +129,14 @@ export interface LLMSettings {
   hasSeenClusteringPrompt: boolean;
   useSameModelForClustering: boolean;
   clusteringProvider?: Partial<ProviderConfig>; // Optional specific config for clustering
+
+  // Database backend settings
+  database?: {
+    type: 'kuzu' | 'neptune';
+    neptuneEndpoint?: string;
+    neptuneRegion?: string;
+    neptunePort?: number;
+  };
 }
 
 /**

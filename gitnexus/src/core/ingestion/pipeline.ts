@@ -387,7 +387,12 @@ export const runPipelineFromRepo = async (
         console.log(`🔧 Worker pool: ${workerPool.size} workers, sub-batch=${cobolSubBatch} (COBOL mode)`);
       }
     } catch (err) {
-      if (isDev) console.warn('Worker pool creation failed, using sequential fallback:', (err as Error).message);
+      const msg = (err as Error).message;
+      if (msg.includes('Worker script not found')) {
+        if (isDev) console.warn('Worker pool: compiled worker not found, using sequential fallback');
+      } else {
+        throw new Error(`Worker pool creation failed: ${msg}`);
+      }
     }
 
     let filesParsedSoFar = 0;
@@ -473,42 +478,52 @@ export const runPipelineFromRepo = async (
           workerPool,
         );
 
-        if (chunkWorkerData) {
-          // Imports
+        if (chunkWorkerData && !chunkWorkerData.sequentialFallback) {
+          // Full worker path — all languages resolved by workers
           await processImportsFromExtracted(graph, allPathObjects, chunkWorkerData.imports, importMap, undefined, repoPath, importCtx, packageMap, namedImportMap);
-          // Calls + Heritage + Routes — resolve in parallel (no shared mutable state between them)
-          // This is safe because each writes disjoint relationship types into idempotent id-keyed Maps,
-          // and the single-threaded event loop prevents races between synchronous addRelationship calls.
           await Promise.all([
             processCallsFromExtracted(
-              graph, 
-              chunkWorkerData.calls, 
-              symbolTable, importMap, 
-              packageMap, 
-              undefined, 
+              graph,
+              chunkWorkerData.calls,
+              symbolTable, importMap,
+              packageMap,
+              undefined,
               namedImportMap
             ),
             processHeritageFromExtracted(
-              graph, 
-              chunkWorkerData.heritage, 
-              symbolTable, 
-              importMap, 
+              graph,
+              chunkWorkerData.heritage,
+              symbolTable,
+              importMap,
               packageMap
             ),
             processRoutesFromExtracted(
-              graph, 
-              chunkWorkerData.routes ?? [], 
-              symbolTable, 
-              importMap, 
+              graph,
+              chunkWorkerData.routes ?? [],
+              symbolTable,
+              importMap,
               packageMap
             ),
           ]);
         } else {
-          // Pool failed — disable for all remaining chunks to avoid 120s timeout per chunk.
+          // Sequential fallback — disable worker pool for remaining chunks
           if (workerPool) {
             await workerPool.terminate();
             workerPool = undefined;
           }
+          // Resolve COBOL calls/imports collected by sequential parsing
+          if (chunkWorkerData) {
+            await processImportsFromExtracted(graph, allPathObjects, chunkWorkerData.imports, importMap, undefined, repoPath, importCtx, packageMap, namedImportMap);
+            await processCallsFromExtracted(
+              graph,
+              chunkWorkerData.calls,
+              symbolTable, importMap,
+              packageMap,
+              undefined,
+              namedImportMap
+            );
+          }
+          // Tree-sitter import/call processing for non-COBOL files
           await processImports(graph, chunkFiles, astCache, importMap, undefined, repoPath, allPaths, packageMap, namedImportMap);
           sequentialChunkPaths.push(chunkPaths);
         }
@@ -565,6 +580,20 @@ export const runPipelineFromRepo = async (
       const contractCount = detectCrossProgamContracts(graph);
       if (isDev && contractCount > 0) {
         console.log(`[pipeline] Detected ${contractCount} cross-program CONTRACTS edge(s) via shared copybooks`);
+      }
+    }
+
+    // ── Phase 4c: JCL job stream integration ────────────────────────
+    if (process.env.GITNEXUS_JCL_DIRS) {
+      const { isJclFile } = await import('./utils.js');
+      const jclPaths = allPaths.filter(p => isJclFile(p));
+      if (jclPaths.length > 0) {
+        const { processJclFiles } = await import('./jcl-processor.js');
+        const jclContents = await readFileContents(repoPath, jclPaths);
+        const jclResult = processJclFiles(graph, jclPaths, jclContents);
+        if (isDev) {
+          console.log(`[pipeline] JCL integration: ${jclResult.jobCount} jobs, ${jclResult.stepCount} steps, ${jclResult.programLinks} program links`);
+        }
       }
     }
 

@@ -1435,3 +1435,5 @@ parentPort!.on('message', (msg: any) => {
     parentPort!.postMessage({ type: 'error', error: message });
   }
 });
+
+parentPort!.postMessage({ type: 'ready' });

@@ -18,6 +18,9 @@ export interface SigmaNodeAttributes {
   mass?: number; // ForceAtlas2 mass - higher = more repulsion
   community?: number; // Community index from Leiden algorithm
   communityColor?: string; // Color assigned by community
+  childCount?: number;
+  isExpanded?: boolean;
+  isExpandable?: boolean;
 }
 
 export interface SigmaEdgeAttributes {
@@ -38,6 +41,7 @@ const getScaledNodeSize = (baseSize: number, nodeCount: number): number => {
   // But a minimum is used that preserves relative differences
   if (nodeCount > 50000) return Math.max(1, baseSize * 0.4);
   if (nodeCount > 20000) return Math.max(1.5, baseSize * 0.5);
+  if (nodeCount > 10000) return Math.max(1.5, baseSize * 0.55);
   if (nodeCount > 5000) return Math.max(2, baseSize * 0.65);
   if (nodeCount > 1000) return Math.max(2.5, baseSize * 0.8);
   return baseSize;
@@ -86,7 +90,7 @@ export const knowledgeGraphToGraphology = (
 ): Graph<SigmaNodeAttributes, SigmaEdgeAttributes> => {
   const graph = new Graph<SigmaNodeAttributes, SigmaEdgeAttributes>();
   const nodeCount = knowledgeGraph.nodes.length;
-  
+
   // Build parent-child map from hierarchy relationships
   // CONTAINS: Folder -> File
   // DEFINES: File -> Function/Class/Interface/Method
@@ -95,9 +99,9 @@ export const knowledgeGraphToGraphology = (
   const parentToChildren = new Map<string, string[]>();
   // child -> parent
   const childToParent = new Map<string, string>();
-  
+
   const hierarchyRelations = new Set(['CONTAINS', 'DEFINES', 'IMPORTS']);
-  
+
   knowledgeGraph.relationships.forEach(rel => {
     // These relationships represent parent-child hierarchy for positioning
     if (hierarchyRelations.has(rel.type)) {
@@ -109,14 +113,14 @@ export const knowledgeGraphToGraphology = (
       childToParent.set(rel.targetId, rel.sourceId);
     }
   });
-  
+
   // Create node lookup
   const nodeMap = new Map(knowledgeGraph.nodes.map(n => [n.id, n]));
-  
+
   // Separate structural nodes (folders, packages) from content nodes
   const structuralTypes = new Set(['Project', 'Package', 'Module', 'Folder']);
   const structuralNodes = knowledgeGraph.nodes.filter(n => structuralTypes.has(n.label));
-  
+
   // Much wider spread for structural nodes - this is the key!
   const structuralSpread = Math.sqrt(nodeCount) * 40;
   // Small jitter for children around their parent
@@ -130,7 +134,7 @@ export const knowledgeGraphToGraphology = (
     const communities = new Set(communityMemberships.values());
     const communityCount = communities.size;
     const clusterSpread = structuralSpread * 0.8; // Clusters spread across 80% of graph
-    
+
     // Position cluster centers using golden angle for even distribution
     const goldenAngle = Math.PI * (3 - Math.sqrt(5));
     let idx = 0;
@@ -150,54 +154,63 @@ export const knowledgeGraphToGraphology = (
   // Store positions for parent lookup
   const nodePositions = new Map<string, { x: number; y: number }>();
 
+  // Collect all nodes into an array for batch import (eliminates O(n) event emissions)
+  const batchNodes: Array<{ key: string; attributes: SigmaNodeAttributes }> = [];
+  const processedNodeIds = new Set<string>();
+
   // Position structural nodes (folders, etc.) in a wide radial pattern FIRST
   structuralNodes.forEach((node, index) => {
     // Use golden angle for even distribution
     const goldenAngle = Math.PI * (3 - Math.sqrt(5));
     const angle = index * goldenAngle;
     const radius = structuralSpread * Math.sqrt((index + 1) / Math.max(structuralNodes.length, 1));
-    
+
     // Add some randomness to prevent perfect patterns
     const jitter = structuralSpread * 0.15;
     const x = radius * Math.cos(angle) + (Math.random() - 0.5) * jitter;
     const y = radius * Math.sin(angle) + (Math.random() - 0.5) * jitter;
-    
+
     nodePositions.set(node.id, { x, y });
-    
+    processedNodeIds.add(node.id);
+
     const baseSize = NODE_SIZES[node.label] || 8;
     const scaledSize = getScaledNodeSize(baseSize, nodeCount);
-    
+
     // Structural nodes keep their type-based color
-    graph.addNode(node.id, {
-      x,
-      y,
-      size: scaledSize,
-      color: NODE_COLORS[node.label] || '#9ca3af',
-      label: node.properties.name,
-      nodeType: node.label,
-      filePath: node.properties.filePath,
-      startLine: node.properties.startLine,
-      endLine: node.properties.endLine,
-      hidden: false,
-      mass: getNodeMass(node.label, nodeCount),
+    batchNodes.push({
+      key: node.id,
+      attributes: {
+        x,
+        y,
+        size: scaledSize,
+        color: NODE_COLORS[node.label] || '#9ca3af',
+        label: node.properties.name,
+        nodeType: node.label,
+        filePath: node.properties.filePath,
+        startLine: node.properties.startLine,
+        endLine: node.properties.endLine,
+        hidden: false,
+        mass: getNodeMass(node.label, nodeCount),
+      },
     });
   });
 
   // Process remaining nodes in HIERARCHY ORDER (parents before children)
   // Use BFS starting from structural nodes to ensure parents are positioned first
+  const symbolTypes = new Set(['Function', 'Class', 'Method', 'Interface']);
+
   const addNodeWithPosition = (nodeId: string) => {
-    if (graph.hasNode(nodeId)) return;
-    
+    if (processedNodeIds.has(nodeId)) return;
+
     const node = nodeMap.get(nodeId);
     if (!node) return;
-    
+
     let x: number, y: number;
-    
+
     // Check if this is a symbol node with a community assignment
     const communityIndex = communityMemberships?.get(nodeId);
-    const symbolTypes = new Set(['Function', 'Class', 'Method', 'Interface']);
     const clusterCenter = communityIndex !== undefined ? clusterCenters.get(communityIndex) : null;
-    
+
     if (clusterCenter && symbolTypes.has(node.label)) {
       // CLUSTER-BASED POSITIONING: Position near cluster center with tight jitter
       x = clusterCenter.x + (Math.random() - 0.5) * clusterJitter;
@@ -206,7 +219,7 @@ export const knowledgeGraphToGraphology = (
       // HIERARCHY-BASED POSITIONING: Position near parent
       const parentId = childToParent.get(nodeId);
       const parentPos = parentId ? nodePositions.get(parentId) : null;
-      
+
       if (parentPos) {
         x = parentPos.x + (Math.random() - 0.5) * childJitter;
         y = parentPos.y + (Math.random() - 0.5) * childJitter;
@@ -216,45 +229,49 @@ export const knowledgeGraphToGraphology = (
         y = (Math.random() - 0.5) * structuralSpread * 0.5;
       }
     }
-    
+
     nodePositions.set(nodeId, { x, y });
-    
+    processedNodeIds.add(nodeId);
+
     const baseSize = NODE_SIZES[node.label] || 8;
     const scaledSize = getScaledNodeSize(baseSize, nodeCount);
-    
+
     // Check if this node has a community assignment (reuse communityIndex from above)
     const hasCommunity = communityIndex !== undefined;
-    
+
     // Symbol nodes get colored by community if available
     const usesCommunityColor = hasCommunity && symbolTypes.has(node.label);
-    const nodeColor = usesCommunityColor 
+    const nodeColor = usesCommunityColor
       ? getCommunityColor(communityIndex!)
       : NODE_COLORS[node.label] || '#9ca3af';
-    
-    graph.addNode(nodeId, {
-      x,
-      y,
-      size: scaledSize,
-      color: nodeColor,
-      label: node.properties.name,
-      nodeType: node.label,
-      filePath: node.properties.filePath,
-      startLine: node.properties.startLine,
-      endLine: node.properties.endLine,
-      hidden: false,
-      mass: getNodeMass(node.label, nodeCount),
-      community: communityIndex,
-      communityColor: hasCommunity ? getCommunityColor(communityIndex!) : undefined,
+
+    batchNodes.push({
+      key: nodeId,
+      attributes: {
+        x,
+        y,
+        size: scaledSize,
+        color: nodeColor,
+        label: node.properties.name,
+        nodeType: node.label,
+        filePath: node.properties.filePath,
+        startLine: node.properties.startLine,
+        endLine: node.properties.endLine,
+        hidden: false,
+        mass: getNodeMass(node.label, nodeCount),
+        community: communityIndex,
+        communityColor: hasCommunity ? getCommunityColor(communityIndex!) : undefined,
+      },
     });
   };
-  
+
   // BFS from structural nodes - this ensures parent is ALWAYS positioned before child
   const queue: string[] = [...structuralNodes.map(n => n.id)];
   const visited = new Set<string>(queue);
-  
+
   while (queue.length > 0) {
     const currentId = queue.shift()!;
-    
+
     // Get children of current node and add them
     const children = parentToChildren.get(currentId) || [];
     for (const childId of children) {
@@ -265,53 +282,66 @@ export const knowledgeGraphToGraphology = (
       }
     }
   }
-  
+
   // Add any orphan nodes that weren't reached (no parent relationship)
   knowledgeGraph.nodes.forEach((node) => {
-    if (!graph.hasNode(node.id)) {
+    if (!processedNodeIds.has(node.id)) {
       addNodeWithPosition(node.id);
     }
   });
 
   // Add edges with distinct colors per relationship type
   const edgeBaseSize = nodeCount > 20000 ? 0.4 : nodeCount > 5000 ? 0.6 : 1.0;
-  
+
   // Edge styles - each relationship type has a DISTINCT color for clarity
   // Using varied hues so relationships are easily distinguishable
   const EDGE_STYLES: Record<string, { color: string; sizeMultiplier: number }> = {
     // STRUCTURAL - Greens (folder/file hierarchy)
     CONTAINS: { color: '#2d5a3d', sizeMultiplier: 0.4 },    // Forest green - folder contains
-    
+
     // DEFINITIONS - Cyan/Teal (code definitions)
     DEFINES: { color: '#0e7490', sizeMultiplier: 0.5 },     // Cyan - file defines function/class
-    
-    // DEPENDENCIES - Blue (imports between files)  
+
+    // DEPENDENCIES - Blue (imports between files)
     IMPORTS: { color: '#1d4ed8', sizeMultiplier: 0.6 },     // Blue - file imports file
-    
+
     // FUNCTION FLOW - Purple (call graph)
     CALLS: { color: '#7c3aed', sizeMultiplier: 0.8 },       // Violet - function calls
-    
+
     // TYPE RELATIONSHIPS - Warm colors (OOP)
     EXTENDS: { color: '#c2410c', sizeMultiplier: 1.0 },     // Orange - extension
     IMPLEMENTS: { color: '#be185d', sizeMultiplier: 0.9 },  // Pink - interface implementation
   };
-  
+
+  // Collect edges for batch import, deduplicating as we go
+  const batchEdges: Array<{ source: string; target: string; attributes: SigmaEdgeAttributes }> = [];
+  const addedEdgeKeys = new Set<string>();
+
   knowledgeGraph.relationships.forEach((rel) => {
-    if (graph.hasNode(rel.sourceId) && graph.hasNode(rel.targetId)) {
-      if (!graph.hasEdge(rel.sourceId, rel.targetId)) {
+    if (processedNodeIds.has(rel.sourceId) && processedNodeIds.has(rel.targetId)) {
+      const edgeKey = `${rel.sourceId}->${rel.targetId}`;
+      if (!addedEdgeKeys.has(edgeKey)) {
+        addedEdgeKeys.add(edgeKey);
         const style = EDGE_STYLES[rel.type] || { color: '#4a4a5a', sizeMultiplier: 0.5 };
         const curvature = 0.12 + (Math.random() * 0.08);
-        
-        graph.addEdge(rel.sourceId, rel.targetId, {
-          size: edgeBaseSize * style.sizeMultiplier,
-          color: style.color,
-          relationType: rel.type,
-          type: 'curved',
-          curvature: curvature,
+
+        batchEdges.push({
+          source: rel.sourceId,
+          target: rel.targetId,
+          attributes: {
+            size: edgeBaseSize * style.sizeMultiplier,
+            color: style.color,
+            relationType: rel.type,
+            type: 'curved',
+            curvature: curvature,
+          },
         });
       }
     }
   });
+
+  // Batch import: single operation eliminates O(n) individual event emissions
+  graph.import({ nodes: batchNodes, edges: batchEdges });
 
   return graph;
 };

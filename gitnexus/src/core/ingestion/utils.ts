@@ -548,6 +548,40 @@ const getCobolDirs = (): Set<string> => {
 };
 
 /**
+ * JCL directory overrides loaded from GITNEXUS_JCL_DIRS environment variable.
+ * Set to a comma-separated list of directory names whose extensionless files
+ * should be treated as JCL. Example: GITNEXUS_JCL_DIRS=jcl,proc,jobs
+ */
+let _jclDirs: Set<string> | null = null;
+const getJclDirs = (): Set<string> => {
+  if (_jclDirs) return _jclDirs;
+  const raw = process.env.GITNEXUS_JCL_DIRS;
+  _jclDirs = raw ? new Set(raw.split(',').map(d => d.trim().toLowerCase())) : new Set();
+  return _jclDirs;
+};
+
+/**
+ * Check if a file path is a JCL file based on extension or directory.
+ */
+export const isJclFile = (filePath: string): boolean => {
+  const lower = filePath.toLowerCase();
+  if (lower.endsWith('.jcl') || lower.endsWith('.jclproc') || lower.endsWith('.proc')) {
+    return true;
+  }
+  const jclDirs = getJclDirs();
+  if (jclDirs.size > 0) {
+    const basename = filePath.split('/').pop() || '';
+    if (!basename.includes('.')) {
+      const segments = lower.split('/');
+      for (const segment of segments) {
+        if (jclDirs.has(segment)) return true;
+      }
+    }
+  }
+  return false;
+};
+
+/**
  * Extended language detection that also handles extensionless files
  * by checking if the file is in a known COBOL directory.
  * Falls back to getLanguageFromFilename for files with extensions.

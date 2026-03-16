@@ -8,7 +8,6 @@
 import path from 'path';
 import readline from 'readline';
 import { execSync, execFileSync } from 'child_process';
-import cliProgress from 'cli-progress';
 import { getGitRoot, isGitRepo } from '../storage/git.js';
 import { getStoragePaths, loadMeta, loadCLIConfig, saveCLIConfig } from '../storage/repo-manager.js';
 import { WikiGenerator, type WikiOptions } from '../core/wiki/generator.js';
@@ -21,6 +20,7 @@ export interface WikiCommandOptions {
   apiKey?: string;
   concurrency?: string;
   gist?: boolean;
+  yes?: boolean;
 }
 
 /**
@@ -78,6 +78,19 @@ export const wikiCommand = async (
   inputPath?: string,
   options?: WikiCommandOptions,
 ) => {
+  // ── TUI Wizard ────────────────────────────────────────────────────
+  let wizardLLMConfig: { baseUrl: string; model: string; apiKey: string } | null = null;
+  {
+    const { shouldRunInteractive } = await import('./tui/shared.js');
+    if (options && shouldRunInteractive(options as Record<string, unknown>)) {
+      const { runWikiWizard } = await import('./tui/wiki-wizard.js');
+      const result = await runWikiWizard(inputPath, options);
+      if (!result) return;
+      options = { ...options, ...result.options };
+      wizardLLMConfig = result.llmConfig;
+    }
+  }
+
   console.log('\n  GitNexus Wiki Generator\n');
 
   // ── Resolve repo path ───────────────────────────────────────────────
@@ -127,15 +140,16 @@ export const wikiCommand = async (
   const hasSavedConfig = !!(savedConfig.apiKey && savedConfig.baseUrl);
   const hasCLIOverrides = !!(options?.apiKey || options?.model || options?.baseUrl);
 
-  let llmConfig = await resolveLLMConfig({
-    model: options?.model,
-    baseUrl: options?.baseUrl,
-    apiKey: options?.apiKey,
-  });
+  let llmConfig = wizardLLMConfig
+    ? { ...await resolveLLMConfig({}), ...wizardLLMConfig }
+    : await resolveLLMConfig({
+        model: options?.model,
+        baseUrl: options?.baseUrl,
+        apiKey: options?.apiKey,
+      });
 
-  // Run interactive setup if no saved config and no CLI flags provided
-  // (even if env vars exist — let user explicitly choose their provider)
-  if (!hasSavedConfig && !hasCLIOverrides) {
+  // Run interactive setup if no saved config, no CLI flags, and wizard didn't run
+  if (!wizardLLMConfig && !hasSavedConfig && !hasCLIOverrides) {
     if (!process.stdin.isTTY) {
       if (!llmConfig.apiKey) {
         console.log('  Error: No LLM API key found.');
@@ -208,33 +222,15 @@ export const wikiCommand = async (
     }
   }
 
-  // ── Setup progress bar with elapsed timer ──────────────────────────
-  const bar = new cliProgress.SingleBar({
-    format: '  {bar} {percentage}% | {phase}',
-    barCompleteChar: '\u2588',
-    barIncompleteChar: '\u2591',
-    hideCursor: true,
-    barGlue: '',
-    autopadding: true,
-    clearOnComplete: false,
-    stopOnComplete: false,
-  }, cliProgress.Presets.shades_grey);
-
-  bar.start(100, 0, { phase: 'Initializing...' });
+  // ── Setup multi-progress ────────────────────────────────────────────
+  const { createMultiProgress } = await import('./tui/components/multi-progress.js');
+  const mp = createMultiProgress([
+    { name: 'generate', label: 'Generating wiki', weight: 95 },
+    { name: 'complete', label: 'Finalizing', weight: 5 },
+  ]);
+  mp.setPhase('generate');
 
   const t0 = Date.now();
-  let lastPhase = '';
-  let phaseStart = t0;
-
-  // Tick elapsed time every second while stuck on the same phase
-  const elapsedTimer = setInterval(() => {
-    if (lastPhase) {
-      const elapsed = Math.round((Date.now() - phaseStart) / 1000);
-      if (elapsed >= 3) {
-        bar.update({ phase: `${lastPhase} (${elapsed}s)` });
-      }
-    }
-  }, 1000);
 
   // ── Run generator ───────────────────────────────────────────────────
   const wikiOptions: WikiOptions = {
@@ -251,54 +247,38 @@ export const wikiCommand = async (
     llmConfig,
     wikiOptions,
     (phase, percent, detail) => {
-      const label = detail || phase;
-      if (label !== lastPhase) {
-        lastPhase = label;
-        phaseStart = Date.now();
-      }
-      bar.update(percent, { phase: label });
+      mp.update(percent, detail || phase);
     },
   );
 
   try {
     const result = await generator.run();
 
-    clearInterval(elapsedTimer);
-    bar.update(100, { phase: 'Done' });
-    bar.stop();
-
     const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
 
     const wikiDir = path.join(storagePath, 'wiki');
     const viewerPath = path.join(wikiDir, 'index.html');
 
-    if (result.mode === 'up-to-date' && !options?.force) {
-      console.log('\n  Wiki is already up to date.');
-      console.log(`  Viewer: ${viewerPath}\n`);
-      await maybePublishGist(viewerPath, options?.gist);
-      return;
-    }
-
-    console.log(`\n  Wiki generated successfully (${elapsed}s)\n`);
-    console.log(`  Mode: ${result.mode}`);
-    console.log(`  Pages: ${result.pagesGenerated}`);
-    console.log(`  Output: ${wikiDir}`);
-    console.log(`  Viewer: ${viewerPath}`);
+    mp.setPhase('complete');
+    mp.complete({
+      'Result': result.mode === 'up-to-date' ? 'Wiki is up to date' : `Generated (${elapsed}s)`,
+      'Pages': String(result.pagesGenerated),
+      'Output': wikiDir,
+      'Viewer': viewerPath,
+    });
 
     if (result.failedModules && result.failedModules.length > 0) {
-      console.log(`\n  Failed modules (${result.failedModules.length}):`);
+      console.log(`  Failed modules (${result.failedModules.length}):`);
       for (const mod of result.failedModules) {
         console.log(`    - ${mod}`);
       }
       console.log('  Re-run to retry failed modules (pages will be regenerated).');
+      console.log('');
     }
-
-    console.log('');
 
     await maybePublishGist(viewerPath, options?.gist);
   } catch (err: any) {
-    clearInterval(elapsedTimer);
-    bar.stop();
+    mp.stop();
 
     if (err.message?.includes('No source files')) {
       console.log(`\n  ${err.message}\n`);

@@ -32,6 +32,8 @@ export interface ConnectToServerResult {
   relationships: GraphRelationship[];
   fileContents: Record<string, string>;
   repoInfo: ServerRepoInfo;
+  truncated?: boolean;
+  totalAvailable?: number;
 }
 
 export function normalizeServerUrl(input: string): string {
@@ -79,7 +81,7 @@ export async function fetchGraph(
   onProgress?: (downloaded: number, total: number | null) => void,
   signal?: AbortSignal,
   repoName?: string
-): Promise<{ nodes: GraphNode[]; relationships: GraphRelationship[] }> {
+): Promise<{ nodes: GraphNode[]; relationships: GraphRelationship[]; truncated?: boolean; totalAvailable?: number }> {
   const url = repoName ? `${baseUrl}/graph?repo=${encodeURIComponent(repoName)}` : `${baseUrl}/graph`;
   const response = await fetch(url, { signal });
   if (!response.ok) {
@@ -142,7 +144,7 @@ export async function connectToServer(
 
   // Phase 2: Download graph
   onProgress?.('downloading', 0, null);
-  const { nodes, relationships } = await fetchGraph(
+  const { nodes, relationships, truncated, totalAvailable } = await fetchGraph(
     baseUrl,
     (downloaded, total) => onProgress?.('downloading', downloaded, total),
     signal,
@@ -153,5 +155,5 @@ export async function connectToServer(
   onProgress?.('extracting', 0, null);
   const fileContents = extractFileContents(nodes);
 
-  return { nodes, relationships, fileContents, repoInfo };
+  return { nodes, relationships, fileContents, repoInfo, truncated, totalAvailable };
 }

@@ -96,7 +96,91 @@ GitNexus builds a complete knowledge graph of your codebase through a multi-phas
 5. **Processes** — Traces execution flows from entry points through call chains
 6. **Search** — Builds hybrid search indexes for fast retrieval
 
-The result is a **KuzuDB graph database** stored locally in `.gitnexus/` with full-text search and semantic embeddings.
+The result is a **KuzuDB graph database** stored locally in `.gitnexus/` with full-text search and semantic embeddings. Alternatively, you can use [AWS Neptune](#database-backends) as a managed cloud backend.
+
+## Database Backends
+
+| | KuzuDB (default) | AWS Neptune |
+|---|---|---|
+| **Storage** | Local `.gitnexus/` directory | Managed AWS cluster |
+| **Setup** | Zero config | VPC, IAM, cluster provisioning |
+| **Full-text search** | BM25 indexes | CONTAINS predicate (no FTS indexes) |
+| **Semantic search** | Embeddings supported | Not supported (v1) |
+| **Multi-repo** | Automatic via registry | One cluster per repo (v1) |
+| **Cost** | Free | AWS Neptune pricing |
+
+KuzuDB is the default and recommended for most users. Neptune is for teams that need a managed, always-on graph database in AWS.
+
+```bash
+# Index with Neptune backend
+gitnexus analyze --db neptune \
+  --neptune-endpoint your-cluster.us-east-1.neptune.amazonaws.com \
+  --neptune-region us-east-1
+```
+
+Or use environment variables: `GITNEXUS_DB_TYPE=neptune`, `GITNEXUS_NEPTUNE_ENDPOINT`, `GITNEXUS_NEPTUNE_REGION`.
+
+See [Neptune setup guide](../docs/neptune-setup.md) for full AWS configuration (VPC, IAM, security groups, SSH tunneling).
+
+## Semantic Search (Embeddings)
+
+By default, GitNexus uses BM25 full-text search. Add `--embeddings` to generate vector embeddings for semantic search — finds conceptually similar code, not just keyword matches.
+
+```bash
+gitnexus analyze --embeddings
+```
+
+### Embedding Providers
+
+| Provider | Model (default) | Dims | Requires |
+|----------|----------------|------|----------|
+| `local` | `snowflake-arctic-embed-xs` | 384 | Nothing (runs locally via transformers.js) |
+| `ollama` | `nomic-embed-text` | 768 | Ollama running locally or remotely |
+| `openai` | `text-embedding-3-small` | 1536 | API key |
+| `cohere` | `embed-english-light-v3.0` | 384 | API key |
+
+### Configuration
+
+CLI flags take priority over environment variables, which take priority over defaults.
+
+```bash
+# Local (default) — zero config, ~90MB model download on first run
+gitnexus analyze --embeddings
+
+# Ollama
+gitnexus analyze --embeddings \
+  --embed-provider ollama \
+  --embed-model nomic-embed-text \
+  --embed-dims 768
+
+# OpenAI
+gitnexus analyze --embeddings \
+  --embed-provider openai \
+  --embed-model text-embedding-3-small \
+  --embed-dims 1536 \
+  --embed-api-key sk-xxx
+
+# Cohere
+gitnexus analyze --embeddings \
+  --embed-provider cohere \
+  --embed-model embed-english-light-v3.0 \
+  --embed-dims 384 \
+  --embed-api-key xxx
+```
+
+### Environment Variables
+
+| Variable | Description |
+|----------|-------------|
+| `GITNEXUS_EMBED_PROVIDER` | Provider type: `local`, `ollama`, `openai`, `cohere` |
+| `GITNEXUS_EMBED_MODEL` | Model name |
+| `GITNEXUS_EMBED_DIMS` | Vector dimensions (must match the model) |
+| `GITNEXUS_EMBED_ENDPOINT` | API endpoint URL (override default) |
+| `GITNEXUS_EMBED_API_KEY` | API key (also reads `OPENAI_API_KEY` / `COHERE_API_KEY`) |
+
+See the [embeddings guide](../docs/embeddings.md) for detailed provider setup, GPU acceleration, and troubleshooting.
+
+> **Note:** Neptune does not support embeddings in v1. Embeddings are stored in KuzuDB only.
 
 ## MCP Tools
 
@@ -140,7 +224,14 @@ gitnexus setup                    # Configure MCP for your editors (one-time)
 gitnexus analyze [path]           # Index a repository (or update stale index)
 gitnexus analyze --force          # Force full re-index
 gitnexus analyze --embeddings     # Enable embedding generation (slower, better search)
+gitnexus analyze --embeddings \   # Use a specific embedding provider
+  --embed-provider ollama \       #   ollama | openai | cohere | local
+  --embed-model nomic-embed-text \#   Model name
+  --embed-dims 768                #   Vector dimensions (must match model)
 gitnexus analyze --verbose        # Log skipped files when parsers are unavailable
+gitnexus analyze --db neptune \   # Use AWS Neptune backend
+  --neptune-endpoint <host> \     # Neptune cluster endpoint
+  --neptune-region <region>       # AWS region
 gitnexus mcp                     # Start MCP server (stdio) — serves all indexed repos
 gitnexus serve                   # Start local HTTP server (multi-repo) for web UI
 gitnexus list                    # List all indexed repositories
@@ -154,6 +245,8 @@ gitnexus wiki --model <model>    # Wiki with custom LLM model (default: gpt-4o-m
 ## Multi-Repo Support
 
 GitNexus supports indexing multiple repositories. Each `gitnexus analyze` registers the repo in a global registry (`~/.gitnexus/registry.json`). The MCP server serves all indexed repos automatically.
+
+> **Neptune:** v1 supports one cluster per repository. Multi-repo requires separate Neptune clusters.
 
 ## Supported Languages
 
@@ -197,8 +290,8 @@ Installed automatically by both `gitnexus analyze` (per-repo) and `gitnexus setu
 
 ## Privacy
 
-- All processing happens locally on your machine
-- No code is sent to any server
+- **KuzuDB (default):** All processing happens locally on your machine. No code is sent to any server.
+- **Neptune:** Code metadata (symbol names, file paths, relationships) is sent to your AWS Neptune cluster. Source code content is not stored in the graph.
 - Index stored in `.gitnexus/` inside your repo (gitignored)
 - Global registry at `~/.gitnexus/` stores only paths and metadata
 

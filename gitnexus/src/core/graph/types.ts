@@ -32,7 +32,9 @@ export type NodeLabel =
   | 'Delegate'
   | 'Annotation'
   | 'Constructor'
-  | 'Template';
+  | 'Template'
+  // Frontend-only (not stored in KuzuDB)
+  | 'ClusterGroup';
 
 
 import { SupportedLanguages } from '../../config/supported-languages.js';
