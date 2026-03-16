@@ -142,14 +142,20 @@ export const embedCommand = async (
     // with the pipeline using Neptune query executor
   } else {
     // LadybugDB path
-    if (dimsChanged) {
-      mp.update(20, `Dimension change detected (${prevEmbed!.dimensions} -> ${embedConfig.dimensions}), recreating table...`);
+    if (dimsChanged || !prevEmbed) {
+      // Recreate if dims changed OR no previous embedding entry (ensures table schema matches
+      // the requested dims — a stale table from an aborted run may have wrong dims/vector index).
+      if (dimsChanged) {
+        mp.update(20, `Dimension change detected (${prevEmbed!.dimensions} -> ${embedConfig.dimensions}), recreating table...`);
+      } else {
+        mp.update(20, `Recreating embedding table (${embedConfig.dimensions} dims)...`);
+      }
       await initLbug(lbugPath);
       try {
         await executeQuery(`DROP TABLE ${EMBEDDING_TABLE_NAME}`);
       } catch { /* table may not exist */ }
       await closeLbug();
-      // Re-init, then create table with new dims
+      // Re-init, then create table with correct dims
       await initLbug(lbugPath);
       await ensureEmbeddingTable(embedConfig.dimensions);
     } else {

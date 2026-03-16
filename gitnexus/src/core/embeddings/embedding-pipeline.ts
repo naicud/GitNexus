@@ -147,6 +147,18 @@ export const runEmbeddingPipeline = async (
   const batchSize = Math.min(provider.maxBatchSize(), finalConfig.batchSize || provider.maxBatchSize());
 
   try {
+    // Load VECTOR extension early — required if CodeEmbedding already has a vector index
+    // from a prior run. LadybugDB needs the extension loaded before any DML on indexed tables.
+    if (!vectorExtensionLoaded) {
+      try {
+        await executeQuery('INSTALL VECTOR');
+        await executeQuery('LOAD EXTENSION VECTOR');
+        vectorExtensionLoaded = true;
+      } catch {
+        vectorExtensionLoaded = true;
+      }
+    }
+
     onProgress({ phase: 'loading-model', percent: 0, modelDownloadPercent: 0 });
 
     // Warm up the provider (triggers lazy model load for local providers)
