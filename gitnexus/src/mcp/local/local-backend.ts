@@ -663,7 +663,7 @@ export class LocalBackend {
         return neptuneSemanticSearch(adapter, queryVec, limit);
       }
 
-      // KuzuDB path: use vector index
+      // LadybugDB path: use vector index
       const tableCheck = await this.runQuery(repo.id, `MATCH (e:CodeEmbedding) RETURN COUNT(*) AS cnt LIMIT 1`);
       if (!tableCheck.length || (tableCheck[0].cnt ?? tableCheck[0][0]) === 0) return [];
 

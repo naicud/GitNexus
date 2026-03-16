@@ -132,7 +132,7 @@ export interface LLMSettings {
 
   // Database backend settings
   database?: {
-    type: 'kuzu' | 'neptune';
+    type: 'lbug' | 'neptune';
     neptuneEndpoint?: string;
     neptuneRegion?: string;
     neptunePort?: number;

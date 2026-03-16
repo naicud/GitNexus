@@ -6,7 +6,7 @@
  *
  * Flow:
  * 1. Resolve repo, verify indexed
- * 2. Open KuzuDB (existing index)
+ * 2. Open LadybugDB (existing index)
  * 3. Run analyzeDeadCode() -> progress
  * 4. Run computeMetrics() -> progress
  * 5. Run scoreModernization() -> progress

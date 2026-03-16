@@ -33,7 +33,7 @@ export type NodeLabel =
   | 'Annotation'
   | 'Constructor'
   | 'Template'
-  // Frontend-only (not stored in KuzuDB)
+  // Frontend-only (not stored in LadybugDB)
   | 'ClusterGroup';
 
 

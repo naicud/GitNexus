@@ -43,7 +43,7 @@ export interface RegistryEntry {
   indexedAt: string;
   lastCommit: string;
   stats?: RepoMeta['stats'];
-  /** DB backend config. If absent, defaults to KuzuDB at storagePath/kuzu (backwards compat) */
+  /** DB backend config. If absent, defaults to LadybugDB at storagePath/lbug (backwards compat) */
   db?: DbConfig;
   /** Embedding config used during indexing. If absent, defaults to local/snowflake-arctic-embed-xs/384. */
   embedding?: {
@@ -82,7 +82,13 @@ export const getStoragePaths = (repoPath: string) => {
  * Falls back to LadybugDB at the standard path for old entries that predate Neptune support.
  */
 export const getDbConfig = (entry: RegistryEntry): DbConfig => {
-  if (entry.db) return entry.db;
+  if (entry.db) {
+    // Backwards compat: old entries may have type 'kuzu' from before migration
+    if ((entry.db as any).type === 'kuzu') {
+      return { type: 'lbug', lbugPath: path.join(entry.storagePath, 'lbug') };
+    }
+    return entry.db;
+  }
   return {
     type: 'lbug',
     lbugPath: path.join(entry.storagePath, 'lbug'),
@@ -303,7 +309,7 @@ export const registerRepo = async (
 
 /**
  * Update the database backend config for a registered repo.
- * If db is undefined or db.type === 'kuzu', the db field is removed (falls back to KuzuDB default).
+ * If db is undefined or db.type === 'lbug', the db field is removed (falls back to LadybugDB default).
  * Throws if the repo is not found in the registry.
  */
 export const updateRepoDb = async (repoName: string, db?: DbConfig): Promise<void> => {
@@ -313,7 +319,7 @@ export const updateRepoDb = async (repoName: string, db?: DbConfig): Promise<voi
     throw new Error(`Repository "${repoName}" not found in registry`);
   }
 
-  if (!db || db.type === 'lbug') {
+  if (!db || db.type === 'lbug' || (db as any).type === 'kuzu') {
     delete entry.db;
   } else {
     entry.db = db;

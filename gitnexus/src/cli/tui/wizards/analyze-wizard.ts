@@ -54,10 +54,10 @@ export async function runAnalyzeWizard(
   const dbChoice = await p.select({
     message: 'Database backend',
     options: [
-      { value: 'kuzu', label: 'KuzuDB', hint: 'local, zero-config (recommended)' },
+      { value: 'lbug', label: 'LadybugDB', hint: 'local, zero-config (recommended)' },
       { value: 'neptune', label: 'AWS Neptune', hint: 'cloud graph database' },
     ],
-    initialValue: 'kuzu',
+    initialValue: 'lbug',
   });
   if (p.isCancel(dbChoice)) { p.cancel('Cancelled.'); return null; }
 
@@ -216,7 +216,7 @@ export async function runAnalyzeWizard(
   renderConfig({
     'Repository': projectName,
     'Path': repoPath,
-    'Database': dbChoice === 'neptune' ? `Neptune (${neptuneEndpoint})` : 'KuzuDB (local)',
+    'Database': dbChoice === 'neptune' ? `Neptune (${neptuneEndpoint})` : 'LadybugDB (local)',
     'Embeddings': enableEmbeddings ? `${embedProvider} / ${embedModel}` : 'off',
     'Force': force,
     'Verbose': verbose,

@@ -28,7 +28,13 @@ import { NeptuneAdapter } from '../core/db/neptune/neptune-adapter.js';
 
 /** Resolve DB config for a registry entry. Falls back to LadybugDB. */
 function getDbConfigFromEntry(entry: { storagePath: string; db?: DbConfig }): DbConfig {
-  if ((entry as any).db) return (entry as any).db;
+  if ((entry as any).db) {
+    // Backwards compat: old entries may have type 'kuzu' from before migration
+    if ((entry as any).db.type === 'kuzu') {
+      return { type: 'lbug', lbugPath: path.join(entry.storagePath, 'lbug') };
+    }
+    return (entry as any).db;
+  }
   return { type: 'lbug', lbugPath: path.join(entry.storagePath, 'lbug') };
 }
 
@@ -320,8 +326,8 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
         return res.status(400).json({ error: '"repo" is required and must be a string' });
       }
 
-      if (!db || typeof db !== 'object' || (db.type !== 'kuzu' && db.type !== 'neptune')) {
-        return res.status(400).json({ error: '"db.type" must be "kuzu" or "neptune"' });
+      if (!db || typeof db !== 'object' || (db.type !== 'lbug' && db.type !== 'neptune')) {
+        return res.status(400).json({ error: '"db.type" must be "lbug" or "neptune"' });
       }
 
       if (db.type === 'neptune') {
@@ -444,7 +450,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
         }
       }
 
-      // KuzuDB path
+      // LadybugDB path
       const lbugPath = path.join(entry.storagePath, 'lbug');
       const summary = await withLbugDb(lbugPath, async () => {
         // Try community-based first
@@ -638,7 +644,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
           }
         }
 
-        // KuzuDB structural expand
+        // LadybugDB structural expand
         const lbugPath = path.join(entry.storagePath, 'lbug');
         const result = await withLbugDb(lbugPath, () =>
           structuralExpand(executeQuery, executeParameterizedQuery)
@@ -861,7 +867,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
 
         // Get neighbors via variable-length paths (parameterized)
         // depth is already validated as integer 1-3
-        // Build direction pattern and type filter for KuzuDB
+        // Build direction pattern and type filter for LadybugDB
         const dirPattern = direction === 'inbound' ? '<-[r:CodeRelation]-' : direction === 'outbound' ? '-[r:CodeRelation]->' : '-[r:CodeRelation]-';
         const typeFilter = types ? ' AND r.type IN $types' : '';
         const neighborParams: Record<string, any> = types ? { nodeId, types } : { nodeId };
@@ -1100,7 +1106,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
         }
       }
 
-      // KuzuDB path
+      // LadybugDB path
       const lbugPath = path.join(entry.storagePath, 'lbug');
       const result = await withLbugDb(lbugPath, async () => {
         if (!parentId) {
@@ -1307,7 +1313,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
         }
       }
 
-      // KuzuDB path
+      // LadybugDB path
       const lbugPath = path.join(entry.storagePath, 'lbug');
       const result = await withLbugDb(lbugPath, async () => {
         const safeNodeId = nodeId.replace(/'/g, "\\'");
@@ -1494,7 +1500,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
 
       const dbConfig = getDbConfigFromEntry(entry);
 
-      // Neptune path (with same NODE_HARD_CAP as KuzuDB)
+      // Neptune path (with same NODE_HARD_CAP as LadybugDB)
       if (dbConfig.type === 'neptune') {
         const adapter = new NeptuneAdapter(dbConfig);
         try {

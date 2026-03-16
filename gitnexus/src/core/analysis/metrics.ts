@@ -1,7 +1,7 @@
 /**
  * Metrics Calculator
  *
- * Computes on-the-fly metrics from the KuzuDB graph (not persisted).
+ * Computes on-the-fly metrics from the LadybugDB graph (not persisted).
  * ~6-8 aggregate Cypher queries.
  *
  * Per-program: fan-in, fan-out, paragraph count, COPY count, EXEC SQL/CICS count
@@ -210,7 +210,7 @@ export async function computeMetrics(
         externalEdges = Number(edgeRows[0].external ?? edgeRows[0][1] ?? 0);
       }
     } catch {
-      // Complex query may fail on some KuzuDB versions — use simpler fallback
+      // Complex query may fail on some LadybugDB versions — use simpler fallback
       try {
         const memberRows = await runQuery(`
           MATCH (a)-[r:CodeRelation {type: 'MEMBER_OF'}]->(c:Community {id: '${id.replace(/'/g, "''")}'})

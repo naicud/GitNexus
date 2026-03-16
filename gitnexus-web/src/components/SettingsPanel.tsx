@@ -230,7 +230,7 @@ export const SettingsPanel = ({ isOpen, onClose, onSettingsSaved, backendUrl, is
   const [bedrockTestStatus, setBedrockTestStatus] = useState<'idle' | 'testing' | 'success' | 'error'>('idle');
   const [bedrockTestMessage, setBedrockTestMessage] = useState('');
   // Database settings state
-  const [dbType, setDbType] = useState<'kuzu' | 'neptune'>('kuzu');
+  const [dbType, setDbType] = useState<'lbug' | 'neptune'>('lbug');
   const [neptuneEndpoint, setNeptuneEndpoint] = useState('');
   const [neptuneRegion, setNeptuneRegion] = useState('');
   const [neptunePort, setNeptunePort] = useState('8182');
@@ -240,7 +240,7 @@ export const SettingsPanel = ({ isOpen, onClose, onSettingsSaved, backendUrl, is
   // DB change tracking
   const [dbChanged, setDbChanged] = useState(false);
   const [dbSaving, setDbSaving] = useState(false);
-  const originalDbType = useRef<'kuzu' | 'neptune'>('kuzu');
+  const originalDbType = useRef<'lbug' | 'neptune'>('lbug');
 
   // Load settings when panel opens
   useEffect(() => {
@@ -250,7 +250,7 @@ export const SettingsPanel = ({ isOpen, onClose, onSettingsSaved, backendUrl, is
       setSaveStatus('idle');
       setOllamaError(null);
       // Sync database state from persisted settings
-      const loadedDbType = s.database?.type ?? 'kuzu';
+      const loadedDbType = s.database?.type ?? 'lbug';
       setDbType(loadedDbType);
       originalDbType.current = loadedDbType;
       setNeptuneEndpoint(s.database?.neptuneEndpoint ?? '');
@@ -313,7 +313,7 @@ export const SettingsPanel = ({ isOpen, onClose, onSettingsSaved, backendUrl, is
         try {
           const dbPayload = dbType === 'neptune'
             ? { type: 'neptune' as const, endpoint: neptuneEndpoint, region: neptuneRegion, port: parseInt(neptunePort) || 8182 }
-            : { type: 'kuzu' as const };
+            : { type: 'lbug' as const };
           const result = await updateRepoDbConfig(currentRepo, dbPayload);
           if (!result.ok) {
             console.warn('Failed to persist DB config to server:', result.error);
@@ -1169,14 +1169,14 @@ export const SettingsPanel = ({ isOpen, onClose, onSettingsSaved, backendUrl, is
             {/* DB Type selector */}
             <div className="flex gap-2 mb-4">
               <button
-                onClick={() => setDbType('kuzu')}
+                onClick={() => setDbType('lbug')}
                 className={`flex-1 px-4 py-2.5 rounded-xl border-2 text-sm font-medium transition-all
-                  ${dbType === 'kuzu'
+                  ${dbType === 'lbug'
                     ? 'border-accent bg-accent/10 text-text-primary'
                     : 'border-border-subtle bg-elevated hover:border-accent/50 text-text-secondary'
                   }`}
               >
-                KuzuDB (Local)
+                LadybugDB (Local)
               </button>
               <button
                 onClick={() => setDbType('neptune')}

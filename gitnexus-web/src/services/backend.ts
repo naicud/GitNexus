@@ -252,12 +252,12 @@ export const testBedrockConnection = async (config: {
 };
 
 /**
- * Update the DB config (kuzu / neptune) for a repository on the server.
+ * Update the DB config (lbug / neptune) for a repository on the server.
  * Called from Settings panel after Save.
  */
 export const updateRepoDbConfig = async (
   repo: string,
-  db: { type: 'kuzu' } | { type: 'neptune'; endpoint: string; region: string; port?: number },
+  db: { type: 'lbug' } | { type: 'neptune'; endpoint: string; region: string; port?: number },
 ): Promise<{ ok: boolean; error?: string }> => {
   const response = await fetchWithTimeout(`${backendUrl}/api/repo/db`, {
     method: 'PATCH',

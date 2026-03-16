@@ -305,6 +305,6 @@ export const embedCommand = async (
 
   console.log('');
 
-  // Force exit to avoid KuzuDB/ONNX native handle hangs
+  // Force exit to avoid LadybugDB/ONNX native handle hangs
   process.exit(0);
 };

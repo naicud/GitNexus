@@ -102,18 +102,41 @@ const doInitLbug = async (dbPath: string) => {
   const parentDir = path.dirname(dbPath);
   await fs.mkdir(parentDir, { recursive: true });
 
-  db = new lbug.Database(dbPath);
-  conn = new lbug.Connection(db);
+  const openAndCreateSchema = async () => {
+    db = new lbug.Database(dbPath);
+    conn = new lbug.Connection(db);
 
-  for (const schemaQuery of SCHEMA_QUERIES) {
-    try {
-      await conn.query(schemaQuery);
-    } catch (err) {
-      // Only ignore "already exists" errors - log everything else
-      const msg = err instanceof Error ? err.message : String(err);
-      if (!msg.includes('already exists')) {
-        console.warn(`⚠️ Schema creation warning: ${msg.slice(0, 120)}`);
+    for (const schemaQuery of SCHEMA_QUERIES) {
+      try {
+        await conn.query(schemaQuery);
+      } catch (err) {
+        // Only ignore "already exists" errors - log everything else
+        const msg = err instanceof Error ? err.message : String(err);
+        if (!msg.includes('already exists')) {
+          console.warn(`⚠️ Schema creation warning: ${msg.slice(0, 120)}`);
+        }
       }
+    }
+  };
+
+  try {
+    await openAndCreateSchema();
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (msg.toLowerCase().includes('wal')) {
+      // Corrupted WAL — close broken handles, delete WAL, retry once
+      console.warn(`⚠️ Corrupted WAL detected for ${dbPath} — deleting WAL and retrying`);
+      try { if (conn) await conn.close(); } catch {}
+      try { if (db) await db.close(); } catch {}
+      conn = null;
+      db = null;
+
+      const walPath = `${dbPath}.wal`;
+      try { await fs.unlink(walPath); } catch {}
+
+      await openAndCreateSchema();
+    } else {
+      throw err;
     }
   }
 
@@ -472,7 +495,7 @@ export const batchInsertNodesToLbug = async (
   return { inserted, failed };
 };
 
-/** Normalize kuzu getAll() — large DBs may return paged results [[page1...], [page2...]] */
+/** Normalize LadybugDB getAll() — large DBs may return paged results [[page1...], [page2...]] */
 const flattenRows = (rows: any[]): any[] => {
   if (rows.length > 0 && Array.isArray(rows[0])) {
     return rows.flat();

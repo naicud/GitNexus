@@ -1,7 +1,7 @@
 /**
  * Dead Code Analyzer
  *
- * Queries Cypher against KuzuDB to identify:
+ * Queries Cypher against LadybugDB to identify:
  * 1. Unused paragraphs — Function nodes with zero incoming CALLS
  * 2. Unreachable programs — Module nodes with zero incoming CALLS and zero JCL refs
  * 3. Orphan copybooks — File nodes in copybook dirs with zero incoming IMPORTS

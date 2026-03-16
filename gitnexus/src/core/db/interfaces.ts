@@ -1,8 +1,8 @@
 /**
  * Graph DB Adapter Interfaces
  *
- * Defines the contract for graph database backends (KuzuDB, Neptune, etc.).
- * KuzuDB remains the default; Neptune is an optional AWS-managed alternative.
+ * Defines the contract for graph database backends (LadybugDB, Neptune, etc.).
+ * LadybugDB remains the default; Neptune is an optional AWS-managed alternative.
  */
 
 export type DbType = 'lbug' | 'neptune';
