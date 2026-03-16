@@ -478,5 +478,6 @@ export const REL_SCHEMA_QUERIES = [
 export const SCHEMA_QUERIES = [
   ...NODE_SCHEMA_QUERIES,
   ...REL_SCHEMA_QUERIES,
-  EMBEDDING_SCHEMA,
+  // NOTE: EMBEDDING_SCHEMA is intentionally excluded — embedding table dims depend on
+  // the configured model and must be created dynamically via ensureEmbeddingTable(dims).
 ];

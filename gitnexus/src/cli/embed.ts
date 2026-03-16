@@ -10,8 +10,8 @@ import path from 'path';
 import { resolveEmbeddingConfig, type EmbedOptions } from './embed-config.js';
 import { getStoragePaths, loadMeta, saveMeta, readRegistry, registerRepo, getDbConfig } from '../storage/repo-manager.js';
 import { getGitRoot, isGitRepo } from '../storage/git.js';
-import { initLbug, closeLbug, executeQuery, executeWithReusedStatement, loadCachedEmbeddings, getLbugStats } from '../core/lbug/lbug-adapter.js';
-import { getEmbeddingSchema, EMBEDDING_TABLE_NAME } from '../core/lbug/schema.js';
+import { initLbug, closeLbug, executeQuery, executeWithReusedStatement, loadCachedEmbeddings, getLbugStats, ensureEmbeddingTable } from '../core/lbug/lbug-adapter.js';
+import { EMBEDDING_TABLE_NAME } from '../core/lbug/schema.js';
 import type { NeptuneDbConfig } from '../core/db/interfaces.js';
 
 export interface EmbedCommandOptions extends EmbedOptions {
@@ -148,14 +148,14 @@ export const embedCommand = async (
       try {
         await executeQuery(`DROP TABLE ${EMBEDDING_TABLE_NAME}`);
       } catch { /* table may not exist */ }
-      try {
-        await executeQuery(getEmbeddingSchema(embedConfig.dimensions));
-      } catch { /* may already exist at new dims */ }
       await closeLbug();
-      // Re-init
+      // Re-init, then create table with new dims
       await initLbug(lbugPath);
+      await ensureEmbeddingTable(embedConfig.dimensions);
     } else {
       await initLbug(lbugPath);
+      // Create table if it doesn't exist yet (e.g. first embed run after a no-embeddings analyze)
+      await ensureEmbeddingTable(embedConfig.dimensions);
     }
 
     if (opts.force) {

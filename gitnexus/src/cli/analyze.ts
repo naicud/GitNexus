@@ -8,7 +8,7 @@ import path from 'path';
 import { execFileSync } from 'child_process';
 import v8 from 'v8';
 import { runPipelineFromRepo } from '../core/ingestion/pipeline.js';
-import { initLbug, loadGraphToLbug, getLbugStats, executeQuery, executeWithReusedStatement, closeLbug, createFTSIndex, loadCachedEmbeddings } from '../core/lbug/lbug-adapter.js';
+import { initLbug, loadGraphToLbug, getLbugStats, executeQuery, executeWithReusedStatement, closeLbug, createFTSIndex, loadCachedEmbeddings, ensureEmbeddingTable } from '../core/lbug/lbug-adapter.js';
 // Embedding imports are lazy (dynamic import) so onnxruntime-node is never
 // loaded when embeddings are not requested. This avoids crashes on Node
 // versions whose ABI is not yet supported by the native binary (#89).
@@ -315,6 +315,13 @@ export const analyzeCommand = async (
   }
   const ftsTime = isNeptune ? 'n/a' : ((Date.now() - t0Fts) / 1000).toFixed(1);
 
+  // ── Ensure embedding table exists with configured dims ─────────────
+  // Must happen before cached embedding re-insertion AND embedding pipeline.
+  // Dims come from user config (--embed-dims, provider model, etc.), not hardcoded.
+  if (!isNeptune && options?.embeddings) {
+    await ensureEmbeddingTable(embedConfig.dimensions);
+  }
+
   // ── Phase 3.5: Re-insert cached embeddings ────────────────────────
   if (!isNeptune && cachedEmbeddings.length > 0) {
     mp.update(50, `Restoring ${cachedEmbeddings.length} cached embeddings...`);
@@ -393,7 +400,7 @@ export const analyzeCommand = async (
         await loadEmbeddingsToNeptune(neptuneConfig, neptuneEmbeddings, (msg) => mp.update(97, msg));
       }
     } else {
-      // LadybugDB path
+      // LadybugDB path (embedding table already created above)
       await runEmbeddingPipeline(
         executeQuery,
         executeWithReusedStatement,

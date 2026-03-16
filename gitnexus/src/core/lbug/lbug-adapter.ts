@@ -705,6 +705,26 @@ export const deleteNodesForFile = async (filePath: string, dbPath?: string): Pro
 
 export const getEmbeddingTableName = (): string => EMBEDDING_TABLE_NAME;
 
+/**
+ * Create the CodeEmbedding table with the correct vector dimension.
+ * Must be called before running the embedding pipeline — NOT during initLbug,
+ * because the dimension depends on the configured model (e.g. 384 vs 1024).
+ * Safe to call multiple times: "already exists" errors are silently ignored.
+ */
+export const ensureEmbeddingTable = async (dims: number): Promise<void> => {
+  if (!conn) {
+    throw new Error('LadybugDB not initialized. Call initLbug first.');
+  }
+  try {
+    await conn.query(getEmbeddingSchema(dims));
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (!msg.includes('already exists')) {
+      throw err;
+    }
+  }
+};
+
 // ============================================================================
 // Full-Text Search (FTS) Functions
 // ============================================================================
