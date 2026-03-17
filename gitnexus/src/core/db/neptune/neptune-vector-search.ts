@@ -3,7 +3,7 @@
  *
  * Neptune does not have native vector indexes. This module:
  * 1. Fetches all embeddings from Neptune on first call
- * 2. Caches them in a flat Float64Array matrix for fast cosine computation
+ * 2. Caches them in a flat Float32Array matrix for fast cosine computation
  * 3. Computes cosine similarity app-side and returns top-K results
  *
  * Trade-off: first query is slow (fetches all embeddings via openCypher),
@@ -16,7 +16,7 @@ import type { NeptuneAdapter } from './neptune-adapter.js';
 
 interface EmbeddingCache {
   nodeIds: string[];
-  matrix: Float64Array;
+  matrix: Float32Array;
   dims: number;
 }
 
@@ -51,7 +51,7 @@ function adapterKey(adapter: NeptuneAdapter): string {
  */
 function cosineSimilarity(
   a: number[],
-  b: Float64Array,
+  b: Float32Array,
   offset: number,
   dims: number,
 ): number {
@@ -98,40 +98,47 @@ function parseEmbedding(raw: unknown): number[] | null {
  * Build the embedding cache by fetching all embeddings from Neptune.
  */
 async function buildCache(adapter: NeptuneAdapter): Promise<EmbeddingCache> {
-  const rows = await adapter.executeQuery(
-    'MATCH (n) WHERE n.embedding IS NOT NULL RETURN n.id AS nodeId, n.embedding AS embedding',
-  );
-
-  if (rows.length === 0) {
-    return { nodeIds: [], matrix: new Float64Array(0), dims: 0 };
-  }
-
-  // Determine dimensionality from the first valid embedding
-  const firstEmbedding = parseEmbedding(rows[0]['embedding']);
-  if (!firstEmbedding) {
-    return { nodeIds: [], matrix: new Float64Array(0), dims: 0 };
-  }
-  const dims = firstEmbedding.length;
-
+  const PAGE_SIZE = 2000;
+  let offset = 0;
+  let dims = 0;
   const nodeIds: string[] = [];
   const values: number[] = [];
 
-  for (const row of rows) {
-    const embedding = parseEmbedding(row['embedding']);
-    const nodeId = row['nodeId'] as string | undefined;
+  while (true) {
+    const rows = await adapter.executeQuery(
+      `MATCH (n) WHERE n.embedding IS NOT NULL ` +
+      `RETURN n.id AS nodeId, n.embedding AS embedding ` +
+      `ORDER BY n.id SKIP ${offset} LIMIT ${PAGE_SIZE}`,
+    );
 
-    if (!nodeId || !embedding || embedding.length !== dims) {
-      continue; // Skip malformed entries
+    if (rows.length === 0) break;
+
+    for (const row of rows) {
+      const embedding = parseEmbedding(row['embedding']);
+      const nodeId = row['nodeId'] as string | undefined;
+      if (!nodeId || !embedding) continue;
+
+      if (dims === 0) {
+        dims = embedding.length;
+      } else if (embedding.length !== dims) {
+        continue;
+      }
+
+      nodeIds.push(nodeId);
+      for (let i = 0; i < dims; i++) {
+        values.push(embedding[i]);
+      }
     }
 
-    nodeIds.push(nodeId);
-    for (let i = 0; i < dims; i++) {
-      values.push(embedding[i]);
-    }
+    offset += rows.length;
+    if (rows.length < PAGE_SIZE) break;
   }
 
-  const matrix = new Float64Array(values);
-  return { nodeIds, matrix, dims };
+  if (nodeIds.length === 0 || dims === 0) {
+    return { nodeIds: [], matrix: new Float32Array(0), dims: 0 };
+  }
+
+  return { nodeIds, matrix: new Float32Array(values), dims };
 }
 
 /**

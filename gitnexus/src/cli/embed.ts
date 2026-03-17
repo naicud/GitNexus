@@ -197,6 +197,8 @@ export const embedCommand = async (
 
   const labels = getEmbeddableLabels(stats.nodes);
 
+  let neptuneEmbeddingCount = 0;
+
   if (isNeptune && neptuneConfig) {
     // Neptune path
     const neptuneEmbeddings: Array<{ nodeId: string; embedding: number[] }> = [];
@@ -238,6 +240,7 @@ export const embedCommand = async (
       const { loadEmbeddingsToNeptune } = await import('../core/db/neptune/neptune-ingest.js');
       await loadEmbeddingsToNeptune(neptuneConfig, neptuneEmbeddings, (msg) => mp.update(97, msg));
     }
+    neptuneEmbeddingCount = neptuneEmbeddings.length;
   } else {
     // LadybugDB path
     await runEmbeddingPipeline(
@@ -264,7 +267,9 @@ export const embedCommand = async (
 
   // Count embeddings
   let embeddingCount = 0;
-  if (!isNeptune) {
+  if (isNeptune) {
+    embeddingCount = neptuneEmbeddingCount;
+  } else {
     try {
       const embResult = await executeQuery(`MATCH (e:${EMBEDDING_TABLE_NAME}) RETURN count(e) AS cnt`);
       embeddingCount = embResult?.[0]?.cnt ?? 0;

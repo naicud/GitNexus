@@ -396,16 +396,17 @@ export class LocalBackend {
     let semanticResults: any[];
 
     if (isNeptune) {
-      // Neptune: text predicate search (no FTS / no embeddings)
-      bm25Results = await this.runParameterized(repo.id, `
-        MATCH (n)
-        WHERE n.name CONTAINS $q OR n.content CONTAINS $q
-        RETURN n.id AS nodeId, n.name AS name, labels(n)[0] AS type,
-               n.filePath AS filePath, n.startLine AS startLine, 1.0 AS score
-        ORDER BY n.name
-        LIMIT 50
-      `, { q: searchQuery });
-      semanticResults = [];
+      [bm25Results, semanticResults] = await Promise.all([
+        this.runParameterized(repo.id, `
+          MATCH (n)
+          WHERE n.name CONTAINS $q OR n.content CONTAINS $q
+          RETURN n.id AS nodeId, n.name AS name, labels(n)[0] AS type,
+                 n.filePath AS filePath, n.startLine AS startLine, 1.0 AS score
+          ORDER BY n.name
+          LIMIT 50
+        `, { q: searchQuery }),
+        this.semanticSearch(repo, searchQuery, searchLimit),
+      ]);
     } else {
       [bm25Results, semanticResults] = await Promise.all([
         this.bm25Search(repo, searchQuery, searchLimit),
@@ -655,12 +656,41 @@ export class LocalBackend {
     try {
       // Neptune path: use app-side cosine similarity search
       if (repo.db?.type === 'neptune') {
-        const { embedQuery, getEmbeddingDims } = await import('../core/embedder.js');
+        const { embedQuery } = await import('../core/embedder.js');
         const queryVec = await embedQuery(query, repo.embedding);
         const { neptuneSemanticSearch } = await import('../../core/db/neptune/neptune-vector-search.js');
         const adapter = neptuneAdapters.get(repo.id);
         if (!adapter) return [];
-        return neptuneSemanticSearch(adapter, queryVec, limit);
+        const rawResults = await neptuneSemanticSearch(adapter, queryVec, limit);
+
+        const results: any[] = [];
+        for (const embRow of rawResults) {
+          const nodeId = embRow.nodeId;
+          const distance = embRow.distance;
+          const labelEndIdx = nodeId.indexOf(':');
+          const label = labelEndIdx > 0 ? nodeId.substring(0, labelEndIdx) : 'Unknown';
+          if (!VALID_NODE_LABELS.has(label)) continue;
+
+          try {
+            const nodeQuery = label === 'File'
+              ? `MATCH (n:File {id: $nodeId}) RETURN n.name AS name, n.filePath AS filePath`
+              : `MATCH (n:\`${label}\` {id: $nodeId}) RETURN n.name AS name, n.filePath AS filePath, n.startLine AS startLine, n.endLine AS endLine`;
+            const nodeRows = await this.runParameterized(repo.id, nodeQuery, { nodeId });
+            if (nodeRows.length > 0) {
+              const nodeRow = nodeRows[0];
+              results.push({
+                nodeId,
+                name: nodeRow.name ?? nodeRow[0] ?? '',
+                type: label,
+                filePath: nodeRow.filePath ?? nodeRow[1] ?? '',
+                distance,
+                startLine: label !== 'File' ? (nodeRow.startLine ?? nodeRow[2]) : undefined,
+                endLine: label !== 'File' ? (nodeRow.endLine ?? nodeRow[3]) : undefined,
+              });
+            }
+          } catch {}
+        }
+        return results;
       }
 
       // LadybugDB path: use vector index
