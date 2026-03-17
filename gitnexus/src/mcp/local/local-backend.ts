@@ -399,7 +399,7 @@ export class LocalBackend {
       [bm25Results, semanticResults] = await Promise.all([
         this.runParameterized(repo.id, `
           MATCH (n)
-          WHERE n.name CONTAINS $q OR n.content CONTAINS $q
+          WHERE toLower(n.name) CONTAINS toLower($q) OR toLower(n.content) CONTAINS toLower($q)
           RETURN n.id AS nodeId, n.name AS name, labels(n)[0] AS type,
                  n.filePath AS filePath, n.startLine AS startLine, 1.0 AS score
           ORDER BY n.name
@@ -763,7 +763,8 @@ export class LocalBackend {
   private async cypher(repo: RepoHandle, params: { query: string }): Promise<any> {
     await this.ensureInitialized(repo.id);
 
-    if (!isLbugReady(repo.id)) {
+    const isNeptuneRepo = neptuneAdapters.has(repo.id);
+    if (!isNeptuneRepo && !isLbugReady(repo.id)) {
       return { error: 'LadybugDB not ready. Index may be corrupted.' };
     }
 

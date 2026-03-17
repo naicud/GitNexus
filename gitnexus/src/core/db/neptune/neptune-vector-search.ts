@@ -96,15 +96,42 @@ function parseEmbedding(raw: unknown): number[] | null {
 
 /**
  * Build the embedding cache by fetching all embeddings from Neptune.
+ *
+ * Uses COUNT + pre-allocation to avoid OOM:
+ * 1. One COUNT query to know total nodes upfront
+ * 2. Detect dims from first row
+ * 3. Pre-allocate Float32Array (768 MB for 250K×768) — lives in ArrayBuffer,
+ *    outside the V8 heap, so no OOM from heap exhaustion
+ * 4. Single pagination pass fills the typed array directly
+ *
+ * Avoids accumulating 250K×768 floats in a plain JS Array (192M elements
+ * exhausts the V8 heap with a fatal "invalid table size" OOM crash).
  */
 async function buildCache(adapter: NeptuneAdapter): Promise<EmbeddingCache> {
   const PAGE_SIZE = 2000;
-  let offset = 0;
-  let dims = 0;
-  const nodeIds: string[] = [];
-  const values: number[] = [];
 
-  while (true) {
+  // ── Step 1: total count ───────────────────────────────────────────────────
+  const countRows = await adapter.executeQuery(
+    'MATCH (n) WHERE n.embedding IS NOT NULL RETURN count(n) AS cnt',
+  );
+  const totalCount = Number((countRows[0] as Record<string, unknown>)?.['cnt'] ?? 0);
+  if (totalCount === 0) return { nodeIds: [], matrix: new Float32Array(0), dims: 0 };
+
+  // ── Step 2: detect dims from first row ───────────────────────────────────
+  const firstRows = await adapter.executeQuery(
+    'MATCH (n) WHERE n.embedding IS NOT NULL RETURN n.embedding AS embedding LIMIT 1',
+  );
+  const dims = parseEmbedding((firstRows[0] as Record<string, unknown>)?.['embedding'])?.length ?? 0;
+  if (dims === 0) return { nodeIds: [], matrix: new Float32Array(0), dims: 0 };
+
+  // ── Step 3: pre-allocate (lives in ArrayBuffer, not V8 heap) ─────────────
+  const nodeIds = new Array<string>(totalCount);
+  const matrix = new Float32Array(totalCount * dims);
+  let nodeIdx = 0;
+
+  // ── Step 4: single pagination pass ───────────────────────────────────────
+  let offset = 0;
+  while (nodeIdx < totalCount) {
     const rows = await adapter.executeQuery(
       `MATCH (n) WHERE n.embedding IS NOT NULL ` +
       `RETURN n.id AS nodeId, n.embedding AS embedding ` +
@@ -114,31 +141,26 @@ async function buildCache(adapter: NeptuneAdapter): Promise<EmbeddingCache> {
     if (rows.length === 0) break;
 
     for (const row of rows) {
-      const embedding = parseEmbedding(row['embedding']);
-      const nodeId = row['nodeId'] as string | undefined;
-      if (!nodeId || !embedding) continue;
+      const embedding = parseEmbedding((row as Record<string, unknown>)['embedding']);
+      const nodeId = (row as Record<string, unknown>)['nodeId'] as string | undefined;
+      if (!nodeId || !embedding || embedding.length !== dims) continue;
 
-      if (dims === 0) {
-        dims = embedding.length;
-      } else if (embedding.length !== dims) {
-        continue;
-      }
-
-      nodeIds.push(nodeId);
+      nodeIds[nodeIdx] = nodeId;
+      const base = nodeIdx * dims;
       for (let i = 0; i < dims; i++) {
-        values.push(embedding[i]);
+        matrix[base + i] = embedding[i];
       }
+      nodeIdx++;
     }
 
     offset += rows.length;
     if (rows.length < PAGE_SIZE) break;
   }
 
-  if (nodeIds.length === 0 || dims === 0) {
-    return { nodeIds: [], matrix: new Float32Array(0), dims: 0 };
-  }
+  const finalNodeIds = nodeIds.slice(0, nodeIdx);
+  const finalMatrix = nodeIdx === totalCount ? matrix : matrix.subarray(0, nodeIdx * dims);
 
-  return { nodeIds, matrix: new Float32Array(values), dims };
+  return { nodeIds: finalNodeIds, matrix: finalMatrix as Float32Array, dims };
 }
 
 /**

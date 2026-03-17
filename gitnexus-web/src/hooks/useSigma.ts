@@ -144,6 +144,7 @@ export const useSigma = (options: UseSigmaOptions = {}): UseSigmaReturn => {
   const layoutTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const animationFrameRef = useRef<number | null>(null);
   const zoomTierRef = useRef<'far' | 'medium' | 'close'>('medium');
+  const userStoppedRef = useRef(false);
   const [isLayoutRunning, setIsLayoutRunning] = useState(false);
   const [selectedNode, setSelectedNodeState] = useState<string | null>(null);
 
@@ -183,19 +184,10 @@ export const useSigma = (options: UseSigmaOptions = {}): UseSigmaReturn => {
   const setSelectedNode = useCallback((nodeId: string | null) => {
     selectedNodeRef.current = nodeId;
     setSelectedNodeState(nodeId);
-    
+
     const sigma = sigmaRef.current;
     if (!sigma) return;
-    
-    // Tiny camera nudge to force edge refresh (workaround for Sigma edge caching)
-    const camera = sigma.getCamera();
-    const currentRatio = camera.ratio;
-    // Imperceptible zoom change that triggers re-render
-    camera.animate(
-      { ratio: currentRatio * 1.0001 },
-      { duration: 50 }
-    );
-    
+
     sigma.refresh();
   }, []);
 
@@ -566,6 +558,28 @@ export const useSigma = (options: UseSigmaOptions = {}): UseSigmaReturn => {
       }
     });
 
+    // Drag handling: pin node during drag so FA2 doesn't fight it
+    let draggedNode: string | null = null;
+
+    sigma.on('downNode', ({ node }) => {
+      const graph = graphRef.current;
+      if (!graph || !graph.hasNode(node)) return;
+      draggedNode = node;
+      graph.setNodeAttribute(node, 'fixed', true);
+    });
+
+    const releaseNode = () => {
+      if (!draggedNode) return;
+      const graph = graphRef.current;
+      if (graph && graph.hasNode(draggedNode)) {
+        graph.setNodeAttribute(draggedNode, 'fixed', false);
+      }
+      draggedNode = null;
+    };
+
+    sigma.on('upNode', releaseNode);
+    sigma.on('upStage', releaseNode);
+
     return () => {
       if (layoutTimeoutRef.current) {
         clearTimeout(layoutTimeoutRef.current);
@@ -581,6 +595,7 @@ export const useSigma = (options: UseSigmaOptions = {}): UseSigmaReturn => {
   const runLayout = useCallback((graph: Graph<SigmaNodeAttributes, SigmaEdgeAttributes>) => {
     const nodeCount = graph.order;
     if (nodeCount === 0) return;
+    if (userStoppedRef.current) return;
 
     // Kill existing
     if (layoutRef.current) {
@@ -636,6 +651,7 @@ export const useSigma = (options: UseSigmaOptions = {}): UseSigmaReturn => {
     sigma.setGraph(newGraph);
     setSelectedNode(null);
 
+    userStoppedRef.current = false;
     runLayout(newGraph);
     sigma.getCamera().animatedReset({ duration: 500 });
   }, [runLayout, setSelectedNode]);
@@ -680,6 +696,7 @@ export const useSigma = (options: UseSigmaOptions = {}): UseSigmaReturn => {
   const startLayout = useCallback(() => {
     const graph = graphRef.current;
     if (!graph || graph.order === 0) return;
+    userStoppedRef.current = false;
     runLayout(graph);
   }, [runLayout]);
 
@@ -691,15 +708,9 @@ export const useSigma = (options: UseSigmaOptions = {}): UseSigmaReturn => {
     if (layoutRef.current) {
       layoutRef.current.stop();
       layoutRef.current = null;
-      
-      const graph = graphRef.current;
-      if (graph) {
-        noverlap.assign(graph, NOVERLAP_SETTINGS);
-        sigmaRef.current?.refresh();
-      }
-      
       setIsLayoutRunning(false);
     }
+    userStoppedRef.current = true;
   }, []);
 
   const refreshHighlights = useCallback(() => {

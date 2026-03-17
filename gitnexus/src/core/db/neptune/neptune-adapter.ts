@@ -16,10 +16,17 @@ import type { NeptuneDbConfig, IDbQueryAdapter } from '../interfaces.js';
 
 /** Normalize Neptune's result format to flat Record<string, unknown>[] */
 function normalizeResults(raw: unknown): Record<string, unknown>[] {
-  if (!raw || typeof raw !== 'object') return [];
+  if (!raw) return [];
+
+  // AWS SDK already unwraps: response.results is already a plain array
+  if (Array.isArray(raw)) {
+    return raw as Record<string, unknown>[];
+  }
+
+  if (typeof raw !== 'object') return [];
   const r = raw as Record<string, unknown>;
 
-  // Neptune openCypher response: { results: [ { col1: val1, col2: val2, ... }, ... ] }
+  // Older SDK / legacy format: { results: [ { col1: val1, ... }, ... ] }
   if (Array.isArray(r['results'])) {
     return r['results'] as Record<string, unknown>[];
   }
