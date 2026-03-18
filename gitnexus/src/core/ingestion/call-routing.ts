@@ -27,7 +27,7 @@ export type CallRouter = (
 const noRouting: CallRouter = () => null;
 
 /** Per-language call routing. noRouting = no special routing (normal call processing) */
-export const callRouters: Record<SupportedLanguages, CallRouter> = {
+export const callRouters = {
   [SupportedLanguages.JavaScript]: noRouting,
   [SupportedLanguages.TypeScript]: noRouting,
   [SupportedLanguages.Python]: noRouting,
@@ -42,7 +42,7 @@ export const callRouters: Record<SupportedLanguages, CallRouter> = {
   [SupportedLanguages.C]: noRouting,
   [SupportedLanguages.Ruby]: routeRubyCall,
   [SupportedLanguages.COBOL]: noRouting,
-};
+} satisfies Record<SupportedLanguages, CallRouter>;
 
 // ── Result types ────────────────────────────────────────────────────────────
 
