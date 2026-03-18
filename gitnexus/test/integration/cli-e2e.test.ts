@@ -194,7 +194,7 @@ describe('CLI end-to-end', () => {
         if (result.status === null) return;
 
         expect(result.status).toBe(0);
-        expect(result.stdout).toMatch(/Repository not indexed/);
+        expect(result.stderr).toMatch(/Repository not indexed/);
       } finally {
         fs.rmSync(tmpDir, { recursive: true, force: true });
       }
@@ -208,7 +208,7 @@ describe('CLI end-to-end', () => {
 
         // status.ts doesn't set process.exitCode — just prints and returns
         expect(result.status).toBe(0);
-        expect(result.stdout).toMatch(/Not a git repository/);
+        expect(result.stderr).toMatch(/Not a git repository/);
       } finally {
         fs.rmSync(tmpDir, { recursive: true, force: true });
       }

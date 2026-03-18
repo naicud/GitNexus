@@ -172,8 +172,8 @@ describe('LadybugDB Schema', () => {
     });
 
     it('SCHEMA_QUERIES includes all node + rel + embedding schemas', () => {
-      // 27 node + 1 rel + 1 embedding = 29
-      expect(SCHEMA_QUERIES).toHaveLength(29);
+      // 27 node + 1 rel = 28 (EMBEDDING_SCHEMA excluded — dims are dynamic)
+      expect(SCHEMA_QUERIES).toHaveLength(28);
     });
 
     it('node schemas come before relation schemas in SCHEMA_QUERIES', () => {
