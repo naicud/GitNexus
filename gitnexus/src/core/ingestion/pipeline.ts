@@ -21,6 +21,7 @@ import { getLanguageFromFilename } from './utils.js';
 import { isLanguageAvailable } from '../tree-sitter/parser-loader.js';
 import { SupportedLanguages } from '../../config/supported-languages.js';
 import { createWorkerPool, WorkerPool } from './workers/worker-pool.js';
+import { generateGraphSummary } from './graph-summary.js';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -856,6 +857,20 @@ export const runPipelineFromRepo = async (
           step: step.step,
         });
       });
+
+      // ── Phase 6b: Graph Summary (LOD precomputation) ───────────────
+      // Pre-generate a cluster-level summary for Level-of-Detail rendering.
+      // The summary is written to {storagePath}/graph-summary.json and served
+      // by /api/graph/summary without re-querying the database.
+      try {
+        const storagePath = path.join(repoPath, '.gitnexus');
+        await generateGraphSummary(graph, communityResult, storagePath);
+        if (isDev) {
+          console.log('📊 Graph summary generated for LOD rendering');
+        }
+      } catch (err) {
+        if (isDev) console.warn('Graph summary generation failed (non-fatal):', (err as Error).message);
+      }
     }
 
     onProgress({

@@ -15,6 +15,8 @@ interface SettingsPanelProps {
   backendUrl?: string;
   isBackendConnected?: boolean;
   onBackendUrlChange?: (url: string) => void;
+  onReloadGraph?: () => void;
+  currentRepo?: string;
 }
 
 /**
