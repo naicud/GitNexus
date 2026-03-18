@@ -49,6 +49,7 @@
     "prepack": "npm run build && chmod +x dist/cli/index.js"
   },
   "dependencies": {
+    "aws4fetch": "^1.0.20",
     "@huggingface/transformers": "^3.0.0",
     "@modelcontextprotocol/sdk": "^1.0.0",
     "cli-progress": "^3.12.0",

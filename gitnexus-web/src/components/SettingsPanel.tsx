@@ -7,6 +7,7 @@ import {
   fetchOpenRouterModels,
 } from '../core/llm/settings-service';
 import type { LLMSettings, LLMProvider } from '../core/llm/types';
+import { testBedrockConnection, getBackendUrl } from '../services/backend';
 
 interface SettingsPanelProps {
   isOpen: boolean;
@@ -222,6 +223,9 @@ export const SettingsPanel = ({ isOpen, onClose, onSettingsSaved, backendUrl, is
   // OpenRouter models state
   const [openRouterModels, setOpenRouterModels] = useState<Array<{ id: string; name: string }>>([]);
   const [isLoadingModels, setIsLoadingModels] = useState(false);
+  // Bedrock connection test state
+  const [bedrockTestStatus, setBedrockTestStatus] = useState<'idle' | 'testing' | 'success' | 'error'>('idle');
+  const [bedrockTestMessage, setBedrockTestMessage] = useState('');
 
   // Load settings when panel opens
   useEffect(() => {
@@ -281,7 +285,7 @@ export const SettingsPanel = ({ isOpen, onClose, onSettingsSaved, backendUrl, is
 
   if (!isOpen) return null;
 
-  const providers: LLMProvider[] = ['openai', 'gemini', 'anthropic', 'azure-openai', 'ollama', 'openrouter'];
+  const providers: LLMProvider[] = ['openai', 'gemini', 'anthropic', 'azure-openai', 'ollama', 'openrouter', 'bedrock'];
 
 
   return (
@@ -366,7 +370,7 @@ export const SettingsPanel = ({ isOpen, onClose, onSettingsSaved, backendUrl, is
                     w-8 h-8 rounded-lg flex items-center justify-center text-lg
                     ${settings.activeProvider === provider ? 'bg-accent/20' : 'bg-surface'}
                   `}>
-                    {provider === 'openai' ? '🤖' : provider === 'gemini' ? '💎' : provider === 'anthropic' ? '🧠' : provider === 'ollama' ? '🦙' : provider === 'openrouter' ? '🌐' : '☁️'}
+                    {provider === 'openai' ? '🤖' : provider === 'gemini' ? '💎' : provider === 'anthropic' ? '🧠' : provider === 'ollama' ? '🦙' : provider === 'openrouter' ? '🌐' : provider === 'bedrock' ? '🔶' : '☁️'}
                   </div>
                   <span className="font-medium">{getProviderDisplayName(provider)}</span>
                 </button>
@@ -815,6 +819,202 @@ export const SettingsPanel = ({ isOpen, onClose, onSettingsSaved, backendUrl, is
           )}
 
 
+
+          {/* AWS Bedrock Settings */}
+          {settings.activeProvider === 'bedrock' && (
+            <div className="space-y-4 animate-fade-in">
+              <div className="grid grid-cols-2 gap-4">
+                <div className="space-y-2">
+                  <label className="flex items-center gap-2 text-sm font-medium text-text-secondary">
+                    <Key className="w-4 h-4" />
+                    Access Key ID
+                  </label>
+                  <div className="relative">
+                    <input
+                      type={showApiKey['bedrock-access'] ? 'text' : 'password'}
+                      value={settings.bedrock?.accessKeyId ?? ''}
+                      onChange={e => setSettings(prev => ({ ...prev, bedrock: { ...prev.bedrock!, accessKeyId: e.target.value } }))}
+                      placeholder="AKIAIOSFODNN7EXAMPLE"
+                      className="w-full px-4 py-3 pr-10 bg-elevated border border-border-subtle rounded-xl text-text-primary placeholder:text-text-muted focus:border-accent focus:ring-2 focus:ring-accent/20 outline-none transition-all font-mono text-xs"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => toggleApiKeyVisibility('bedrock-access')}
+                      className="absolute right-3 top-1/2 -translate-y-1/2 p-1 text-text-muted hover:text-text-primary transition-colors"
+                    >
+                      {showApiKey['bedrock-access'] ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                    </button>
+                  </div>
+                </div>
+
+                <div className="space-y-2">
+                  <label className="flex items-center gap-2 text-sm font-medium text-text-secondary">
+                    <Key className="w-4 h-4" />
+                    Secret Access Key
+                  </label>
+                  <div className="relative">
+                    <input
+                      type={showApiKey['bedrock-secret'] ? 'text' : 'password'}
+                      value={settings.bedrock?.secretAccessKey ?? ''}
+                      onChange={e => setSettings(prev => ({ ...prev, bedrock: { ...prev.bedrock!, secretAccessKey: e.target.value } }))}
+                      placeholder="wJalrXUtnFEMI/K7MDENG"
+                      className="w-full px-4 py-3 pr-10 bg-elevated border border-border-subtle rounded-xl text-text-primary placeholder:text-text-muted focus:border-accent focus:ring-2 focus:ring-accent/20 outline-none transition-all font-mono text-xs"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => toggleApiKeyVisibility('bedrock-secret')}
+                      className="absolute right-3 top-1/2 -translate-y-1/2 p-1 text-text-muted hover:text-text-primary transition-colors"
+                    >
+                      {showApiKey['bedrock-secret'] ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                    </button>
+                  </div>
+                </div>
+              </div>
+
+              <div className="space-y-2">
+                <label className="text-sm font-medium text-text-secondary">
+                  Session Token <span className="text-text-muted font-normal">(optional — for STS temporary credentials)</span>
+                </label>
+                <input
+                  type="text"
+                  value={settings.bedrock?.sessionToken ?? ''}
+                  onChange={e => setSettings(prev => ({ ...prev, bedrock: { ...prev.bedrock!, sessionToken: e.target.value } }))}
+                  placeholder="Leave empty for long-term credentials"
+                  className="w-full px-4 py-3 bg-elevated border border-border-subtle rounded-xl text-text-primary placeholder:text-text-muted focus:border-accent focus:ring-2 focus:ring-accent/20 outline-none transition-all font-mono text-xs"
+                />
+              </div>
+
+              <div className="grid grid-cols-2 gap-4">
+                <div className="space-y-2">
+                  <label className="text-sm font-medium text-text-secondary">Region</label>
+                  <input
+                    type="text"
+                    list="aws-regions"
+                    value={settings.bedrock?.region ?? 'us-east-1'}
+                    onChange={e => setSettings(prev => ({ ...prev, bedrock: { ...prev.bedrock!, region: e.target.value } }))}
+                    placeholder="e.g. us-east-1"
+                    className="w-full px-4 py-3 bg-elevated border border-border-subtle rounded-xl text-text-primary placeholder:text-text-muted focus:border-accent focus:ring-2 focus:ring-accent/20 outline-none transition-all font-mono text-xs"
+                  />
+                  <datalist id="aws-regions">
+                    <option value="us-east-1">N. Virginia</option>
+                    <option value="us-east-2">Ohio</option>
+                    <option value="us-west-1">N. California</option>
+                    <option value="us-west-2">Oregon</option>
+                    <option value="eu-west-1">Ireland</option>
+                    <option value="eu-west-2">London</option>
+                    <option value="eu-west-3">Paris</option>
+                    <option value="eu-central-1">Frankfurt</option>
+                    <option value="eu-central-2">Zurich</option>
+                    <option value="eu-north-1">Stockholm</option>
+                    <option value="eu-south-1">Milan</option>
+                    <option value="eu-south-2">Spain</option>
+                    <option value="ap-southeast-1">Singapore</option>
+                    <option value="ap-southeast-2">Sydney</option>
+                    <option value="ap-southeast-3">Jakarta</option>
+                    <option value="ap-northeast-1">Tokyo</option>
+                    <option value="ap-northeast-2">Seoul</option>
+                    <option value="ap-northeast-3">Osaka</option>
+                    <option value="ap-south-1">Mumbai</option>
+                    <option value="ap-south-2">Hyderabad</option>
+                    <option value="ap-east-1">Hong Kong</option>
+                    <option value="sa-east-1">São Paulo</option>
+                    <option value="ca-central-1">Canada</option>
+                    <option value="me-south-1">Bahrain</option>
+                    <option value="me-central-1">UAE</option>
+                    <option value="af-south-1">Cape Town</option>
+                    <option value="il-central-1">Tel Aviv</option>
+                  </datalist>
+                </div>
+
+                <div className="space-y-2">
+                  <label className="text-sm font-medium text-text-secondary">Model</label>
+                  <input
+                    type="text"
+                    value={settings.bedrock?.model ?? 'anthropic.claude-3-5-sonnet-20241022-v2:0'}
+                    onChange={e => setSettings(prev => ({ ...prev, bedrock: { ...prev.bedrock!, model: e.target.value } }))}
+                    placeholder="e.g. anthropic.claude-3-5-sonnet-20241022-v2:0"
+                    className="w-full px-4 py-3 bg-elevated border border-border-subtle rounded-xl text-text-primary placeholder:text-text-muted focus:border-accent focus:ring-2 focus:ring-accent/20 outline-none transition-all font-mono text-xs"
+                  />
+                </div>
+              </div>
+
+              <p className="text-xs text-text-muted">
+                Make sure Bedrock model access is enabled in your{' '}
+                <a
+                  href="https://console.aws.amazon.com/bedrock/home#/modelaccess"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="text-accent hover:underline"
+                >
+                  AWS Console
+                </a>
+              </p>
+
+              {/* Bedrock Health Check */}
+              <div className="space-y-2">
+                <button
+                  type="button"
+                  disabled={
+                    !settings.bedrock?.accessKeyId?.trim() ||
+                    !settings.bedrock?.secretAccessKey?.trim() ||
+                    !settings.bedrock?.model?.trim() ||
+                    bedrockTestStatus === 'testing'
+                  }
+                  onClick={async () => {
+                    setBedrockTestStatus('testing');
+                    setBedrockTestMessage('');
+                    try {
+                      const result = await testBedrockConnection({
+                        region: settings.bedrock?.region || 'us-east-1',
+                        accessKeyId: settings.bedrock?.accessKeyId || '',
+                        secretAccessKey: settings.bedrock?.secretAccessKey || '',
+                        sessionToken: settings.bedrock?.sessionToken || undefined,
+                        model: settings.bedrock?.model || '',
+                      });
+                      if (result.ok) {
+                        setBedrockTestStatus('success');
+                        setBedrockTestMessage(`Connected — ${result.model} in ${result.region}`);
+                      } else {
+                        setBedrockTestStatus('error');
+                        setBedrockTestMessage(result.error || 'Connection failed');
+                      }
+                    } catch (err: any) {
+                      setBedrockTestStatus('error');
+                      setBedrockTestMessage(err.message || 'Failed to reach backend server');
+                    }
+                  }}
+                  className="flex items-center gap-2 px-4 py-2 bg-accent/20 text-accent rounded-lg hover:bg-accent/30 transition-colors disabled:opacity-40 disabled:cursor-not-allowed text-sm font-medium"
+                >
+                  {bedrockTestStatus === 'testing' ? (
+                    <Loader2 className="w-4 h-4 animate-spin" />
+                  ) : (
+                    <Server className="w-4 h-4" />
+                  )}
+                  Test Connection
+                </button>
+
+                {bedrockTestStatus === 'success' && (
+                  <div className="flex items-start gap-2 p-3 bg-green-500/10 border border-green-500/20 rounded-lg">
+                    <Check className="w-4 h-4 text-green-400 flex-shrink-0 mt-0.5" />
+                    <span className="text-xs text-green-400">{bedrockTestMessage}</span>
+                  </div>
+                )}
+
+                {bedrockTestStatus === 'error' && (
+                  <div className="flex items-start gap-2 p-3 bg-red-500/10 border border-red-500/20 rounded-lg">
+                    <AlertCircle className="w-4 h-4 text-red-400 flex-shrink-0 mt-0.5" />
+                    <span className="text-xs text-red-400 break-all">{bedrockTestMessage}</span>
+                  </div>
+                )}
+
+                {!getBackendUrl() && (
+                  <p className="text-xs text-yellow-400/80">
+                    Bedrock requires the local server running (<code className="bg-elevated px-1 rounded">gitnexus serve</code>) to proxy API calls and bypass browser CORS restrictions.
+                  </p>
+                )}
+              </div>
+            </div>
+          )}
 
           {/* Privacy Note */}
           <div className="p-4 bg-elevated/50 border border-border-subtle rounded-xl">

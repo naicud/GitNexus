@@ -228,3 +228,25 @@ export const fetchClusterDetail = async (
   await assertOk(response);
   return response.json();
 };
+
+/**
+ * Test AWS Bedrock connection by making a minimal API call through the backend proxy.
+ */
+export const testBedrockConnection = async (config: {
+  region: string;
+  accessKeyId: string;
+  secretAccessKey: string;
+  sessionToken?: string;
+  model: string;
+}): Promise<{ ok: boolean; error?: string; model?: string; region?: string }> => {
+  const response = await fetchWithTimeout(
+    `${backendUrl}/api/bedrock/test`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(config),
+    },
+    15_000, // Bedrock cold start can be slow
+  );
+  return response.json() as Promise<{ ok: boolean; error?: string; model?: string; region?: string }>;
+};

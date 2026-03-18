@@ -8,7 +8,7 @@
 /**
  * Supported LLM providers
  */
-export type LLMProvider = 'openai' | 'azure-openai' | 'gemini' | 'anthropic' | 'ollama' | 'openrouter';
+export type LLMProvider = 'openai' | 'azure-openai' | 'gemini' | 'anthropic' | 'ollama' | 'openrouter' | 'bedrock';
 
 /**
  * Base configuration shared by all providers
@@ -79,9 +79,22 @@ export interface OpenRouterConfig extends BaseProviderConfig {
 }
 
 /**
+ * AWS Bedrock configuration
+ */
+export interface AWSBedrockConfig extends BaseProviderConfig {
+  provider: 'bedrock';
+  accessKeyId: string;
+  secretAccessKey: string;
+  sessionToken?: string;  // for temporary STS credentials
+  region: string;
+  model: string;
+  proxyBaseUrl?: string;  // when set, routes API calls through backend to bypass CORS
+}
+
+/**
  * Union type for all provider configurations
  */
-export type ProviderConfig = OpenAIConfig | AzureOpenAIConfig | GeminiConfig | AnthropicConfig | OllamaConfig | OpenRouterConfig;
+export type ProviderConfig = OpenAIConfig | AzureOpenAIConfig | GeminiConfig | AnthropicConfig | OllamaConfig | OpenRouterConfig | AWSBedrockConfig;
 
 /**
  * Stored settings (what goes to localStorage)
@@ -98,6 +111,7 @@ export interface LLMSettings {
   anthropic?: Partial<Omit<AnthropicConfig, 'provider'>>;
   ollama?: Partial<Omit<OllamaConfig, 'provider'>>;
   openrouter?: Partial<Omit<OpenRouterConfig, 'provider'>>;
+  bedrock?: Partial<Omit<AWSBedrockConfig, 'provider'>>;
 
   // Intelligent Clustering Settings
   intelligentClustering: boolean;
@@ -146,6 +160,13 @@ export const DEFAULT_LLM_SETTINGS: LLMSettings = {
     apiKey: '',
     model: '',
     baseUrl: 'https://openrouter.ai/api/v1',
+    temperature: 0.1,
+  },
+  bedrock: {
+    accessKeyId: '',
+    secretAccessKey: '',
+    region: 'us-east-1',
+    model: 'anthropic.claude-3-5-sonnet-20241022-v2:0',
     temperature: 0.1,
   },
 };
