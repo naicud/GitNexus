@@ -7,9 +7,8 @@
 import path from 'path';
 import { execFileSync } from 'child_process';
 import v8 from 'v8';
-import cliProgress from 'cli-progress';
 import { runPipelineFromRepo } from '../core/ingestion/pipeline.js';
-import { initLbug, loadGraphToLbug, getLbugStats, executeQuery, executeWithReusedStatement, closeLbug, createFTSIndex, loadCachedEmbeddings } from '../core/lbug/lbug-adapter.js';
+import { initLbug, loadGraphToLbug, getLbugStats, executeQuery, executeWithReusedStatement, closeLbug, createFTSIndex, loadCachedEmbeddings, ensureEmbeddingTable } from '../core/lbug/lbug-adapter.js';
 // Embedding imports are lazy (dynamic import) so onnxruntime-node is never
 // loaded when embeddings are not requested. This avoids crashes on Node
 // versions whose ABI is not yet supported by the native binary (#89).
@@ -19,6 +18,7 @@ import { getCurrentCommit, isGitRepo, getGitRoot } from '../storage/git.js';
 import { generateAIContextFiles } from './ai-context.js';
 import { generateSkillFiles, type GeneratedSkillInfo } from './skill-gen.js';
 import fs from 'fs/promises';
+import { resolveEmbeddingConfig } from './embed-config.js';
 
 
 const HEAP_MB = 8192;
@@ -48,10 +48,13 @@ export interface AnalyzeOptions {
   embeddings?: boolean;
   skills?: boolean;
   verbose?: boolean;
+  embedProvider?: string;
+  embedModel?: string;
+  embedDims?: string;
+  embedEndpoint?: string;
+  embedApiKey?: string;
+  yes?: boolean;
 }
-
-/** Threshold: auto-skip embeddings for repos with more nodes than this */
-const EMBEDDING_NODE_LIMIT = 50_000;
 
 const PHASE_LABELS: Record<string, string> = {
   extracting: 'Scanning files',
@@ -73,6 +76,26 @@ export const analyzeCommand = async (
   inputPath?: string,
   options?: AnalyzeOptions
 ) => {
+  // ── TUI Wizard (runs before heap re-exec) ─────────────────────────
+  if (options && !(options as Record<string, unknown>)._tuiMerged) {
+    const { shouldRunInteractive, serializeToEnv, deserializeFromEnv } = await import('./tui/shared.js');
+
+    if (shouldRunInteractive(options as Record<string, unknown>)) {
+      const { runAnalyzeWizard } = await import('./tui/analyze-wizard.js');
+      const result = await runAnalyzeWizard(inputPath, options);
+      if (!result) return;
+      options = { ...options, ...result.options };
+      inputPath = result.path ?? inputPath;
+      serializeToEnv(result);
+    } else if (process.env.GITNEXUS_TUI_DONE === '1') {
+      // Re-exec child: merge wizard choices from env
+      const fromEnv = deserializeFromEnv();
+      if (fromEnv.tuiPath) inputPath = fromEnv.tuiPath;
+      options = { ...options, ...fromEnv };
+      (options as Record<string, unknown>)._tuiMerged = true;
+    }
+  }
+
   if (ensureHeap()) return;
 
   if (options?.verbose) {
@@ -100,6 +123,9 @@ export const analyzeCommand = async (
     return;
   }
 
+  // Resolve embedding config (always, even if --embeddings not set, for registry persistence)
+  const embedConfig = resolveEmbeddingConfig(options ?? {});
+
   const { storagePath, lbugPath } = getStoragePaths(repoPath);
 
   // Clean up stale KuzuDB files from before the LadybugDB migration.
@@ -121,67 +147,26 @@ export const analyzeCommand = async (
     console.log('  GITNEXUS_NO_GITIGNORE is set — skipping .gitignore (still reading .gitnexusignore)\n');
   }
 
-  // Single progress bar for entire pipeline
-  const bar = new cliProgress.SingleBar({
-    format: '  {bar} {percentage}% | {phase}',
-    barCompleteChar: '\u2588',
-    barIncompleteChar: '\u2591',
-    hideCursor: true,
-    barGlue: '',
-    autopadding: true,
-    clearOnComplete: false,
-    stopOnComplete: false,
-  }, cliProgress.Presets.shades_grey);
-
-  bar.start(100, 0, { phase: 'Initializing...' });
+  // Multi-phase progress display
+  const { createMultiProgress } = await import('./tui/components/multi-progress.js');
+  const mp = createMultiProgress([
+    { name: 'pipeline', label: 'Running pipeline', weight: 60 },
+    { name: 'db', label: 'Loading into LadybugDB', weight: 25 },
+    { name: 'fts', label: 'Creating search indexes', weight: 5 },
+    { name: 'embeddings', label: 'Generating embeddings', weight: 8 },
+    { name: 'finalize', label: 'Finalizing', weight: 2 },
+  ]);
 
   // Graceful SIGINT handling — clean up resources and exit
   let aborted = false;
   const sigintHandler = () => {
     if (aborted) process.exit(1); // Second Ctrl-C: force exit
     aborted = true;
-    bar.stop();
+    mp.stop();
     console.log('\n  Interrupted — cleaning up...');
     closeLbug().catch(() => {}).finally(() => process.exit(130));
   };
   process.on('SIGINT', sigintHandler);
-
-  // Route all console output through bar.log() so the bar doesn't stamp itself
-  // multiple times when other code writes to stdout/stderr mid-render.
-  const origLog = console.log.bind(console);
-  const origWarn = console.warn.bind(console);
-  const origError = console.error.bind(console);
-  const barLog = (...args: any[]) => {
-    // Clear the bar line, print the message, then let the next bar.update redraw
-    process.stdout.write('\x1b[2K\r');
-    origLog(args.map(a => (typeof a === 'string' ? a : String(a))).join(' '));
-  };
-  console.log = barLog;
-  console.warn = barLog;
-  console.error = barLog;
-
-  // Track elapsed time per phase — both updateBar and the interval use the
-  // same format so they don't flicker against each other.
-  let lastPhaseLabel = 'Initializing...';
-  let phaseStart = Date.now();
-
-  /** Update bar with phase label + elapsed seconds (shown after 3s). */
-  const updateBar = (value: number, phaseLabel: string) => {
-    if (phaseLabel !== lastPhaseLabel) { lastPhaseLabel = phaseLabel; phaseStart = Date.now(); }
-    const elapsed = Math.round((Date.now() - phaseStart) / 1000);
-    const display = elapsed >= 3 ? `${phaseLabel} (${elapsed}s)` : phaseLabel;
-    bar.update(value, { phase: display });
-  };
-
-  // Tick elapsed seconds for phases with infrequent progress callbacks
-  // (e.g. CSV streaming, FTS indexing). Uses the same display format as
-  // updateBar so there's no flickering.
-  const elapsedTimer = setInterval(() => {
-    const elapsed = Math.round((Date.now() - phaseStart) / 1000);
-    if (elapsed >= 3) {
-      bar.update({ phase: `${lastPhaseLabel} (${elapsed}s)` });
-    }
-  }, 1000);
 
   const t0Global = Date.now();
 
@@ -189,9 +174,17 @@ export const analyzeCommand = async (
   let cachedEmbeddingNodeIds = new Set<string>();
   let cachedEmbeddings: Array<{ nodeId: string; embedding: number[] }> = [];
 
-  if (options?.embeddings && existingMeta && !options?.force) {
+  // Check dimension mismatch: if provider/model/dims changed, invalidate cache
+  const existingRegistry = await import('../storage/repo-manager.js').then(m => m.readRegistry());
+  const existingEntry = existingRegistry.find((e: any) => path.resolve(e.path) === path.resolve(repoPath));
+  const prevDims = existingEntry?.embedding?.dimensions ?? 384;
+  const dimsChanged = options?.embeddings && prevDims !== embedConfig.dimensions;
+  const providerChanged = options?.embeddings && existingEntry?.embedding &&
+    (existingEntry.embedding.provider !== embedConfig.provider || existingEntry.embedding.model !== embedConfig.model);
+
+  if (options?.embeddings && existingMeta && !options?.force && !dimsChanged && !providerChanged) {
     try {
-      updateBar(0, 'Caching embeddings...');
+      mp.update(0, 'Caching embeddings...');
       await initLbug(lbugPath);
       const cached = await loadCachedEmbeddings();
       cachedEmbeddingNodeIds = cached.embeddingNodeIds;
@@ -202,16 +195,23 @@ export const analyzeCommand = async (
     }
   }
 
-  // ── Phase 1: Full Pipeline (0–60%) ─────────────────────────────────
+  // ── Phase 1: Full Pipeline ──────────────────────────────────────────
+  mp.setPhase('pipeline');
   const pipelineResult = await runPipelineFromRepo(repoPath, (progress) => {
     const phaseLabel = PHASE_LABELS[progress.phase] || progress.phase;
-    const scaled = Math.round(progress.percent * 0.6);
-    updateBar(scaled, phaseLabel);
+    const detail =
+      progress.phase === 'parsing' && (progress.stats?.totalFiles ?? 0) > 0
+        ? `${progress.stats!.filesProcessed}/${progress.stats!.totalFiles} files${
+            options?.verbose && progress.detail
+              ? ` — ${progress.detail.split('/').at(-1)}`
+              : ''
+          }`
+        : undefined;
+    mp.update(progress.percent, detail || phaseLabel);
   });
 
-  // ── Phase 2: LadybugDB (60–85%) ──────────────────────────────────────
-  updateBar(60, 'Loading into LadybugDB...');
-
+  // ── Phase 2: LadybugDB ─────────────────────────────────────────────
+  mp.setPhase('db');
   await closeLbug();
   const lbugFiles = [lbugPath, `${lbugPath}.wal`, `${lbugPath}.lock`];
   for (const f of lbugFiles) {
@@ -223,15 +223,14 @@ export const analyzeCommand = async (
   let lbugMsgCount = 0;
   const lbugResult = await loadGraphToLbug(pipelineResult.graph, pipelineResult.repoPath, storagePath, (msg) => {
     lbugMsgCount++;
-    const progress = Math.min(84, 60 + Math.round((lbugMsgCount / (lbugMsgCount + 10)) * 24));
-    updateBar(progress, msg);
+    const progress = Math.min(100, Math.round((lbugMsgCount / (lbugMsgCount + 10)) * 100));
+    mp.update(progress, msg);
   });
-  const lbugTime = ((Date.now() - t0Lbug) / 1000).toFixed(1);
-  const lbugWarnings = lbugResult.warnings;
+  const dbTime = ((Date.now() - t0Lbug) / 1000).toFixed(1);
+  const dbWarnings = lbugResult.warnings;
 
-  // ── Phase 3: FTS (85–90%) ─────────────────────────────────────────
-  updateBar(85, 'Creating search indexes...');
-
+  // ── Phase 3: FTS ───────────────────────────────────────────────────
+  mp.setPhase('fts');
   const t0Fts = Date.now();
   try {
     await createFTSIndex('File', 'file_fts', ['name', 'content']);
@@ -244,9 +243,16 @@ export const analyzeCommand = async (
   }
   const ftsTime = ((Date.now() - t0Fts) / 1000).toFixed(1);
 
+  // ── Ensure embedding table exists with configured dims ─────────────
+  // Must happen before cached embedding re-insertion AND embedding pipeline.
+  // Dims come from user config (--embed-dims, provider model, etc.), not hardcoded.
+  if (options?.embeddings) {
+    await ensureEmbeddingTable(embedConfig.dimensions);
+  }
+
   // ── Phase 3.5: Re-insert cached embeddings ────────────────────────
   if (cachedEmbeddings.length > 0) {
-    updateBar(88, `Restoring ${cachedEmbeddings.length} cached embeddings...`);
+    mp.update(50, `Restoring ${cachedEmbeddings.length} cached embeddings...`);
     const EMBED_BATCH = 200;
     for (let i = 0; i < cachedEmbeddings.length; i += EMBED_BATCH) {
       const batch = cachedEmbeddings.slice(i, i + EMBED_BATCH);
@@ -260,40 +266,44 @@ export const analyzeCommand = async (
     }
   }
 
-  // ── Phase 4: Embeddings (90–98%) ──────────────────────────────────
+  // ── Phase 4: Embeddings ─────────────────────────────────────────────
+  mp.setPhase('embeddings');
   const stats = await getLbugStats();
   let embeddingTime = '0.0';
-  let embeddingSkipped = true;
+  let embeddingSkipped = !options?.embeddings;
   let embeddingSkipReason = 'off (use --embeddings to enable)';
 
-  if (options?.embeddings) {
-    if (stats.nodes > EMBEDDING_NODE_LIMIT) {
-      embeddingSkipReason = `skipped (${stats.nodes.toLocaleString()} nodes > ${EMBEDDING_NODE_LIMIT.toLocaleString()} limit)`;
-    } else {
-      embeddingSkipped = false;
-    }
-  }
-
   if (!embeddingSkipped) {
-    updateBar(90, 'Loading embedding model...');
+    mp.update(0, `Loading embedding provider (${embedConfig.provider})...`);
     const t0Emb = Date.now();
-    const { runEmbeddingPipeline } = await import('../core/embeddings/embedding-pipeline.js');
+
+    const { createEmbeddingProvider } = await import('../core/embeddings/providers/factory.js');
+    const { runEmbeddingPipeline, getEmbeddableLabels } = await import('../core/embeddings/embedding-pipeline.js');
+
+    const provider = await createEmbeddingProvider(embedConfig);
+    const labels = getEmbeddableLabels(stats.nodes);
+
+    // LadybugDB path (embedding table already created above)
     await runEmbeddingPipeline(
       executeQuery,
       executeWithReusedStatement,
       (progress) => {
-        const scaled = 90 + Math.round((progress.percent / 100) * 8);
-        const label = progress.phase === 'loading-model' ? 'Loading embedding model...' : `Embedding ${progress.nodesProcessed || 0}/${progress.totalNodes || '?'}`;
-        updateBar(scaled, label);
+        const label = progress.phase === 'loading-model'
+          ? `Loading ${embedConfig.provider} model...`
+          : `Embedding ${progress.nodesProcessed || 0}/${progress.totalNodes || '?'}`;
+        mp.update(progress.percent, label);
       },
+      provider,
       {},
       cachedEmbeddingNodeIds.size > 0 ? cachedEmbeddingNodeIds : undefined,
+      labels,
     );
     embeddingTime = ((Date.now() - t0Emb) / 1000).toFixed(1);
   }
 
-  // ── Phase 5: Finalize (98–100%) ───────────────────────────────────
-  updateBar(98, 'Saving metadata...');
+  // ── Phase 5: Finalize ──────────────────────────────────────────────
+  mp.setPhase('finalize');
+  mp.update(0, 'Saving metadata...');
 
   // Count embeddings in the index (cached + newly generated)
   let embeddingCount = 0;
@@ -316,7 +326,10 @@ export const analyzeCommand = async (
     },
   };
   await saveMeta(storagePath, meta);
-  await registerRepo(repoPath, meta);
+  const embeddingMeta = options?.embeddings
+    ? { provider: embedConfig.provider, model: embedConfig.model, dimensions: embedConfig.dimensions, endpoint: embedConfig.endpoint }
+    : undefined;
+  await registerRepo(repoPath, meta, undefined, embeddingMeta);
   await addToGitignore(repoPath);
 
   const projectName = path.basename(repoPath);
@@ -332,7 +345,7 @@ export const analyzeCommand = async (
 
   let generatedSkills: GeneratedSkillInfo[] = [];
   if (options?.skills && pipelineResult.communityResult) {
-    updateBar(99, 'Generating skill files...');
+    mp.update(50, 'Generating skill files...');
     const skillResult = await generateSkillFiles(repoPath, projectName, pipelineResult);
     generatedSkills = skillResult.skills;
   }
@@ -353,34 +366,37 @@ export const analyzeCommand = async (
 
   const totalTime = ((Date.now() - t0Global) / 1000).toFixed(1);
 
-  clearInterval(elapsedTimer);
   process.removeListener('SIGINT', sigintHandler);
-
-  console.log = origLog;
-  console.warn = origWarn;
-  console.error = origError;
-
-  bar.update(100, { phase: 'Done' });
-  bar.stop();
 
   // ── Summary ───────────────────────────────────────────────────────
   const embeddingsCached = cachedEmbeddings.length > 0;
-  console.log(`\n  Repository indexed successfully (${totalTime}s)${embeddingsCached ? ` [${cachedEmbeddings.length} embeddings cached]` : ''}\n`);
-  console.log(`  ${stats.nodes.toLocaleString()} nodes | ${stats.edges.toLocaleString()} edges | ${pipelineResult.communityResult?.stats.totalCommunities || 0} clusters | ${pipelineResult.processResult?.stats.totalProcesses || 0} flows`);
-  console.log(`  LadybugDB ${lbugTime}s | FTS ${ftsTime}s | Embeddings ${embeddingSkipped ? embeddingSkipReason : embeddingTime + 's'}`);
-  console.log(`  ${repoPath}`);
+  const resultLabel = embeddingsCached
+    ? `Indexed successfully (${totalTime}s) [${cachedEmbeddings.length} embeddings cached]`
+    : `Indexed successfully (${totalTime}s)`;
+
+  mp.complete({
+    'Result': resultLabel,
+    'Nodes': stats.nodes.toLocaleString(),
+    'Edges': stats.edges.toLocaleString(),
+    'Clusters': String(pipelineResult.communityResult?.stats.totalCommunities || 0),
+    'Flows': String(pipelineResult.processResult?.stats.totalProcesses || 0),
+    'Database': `LadybugDB (${dbTime}s)`,
+    'FTS': ftsTime + 's',
+    'Embeddings': embeddingSkipped ? embeddingSkipReason : embeddingTime + 's',
+    'Path': repoPath,
+  });
 
   if (aiContext.files.length > 0) {
     console.log(`  Context: ${aiContext.files.join(', ')}`);
   }
 
   // Show a quiet summary if some edge types needed fallback insertion
-  if (lbugWarnings.length > 0) {
-    const totalFallback = lbugWarnings.reduce((sum, w) => {
+  if (dbWarnings.length > 0) {
+    const totalFallback = dbWarnings.reduce((sum, w) => {
       const m = w.match(/\((\d+) edges\)/);
       return sum + (m ? parseInt(m[1]) : 0);
     }, 0);
-    console.log(`  Note: ${totalFallback} edges across ${lbugWarnings.length} types inserted via fallback (schema will be updated in next release)`);
+    console.log(`  Note: ${totalFallback} edges across ${dbWarnings.length} types inserted via fallback (schema will be updated in next release)`);
   }
 
   try {

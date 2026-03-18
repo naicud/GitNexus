@@ -1,21 +1,19 @@
 /**
  * Direct CLI Tool Commands
- * 
+ *
  * Exposes GitNexus tools (query, context, impact, cypher) as direct CLI commands.
  * Bypasses MCP entirely — invokes LocalBackend directly for minimal overhead.
- * 
+ *
  * Usage:
  *   gitnexus query "authentication flow"
  *   gitnexus context --name "validateUser"
  *   gitnexus impact --target "AuthService" --direction upstream
  *   gitnexus cypher "MATCH (n:Function) RETURN n.name LIMIT 10"
- * 
- * Note: Output goes to stdout via fs.writeSync(fd 1), bypassing LadybugDB's
- * native module which captures the Node.js process.stdout stream during init.
- * See the output() function for details (#324).
+ *
+ * Note: Output goes to stderr because LadybugDB's native module captures stdout
+ * at the OS level during init. This is consistent with augment.ts.
  */
 
-import { writeSync } from 'node:fs';
 import { LocalBackend } from '../mcp/local/local-backend.js';
 
 let _backend: LocalBackend | null = null;
@@ -31,29 +29,10 @@ async function getBackend(): Promise<LocalBackend> {
   return _backend;
 }
 
-/**
- * Write tool output to stdout using low-level fd write.
- *
- * LadybugDB's native module captures Node.js process.stdout during init,
- * but the underlying OS file descriptor 1 (stdout) remains intact.
- * By using fs.writeSync(1, ...) we bypass the Node.js stream layer
- * and write directly to the real stdout fd (#324).
- *
- * Falls back to stderr if the fd write fails (e.g., broken pipe).
- */
 function output(data: any): void {
   const text = typeof data === 'string' ? data : JSON.stringify(data, null, 2);
-  try {
-    writeSync(1, text + '\n');
-  } catch (err: any) {
-    if (err?.code === 'EPIPE') {
-      // Consumer closed the pipe (e.g., `gitnexus cypher ... | head -1`)
-      // Exit cleanly per Unix convention
-      process.exit(0);
-    }
-    // Fallback: stderr (previous behavior, works on all platforms)
-    process.stderr.write(text + '\n');
-  }
+  // stderr because LadybugDB captures stdout at OS level
+  process.stderr.write(text + '\n');
 }
 
 export async function queryCommand(queryText: string, options?: {
@@ -63,7 +42,13 @@ export async function queryCommand(queryText: string, options?: {
   limit?: string;
   content?: boolean;
 }): Promise<void> {
+  // Interactive mode: no query text + TTY
   if (!queryText?.trim()) {
+    const { shouldRunInteractiveGeneric } = await import('./tui/shared.js');
+    if (shouldRunInteractiveGeneric({})) {
+      const { runQueryTUI } = await import('./tui/interactive/query-tui.js');
+      return runQueryTUI(options);
+    }
     console.error('Usage: gitnexus query <search_query>');
     process.exit(1);
   }
@@ -77,7 +62,14 @@ export async function queryCommand(queryText: string, options?: {
     include_content: options?.content ?? false,
     repo: options?.repo,
   });
-  output(result);
+
+  // Use formatted output if TTY, raw JSON otherwise
+  if (process.stderr.isTTY) {
+    const { renderQueryResults } = await import('./tui/interactive/query-tui.js');
+    renderQueryResults(result);
+  } else {
+    output(result);
+  }
 }
 
 export async function contextCommand(name: string, options?: {
@@ -87,6 +79,11 @@ export async function contextCommand(name: string, options?: {
   content?: boolean;
 }): Promise<void> {
   if (!name?.trim() && !options?.uid) {
+    const { shouldRunInteractiveGeneric } = await import('./tui/shared.js');
+    if (shouldRunInteractiveGeneric({})) {
+      const { runContextTUI } = await import('./tui/interactive/context-tui.js');
+      return runContextTUI(options);
+    }
     console.error('Usage: gitnexus context <symbol_name> [--uid <uid>] [--file <path>]');
     process.exit(1);
   }
@@ -99,7 +96,13 @@ export async function contextCommand(name: string, options?: {
     include_content: options?.content ?? false,
     repo: options?.repo,
   });
-  output(result);
+
+  if (process.stderr.isTTY) {
+    const { renderContextResults } = await import('./tui/interactive/context-tui.js');
+    renderContextResults(result);
+  } else {
+    output(result);
+  }
 }
 
 export async function impactCommand(target: string, options?: {
@@ -109,30 +112,29 @@ export async function impactCommand(target: string, options?: {
   includeTests?: boolean;
 }): Promise<void> {
   if (!target?.trim()) {
+    const { shouldRunInteractiveGeneric } = await import('./tui/shared.js');
+    if (shouldRunInteractiveGeneric({})) {
+      const { runImpactTUI } = await import('./tui/interactive/impact-tui.js');
+      return runImpactTUI(options);
+    }
     console.error('Usage: gitnexus impact <symbol_name> [--direction upstream|downstream]');
     process.exit(1);
   }
 
-  try {
-    const backend = await getBackend();
-    const result = await backend.callTool('impact', {
-      target,
-      direction: options?.direction || 'upstream',
-      maxDepth: options?.depth ? parseInt(options.depth, 10) : undefined,
-      includeTests: options?.includeTests ?? false,
-      repo: options?.repo,
-    });
+  const backend = await getBackend();
+  const result = await backend.callTool('impact', {
+    target,
+    direction: options?.direction || 'upstream',
+    maxDepth: options?.depth ? parseInt(options.depth) : undefined,
+    includeTests: options?.includeTests ?? false,
+    repo: options?.repo,
+  });
+
+  if (process.stderr.isTTY) {
+    const { renderImpactResults } = await import('./tui/interactive/impact-tui.js');
+    renderImpactResults(result);
+  } else {
     output(result);
-  } catch (err: unknown) {
-    // Belt-and-suspenders: catch infrastructure failures (getBackend, callTool transport)
-    // The backend's impact() already returns structured errors for graph query failures
-    output({
-      error: (err instanceof Error ? err.message : String(err)) || 'Impact analysis failed unexpectedly',
-      target: { name: target },
-      direction: options?.direction || 'upstream',
-      suggestion: 'Try reducing --depth or using gitnexus context <symbol> as a fallback',
-    });
-    process.exit(1);
   }
 }
 
@@ -140,6 +142,11 @@ export async function cypherCommand(query: string, options?: {
   repo?: string;
 }): Promise<void> {
   if (!query?.trim()) {
+    const { shouldRunInteractiveGeneric } = await import('./tui/shared.js');
+    if (shouldRunInteractiveGeneric({})) {
+      const { runCypherTUI } = await import('./tui/interactive/cypher-tui.js');
+      return runCypherTUI(options);
+    }
     console.error('Usage: gitnexus cypher <cypher_query>');
     process.exit(1);
   }
@@ -149,5 +156,11 @@ export async function cypherCommand(query: string, options?: {
     query,
     repo: options?.repo,
   });
-  output(result);
+
+  if (process.stderr.isTTY) {
+    const { renderCypherResults } = await import('./tui/interactive/cypher-tui.js');
+    renderCypherResults(result);
+  } else {
+    output(result);
+  }
 }

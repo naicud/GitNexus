@@ -47,7 +47,7 @@ export const VALID_NODE_LABELS = new Set([
 ]);
 
 /** Valid relation types for impact analysis filtering */
-export const VALID_RELATION_TYPES = new Set(['CALLS', 'IMPORTS', 'EXTENDS', 'IMPLEMENTS', 'HAS_METHOD', 'OVERRIDES']);
+export const VALID_RELATION_TYPES = new Set(['CALLS', 'IMPORTS', 'EXTENDS', 'IMPLEMENTS']);
 
 /** Regex to detect write operations in user-supplied Cypher queries */
 export const CYPHER_WRITE_RE = /\b(CREATE|DELETE|SET|MERGE|REMOVE|DROP|ALTER|COPY|DETACH)\b/i;
@@ -82,6 +82,8 @@ interface RepoHandle {
   indexedAt: string;
   lastCommit: string;
   stats?: RegistryEntry['stats'];
+  /** Embedding config used during indexing — for query-time provider matching */
+  embedding?: { provider: string; model: string; dimensions: number; endpoint?: string };
 }
 
 export class LocalBackend {
@@ -132,6 +134,7 @@ export class LocalBackend {
         indexedAt: entry.indexedAt,
         lastCommit: entry.lastCommit,
         stats: entry.stats,
+        embedding: entry.embedding,
       };
 
       this.repos.set(id, handle);
@@ -611,8 +614,8 @@ export class LocalBackend {
       if (!tableCheck.length || (tableCheck[0].cnt ?? tableCheck[0][0]) === 0) return [];
 
       const { embedQuery, getEmbeddingDims } = await import('../core/embedder.js');
-      const queryVec = await embedQuery(query);
-      const dims = getEmbeddingDims();
+      const queryVec = await embedQuery(query, repo.embedding);
+      const dims = getEmbeddingDims(repo.embedding);
       const queryVecStr = `[${queryVec.join(',')}]`;
       
       const vectorQuery = `

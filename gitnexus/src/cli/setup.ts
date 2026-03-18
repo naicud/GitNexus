@@ -355,7 +355,17 @@ async function installOpenCodeSkills(result: SetupResult): Promise<void> {
 
 // ─── Main command ──────────────────────────────────────────────────
 
-export const setupCommand = async () => {
+export const setupCommand = async (options?: { yes?: boolean }) => {
+  // TUI Wizard
+  const { shouldRunInteractiveGeneric } = await import('./tui/shared.js');
+  if (shouldRunInteractiveGeneric(options as Record<string, unknown> ?? {})) {
+    const { runSetupWizard } = await import('./tui/wizards/setup-wizard.js');
+    const wizardResult = await runSetupWizard();
+    if (!wizardResult) return;
+    // wizardResult.selectedEditors tells us which to configure
+    // Fall through to existing setup logic
+  }
+
   console.log('');
   console.log('  GitNexus Setup');
   console.log('  ==============');

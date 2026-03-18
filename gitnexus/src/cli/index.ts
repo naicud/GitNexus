@@ -19,6 +19,7 @@ program
 program
   .command('setup')
   .description('One-time setup: configure MCP for Cursor, Claude Code, OpenCode')
+  .option('-y, --yes', 'Skip interactive prompts')
   .action(createLazyAction(() => import('./setup.js'), 'setupCommand'));
 
 program
@@ -26,10 +27,33 @@ program
   .description('Index a repository (full analysis)')
   .option('-f, --force', 'Force full re-index even if up to date')
   .option('--embeddings', 'Enable embedding generation for semantic search (off by default)')
+  .option('--embed-provider <type>', 'Embedding provider: ollama | cohere | openai | local (default: local)')
+  .option('--embed-model <model>', 'Embedding model name (e.g. nomic-embed-text)')
+  .option('--embed-dims <n>', 'Embedding vector dimensions (default: 384)')
+  .option('--embed-endpoint <url>', 'API endpoint URL for remote providers')
+  .option('--embed-api-key <key>', 'API key for cloud embedding providers')
   .option('--skills', 'Generate repo-specific skill files from detected communities')
    .option('-v, --verbose', 'Enable verbose ingestion warnings (default: false)')
+   .option('-y, --yes', 'Skip interactive prompts, use defaults/flags')
    .addHelpText('after', '\nEnvironment variables:\n  GITNEXUS_NO_GITIGNORE=1  Skip .gitignore parsing (still reads .gitnexusignore)')
    .action(createLazyAction(() => import('./analyze.js'), 'analyzeCommand'));
+
+program
+  .command('embed [path]')
+  .description('Generate or update embeddings for an already-indexed repository')
+  .option('--provider <type>', 'Embedding provider: local | ollama | openai | cohere')
+  .option('--model <model>', 'Embedding model name')
+  .option('--dims <n>', 'Vector dimensions (default: 384)')
+  .option('--endpoint <url>', 'API endpoint URL (Ollama, OpenAI-compatible)')
+  .option('--api-key <key>', 'API key for cloud providers')
+  .option('--embed-provider <type>', 'Alias for --provider')
+  .option('--embed-model <model>', 'Alias for --model')
+  .option('--embed-dims <n>', 'Alias for --dims')
+  .option('--embed-endpoint <url>', 'Alias for --endpoint')
+  .option('--embed-api-key <key>', 'Alias for --api-key')
+  .option('-f, --force', 'Regenerate all embeddings')
+  .option('-y, --yes', 'Skip interactive prompts')
+  .action(createLazyAction(() => import('./embed.js'), 'embedCommand'));
 
 program
   .command('serve')
@@ -58,6 +82,7 @@ program
   .description('Delete GitNexus index for current repo')
   .option('-f, --force', 'Skip confirmation prompt')
   .option('--all', 'Clean all indexed repos')
+  .option('-y, --yes', 'Skip interactive prompts')
   .action(createLazyAction(() => import('./clean.js'), 'cleanCommand'));
 
 program
@@ -69,6 +94,7 @@ program
   .option('--api-key <key>', 'LLM API key (saved to ~/.gitnexus/config.json)')
   .option('--concurrency <n>', 'Parallel LLM calls (default: 3)', '3')
   .option('--gist', 'Publish wiki as a public GitHub Gist after generation')
+  .option('-y, --yes', 'Skip interactive prompts, use defaults/flags')
   .action(createLazyAction(() => import('./wiki.js'), 'wikiCommand'));
 
 program
@@ -80,7 +106,7 @@ program
 // These invoke LocalBackend directly for use in eval, scripts, and CI.
 
 program
-  .command('query <search_query>')
+  .command('query [search_query]')
   .description('Search the knowledge graph for execution flows related to a concept')
   .option('-r, --repo <name>', 'Target repository (omit if only one indexed)')
   .option('-c, --context <text>', 'Task context to improve ranking')
@@ -99,7 +125,7 @@ program
   .action(createLazyAction(() => import('./tool.js'), 'contextCommand'));
 
 program
-  .command('impact <target>')
+  .command('impact [target]')
   .description('Blast radius analysis: what breaks if you change a symbol')
   .option('-d, --direction <dir>', 'upstream (dependants) or downstream (dependencies)', 'upstream')
   .option('-r, --repo <name>', 'Target repository')
@@ -108,7 +134,7 @@ program
   .action(createLazyAction(() => import('./tool.js'), 'impactCommand'));
 
 program
-  .command('cypher <query>')
+  .command('cypher [query]')
   .description('Execute raw Cypher query against the knowledge graph')
   .option('-r, --repo <name>', 'Target repository')
   .action(createLazyAction(() => import('./tool.js'), 'cypherCommand'));

@@ -233,7 +233,15 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
         const { isEmbedderReady } = await import('../core/embeddings/embedder.js');
         if (isEmbedderReady()) {
           const { semanticSearch } = await import('../core/embeddings/embedding-pipeline.js');
-          return hybridSearch(query, limit, executeQuery, semanticSearch);
+          const { embedQuery, getEmbeddingDims } = await import('../mcp/core/embedder.js');
+          // Wrap the new provider-based semanticSearch to match hybridSearch's expected signature
+          const wrappedSemantic = async (eq: typeof executeQuery, q: string, k?: number) => {
+            const embeddingConfig = (entry as any).embedding;
+            const queryVec = await embedQuery(q, embeddingConfig);
+            const dims = getEmbeddingDims(embeddingConfig);
+            return semanticSearch(eq, queryVec, dims, k);
+          };
+          return hybridSearch(query, limit, executeQuery, wrappedSemantic);
         }
         // FTS-only fallback when embeddings aren't loaded
         return searchFTSFromLbug(query, limit);
