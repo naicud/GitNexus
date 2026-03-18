@@ -32,6 +32,7 @@ import {
   resolvePhpImport,
   resolveRustImport,
   resolveRubyImport,
+  resolvePythonImport,
 } from './resolvers/index.js';
 import { callRouters } from './call-routing.js';
 import type { ResolutionContext } from './resolution-context.js';
@@ -257,6 +258,14 @@ function resolveLanguageImport(
       if (files.length > 0) return { kind: 'files', files };
     }
     return null; // External framework (Foundation, UIKit, etc.)
+  }
+
+  // Python: relative imports (PEP 328) + proximity-based bare imports
+  // Falls through to standard suffix resolution when proximity finds no match.
+  if (language === SupportedLanguages.Python) {
+    const resolved = resolvePythonImport(filePath, rawImportPath, allFilePaths);
+    if (resolved) return { kind: 'files', files: [resolved] };
+    if (rawImportPath.startsWith('.')) return null; // relative but unresolved — don't suffix-match
   }
 
   // Ruby: require / require_relative

@@ -24,10 +24,14 @@ export type ConstructorBindingScanner = (node: SyntaxNode) => { varName: string;
  *  rather than in AST fields. Returns undefined if no return type can be determined. */
 export type ReturnTypeExtractor = (node: SyntaxNode) => string | undefined;
 
-/** Extracts loop variable type binding from a for-each statement. */
+/** Extracts loop variable type binding from a for-each statement.
+ *  All parameters are required (aligned with PatternBindingExtractor convention)
+ *  to prevent new extractors from silently ignoring declarationTypeNodes/scope. */
 export type ForLoopExtractor = (
   node: SyntaxNode,
   scopeEnv: Map<string, string>,
+  declarationTypeNodes: ReadonlyMap<string, SyntaxNode>,
+  scope: string,
 ) => void;
 
 /** Extracts a plain-identifier assignment for Tier 2 propagation.
@@ -38,12 +42,39 @@ export type PendingAssignmentExtractor = (
   scopeEnv: ReadonlyMap<string, string>,
 ) => { lhs: string; rhs: string } | undefined;
 
+/** Extracts a typed variable binding from a pattern-matching construct.
+ *  Returns { varName, typeName } for patterns that introduce NEW variables.
+ *  Examples: `if let Some(user) = opt` (Rust), `x instanceof User user` (Java).
+ *  Conservative: returns undefined when the source variable's type is unknown.
+ *
+ *  @param scopeEnv   Read-only view of already-resolved type bindings in the current scope.
+ *  @param declarationTypeNodes  Maps `scope\0varName` to the original declaration's type
+ *    annotation AST node. Allows extracting generic type arguments (e.g., T from Result<T,E>)
+ *    that are stripped during normal TypeEnv extraction.
+ *  @param scope  Current scope key (e.g. `"process@42"`) for declarationTypeNodes lookups. */
+export type PatternBindingExtractor = (
+  node: SyntaxNode,
+  scopeEnv: ReadonlyMap<string, string>,
+  declarationTypeNodes: ReadonlyMap<string, SyntaxNode>,
+  scope: string,
+) => { varName: string; typeName: string } | undefined;
+
 /** Per-language type extraction configuration */
 export interface LanguageTypeConfig {
+  /** Allow pattern binding to overwrite existing scopeEnv entries.
+   *  WARNING: Enables function-scope type pollution. Only for languages with
+   *  smart-cast semantics (e.g., Kotlin `when/is`) where the subject variable
+   *  already exists in scopeEnv from its declaration. */
+  readonly allowPatternBindingOverwrite?: boolean;
   /** Node types that represent typed declarations for this language */
   declarationNodeTypes: ReadonlySet<string>;
   /** AST node types for for-each/for-in statements with explicit element types. */
   forLoopNodeTypes?: ReadonlySet<string>;
+  /** Optional allowlist of AST node types on which extractPatternBinding should run.
+   *  When present, extractPatternBinding is only invoked for nodes whose type is in this set,
+   *  short-circuiting the call for all other node types. When absent, every node is passed to
+   *  extractPatternBinding (legacy behaviour). */
+  patternBindingNodeTypes?: ReadonlySet<string>;
   /** Extract a (varName → typeName) binding from a declaration node */
   extractDeclaration: TypeBindingExtractor;
   /** Extract a (varName → typeName) binding from a parameter node */
@@ -66,4 +97,10 @@ export interface LanguageTypeConfig {
    *  Called on declaration/assignment nodes; returns {lhs, rhs} when the RHS is a bare identifier
    *  and the LHS has no resolved type yet. Language-specific because AST shapes differ widely. */
   extractPendingAssignment?: PendingAssignmentExtractor;
+  /** Extract a typed variable binding from a pattern-matching construct.
+   *  Called on every AST node; returns { varName, typeName } when the node introduces a new
+   *  typed variable via pattern matching (e.g. `if let Some(x) = opt`, `x instanceof T t`).
+   *  The extractor receives the current scope's resolved bindings (read-only) to look up the
+   *  source variable's type. Returns undefined for non-matching nodes or unknown source types. */
+  extractPatternBinding?: PatternBindingExtractor;
 }

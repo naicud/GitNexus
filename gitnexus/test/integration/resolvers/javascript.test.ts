@@ -9,6 +9,39 @@ import {
 } from './helpers.js';
 
 // ---------------------------------------------------------------------------
+// skipGraphPhases: verify pipeline works correctly when graph phases are skipped
+// ---------------------------------------------------------------------------
+
+describe('Pipeline skipGraphPhases option', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'javascript-self-this-resolution'),
+      () => {},
+      { skipGraphPhases: true },
+    );
+  }, 60000);
+
+  it('produces graph nodes without community/process phases', () => {
+    expect(getNodesByLabel(result, 'Class').length).toBeGreaterThan(0);
+  });
+
+  it('still resolves CALLS edges correctly', () => {
+    const calls = getRelationships(result, 'CALLS');
+    expect(calls.length).toBeGreaterThan(0);
+  });
+
+  it('omits communityResult when skipGraphPhases is true', () => {
+    expect(result.communityResult).toBeUndefined();
+  });
+
+  it('omits processResult when skipGraphPhases is true', () => {
+    expect(result.processResult).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
 // this.save() resolves to enclosing class's own save method
 // ---------------------------------------------------------------------------
 
@@ -148,6 +181,56 @@ describe('JavaScript super resolution', () => {
       && c.targetFilePath === 'src/models/Base.js');
     expect(superSave).toBeDefined();
     const repoSave = calls.find(c => c.target === 'save' && c.targetFilePath === 'src/models/Repo.js');
+    expect(repoSave).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Chained method calls: svc.getUser().save()
+// Tests that JavaScript chain call resolution correctly infers the intermediate
+// receiver type from getUser()'s JSDoc @returns {User} and resolves save().
+// ---------------------------------------------------------------------------
+
+describe('JavaScript chained method call resolution', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'javascript-chain-call'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects User and Repo classes, and UserService', () => {
+    const classes = getNodesByLabel(result, 'Class');
+    expect(classes).toContain('User');
+    expect(classes).toContain('Repo');
+    expect(classes).toContain('UserService');
+  });
+
+  it('detects getUser and save methods', () => {
+    const methods = getNodesByLabel(result, 'Method');
+    expect(methods).toContain('getUser');
+    expect(methods).toContain('save');
+  });
+
+  it('resolves svc.getUser().save() to User#save via chain resolution', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const userSave = calls.find(c =>
+      c.target === 'save' &&
+      c.source === 'processUser' &&
+      c.targetFilePath?.includes('user.js'),
+    );
+    expect(userSave).toBeDefined();
+  });
+
+  it('does NOT resolve svc.getUser().save() to Repo#save', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const repoSave = calls.find(c =>
+      c.target === 'save' &&
+      c.source === 'processUser' &&
+      c.targetFilePath?.includes('repo.js'),
+    );
     expect(repoSave).toBeUndefined();
   });
 });

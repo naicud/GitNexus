@@ -777,3 +777,241 @@ describe('Java Optional<User> receiver resolution via wrapper unwrapping', () =>
     expect(userSave!.targetFilePath).not.toBe(repoSave!.targetFilePath);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Chained method call resolution: svc.getUser().save()
+// The receiver of save() is a method_invocation (getUser()), not a simple identifier.
+// Resolution must walk the chain: getUser() returns User, so save() → User#save.
+// ---------------------------------------------------------------------------
+
+describe('Java chained method call resolution', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'java-chain-call'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects User, Repo and UserService classes', () => {
+    const classes = getNodesByLabel(result, 'Class');
+    expect(classes).toContain('User');
+    expect(classes).toContain('Repo');
+    expect(classes).toContain('UserService');
+  });
+
+  it('detects save methods on both User and Repo', () => {
+    const saveMethods = getNodesByLabel(result, 'Method').filter(m => m === 'save');
+    expect(saveMethods.length).toBe(2);
+  });
+
+  it('detects getUser method on UserService', () => {
+    const methods = getNodesByLabel(result, 'Method');
+    expect(methods).toContain('getUser');
+  });
+
+  it('resolves svc.getUser().save() to User#save, NOT Repo#save', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const userSave = calls.find(c =>
+      c.target === 'save' &&
+      c.source === 'processUser' &&
+      c.targetFilePath.includes('User.java'),
+    );
+    const repoSave = calls.find(c =>
+      c.target === 'save' &&
+      c.source === 'processUser' &&
+      c.targetFilePath.includes('Repo.java'),
+    );
+    expect(userSave).toBeDefined();
+    expect(repoSave).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Java 16+ instanceof pattern variable: `if (obj instanceof User user)`
+// Phase 5.2: extractPatternBinding on instanceof_expression binds user → User.
+// Disambiguation: User.save vs Repo.save — only User.save should be called.
+// ---------------------------------------------------------------------------
+
+describe('Java instanceof pattern variable resolution (Phase 5.2)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'java-instanceof-pattern'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects User and Repo classes each with a save method', () => {
+    expect(getNodesByLabel(result, 'Class')).toContain('User');
+    expect(getNodesByLabel(result, 'Class')).toContain('Repo');
+    const saveMethods = getNodesByLabel(result, 'Method').filter(m => m === 'save');
+    expect(saveMethods.length).toBe(2);
+  });
+
+  it('resolves user.save() inside if (obj instanceof User user) to User#save', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const userSave = calls.find(c =>
+      c.target === 'save' &&
+      c.source === 'process' &&
+      c.targetFilePath.includes('User.java'),
+    );
+    expect(userSave).toBeDefined();
+  });
+
+  it('does NOT resolve user.save() to Repo#save', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const repoSave = calls.find(c =>
+      c.target === 'save' &&
+      c.source === 'process' &&
+      c.targetFilePath.includes('Repo.java'),
+    );
+    expect(repoSave).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Enum static method calls: Status.fromCode(200) should resolve via
+// class-as-receiver with Enum type included in the filter.
+// ---------------------------------------------------------------------------
+
+describe('Java enum static method call resolution (Phase 5 review fix)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'java-enum-static-call'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects Status as an Enum and App as a Class', () => {
+    expect(getNodesByLabel(result, 'Enum')).toContain('Status');
+    expect(getNodesByLabel(result, 'Class')).toContain('App');
+  });
+
+  it('detects fromCode and label methods on Status', () => {
+    const methods = getNodesByLabel(result, 'Method');
+    expect(methods).toContain('fromCode');
+    expect(methods).toContain('label');
+  });
+
+  it('resolves Status.fromCode(200) to Status#fromCode via class-as-receiver', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const fromCodeCall = calls.find(c =>
+      c.target === 'fromCode' &&
+      c.source === 'process' &&
+      c.targetFilePath?.includes('Status.java'),
+    );
+    expect(fromCodeCall).toBeDefined();
+  });
+
+  it('resolves s.label() to Status#label', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const labelCall = calls.find(c =>
+      c.target === 'label' &&
+      c.source === 'process' &&
+      c.targetFilePath?.includes('Status.java'),
+    );
+    expect(labelCall).toBeDefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Java 21+ switch pattern matching: switch (obj) { case User user -> user.save(); }
+// ---------------------------------------------------------------------------
+
+describe('Java switch pattern binding', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'java-switch-pattern'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects User and Repo classes, both with save methods', () => {
+    expect(getNodesByLabel(result, 'Class')).toContain('User');
+    expect(getNodesByLabel(result, 'Class')).toContain('Repo');
+    const saveMethods = getNodesByLabel(result, 'Method').filter(m => m === 'save');
+    expect(saveMethods.length).toBe(2);
+  });
+
+  it('resolves user.save() in switch case User to models/User.java', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const userSave = calls.find(c =>
+      c.target === 'save' && c.source === 'processAny' && c.targetFilePath === 'models/User.java',
+    );
+    expect(userSave).toBeDefined();
+  });
+
+  it('resolves repo.save() in switch case Repo to models/Repo.java', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const repoSave = calls.find(c =>
+      c.target === 'save' && c.source === 'processAny' && c.targetFilePath === 'models/Repo.java',
+    );
+    expect(repoSave).toBeDefined();
+  });
+
+  it('resolves user.save() in handleUser switch case User to models/User.java', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const userSave = calls.find(c =>
+      c.target === 'save' && c.source === 'handleUser' && c.targetFilePath === 'models/User.java',
+    );
+    expect(userSave).toBeDefined();
+  });
+
+  it('does NOT cross-resolve handleUser switch case User to Repo.save', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const wrongSave = calls.find(c =>
+      c.target === 'save' && c.source === 'handleUser' && c.targetFilePath === 'models/Repo.java',
+    );
+    expect(wrongSave).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Java Map .values() for-loop — method-aware type arg resolution
+// ---------------------------------------------------------------------------
+
+describe('Java Map .values() for-loop resolution', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'java-map-keys-values'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects User class with save method', () => {
+    expect(getNodesByLabel(result, 'Class')).toContain('User');
+  });
+
+  it('resolves user.save() via Map.values() to User#save', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const userSave = calls.find(c =>
+      c.target === 'save' && c.source === 'processValues' && c.targetFilePath?.includes('User'),
+    );
+    expect(userSave).toBeDefined();
+  });
+
+  it('does NOT resolve user.save() to Repo#save (negative)', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const wrongSave = calls.find(c =>
+      c.target === 'save' && c.source === 'processValues' && c.targetFilePath?.includes('Repo'),
+    );
+    expect(wrongSave).toBeUndefined();
+  });
+
+  it('resolves user.save() via List iteration to User#save', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const userSave = calls.find(c =>
+      c.target === 'save' && c.source === 'processList' && c.targetFilePath?.includes('User'),
+    );
+    expect(userSave).toBeDefined();
+  });
+});

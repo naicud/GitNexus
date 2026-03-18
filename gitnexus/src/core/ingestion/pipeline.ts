@@ -240,9 +240,15 @@ function detectCrossProgamContracts(graph: KnowledgeGraph): number {
   return contractCount;
 }
 
+export interface PipelineOptions {
+  /** Skip MRO, community detection, and process extraction for faster test runs. */
+  skipGraphPhases?: boolean;
+}
+
 export const runPipelineFromRepo = async (
   repoPath: string,
-  onProgress: (progress: PipelineProgress) => void
+  onProgress: (progress: PipelineProgress) => void,
+  options?: PipelineOptions,
 ): Promise<PipelineResult> => {
   const graph = createKnowledgeGraph();
   const ctx = createResolutionContext();
@@ -361,32 +367,34 @@ export const runPipelineFromRepo = async (
       stats: { filesProcessed: 0, totalFiles: totalParseable, nodesCreated: graph.nodeCount },
     });
 
+    // Don't spawn workers for tiny repos — overhead exceeds benefit
+    const MIN_FILES_FOR_WORKERS = 15;
+    const MIN_BYTES_FOR_WORKERS = 512 * 1024;
+    const totalBytes = parseableScanned.reduce((s, f) => s + f.size, 0);
+
     // Create worker pool once, reuse across chunks.
     // For COBOL repos, use smaller sub-batches (200 vs 1500) to prevent worker
     // timeouts — COBOL tree-sitter + preprocessing + regex takes ~150ms/file.
     let workerPool: WorkerPool | undefined;
-    try {
-      let workerUrl = new URL('./workers/parse-worker.js', import.meta.url);
-      // When running under vitest, import.meta.url points to src/ where no .js exists.
-      // Fall back to the compiled dist/ worker so the pool can spawn real worker threads.
-      const thisDir = fileURLToPath(new URL('.', import.meta.url));
-      if (!fs.existsSync(fileURLToPath(workerUrl))) {
-        const distWorker = path.resolve(thisDir, '..', '..', '..', 'dist', 'core', 'ingestion', 'workers', 'parse-worker.js');
-        if (fs.existsSync(distWorker)) {
-          workerUrl = pathToFileURL(distWorker) as URL;
+    if (totalParseable >= MIN_FILES_FOR_WORKERS || totalBytes >= MIN_BYTES_FOR_WORKERS) {
+      try {
+        let workerUrl = new URL('./workers/parse-worker.js', import.meta.url);
+        // When running under vitest, import.meta.url points to src/ where no .js exists.
+        // Fall back to the compiled dist/ worker so the pool can spawn real worker threads.
+        const thisDir = fileURLToPath(new URL('.', import.meta.url));
+        if (!fs.existsSync(fileURLToPath(workerUrl))) {
+          const distWorker = path.resolve(thisDir, '..', '..', '..', 'dist', 'core', 'ingestion', 'workers', 'parse-worker.js');
+          if (fs.existsSync(distWorker)) {
+            workerUrl = pathToFileURL(distWorker) as URL;
+          }
         }
-      }
-      const cobolSubBatch = process.env.GITNEXUS_COBOL_DIRS ? 200 : undefined;
-      workerPool = createWorkerPool(workerUrl, undefined, cobolSubBatch);
-      if (isDev && cobolSubBatch) {
-        console.log(`🔧 Worker pool: ${workerPool.size} workers, sub-batch=${cobolSubBatch} (COBOL mode)`);
-      }
-    } catch (err) {
-      const msg = (err as Error).message;
-      if (msg.includes('Worker script not found')) {
-        if (isDev) console.warn('Worker pool: compiled worker not found, using sequential fallback');
-      } else {
-        throw new Error(`Worker pool creation failed: ${msg}`);
+        const cobolSubBatch = process.env.GITNEXUS_COBOL_DIRS ? 200 : undefined;
+        workerPool = createWorkerPool(workerUrl, undefined, cobolSubBatch);
+        if (isDev && cobolSubBatch) {
+          console.log(`Worker pool: ${workerPool.size} workers, sub-batch=${cobolSubBatch} (COBOL mode)`);
+        }
+      } catch (err) {
+        if (isDev) console.warn('Worker pool creation failed, using sequential fallback:', (err as Error).message);
       }
     }
 
@@ -591,157 +599,162 @@ export const runPipelineFromRepo = async (
     (importCtx as any).suffixIndex = null;
     (importCtx as any).normalizedFileList = null;
 
-    // ── Phase 4.5: Method Resolution Order ──────────────────────────────
-    onProgress({
-      phase: 'parsing',
-      percent: 81,
-      message: 'Computing method resolution order...',
-      stats: { filesProcessed: totalFiles, totalFiles, nodesCreated: graph.nodeCount },
-    });
+    let communityResult: Awaited<ReturnType<typeof processCommunities>> | undefined;
+    let processResult: Awaited<ReturnType<typeof processProcesses>> | undefined;
 
-    const mroResult = computeMRO(graph);
-    if (isDev && mroResult.entries.length > 0) {
-      console.log(`🔀 MRO: ${mroResult.entries.length} classes analyzed, ${mroResult.ambiguityCount} ambiguities found, ${mroResult.overrideEdges} OVERRIDES edges`);
-    }
-
-    // ── Phase 4b: Cross-program contract detection (COBOL) ────────────
-    // After all imports and calls are resolved, detect shared copybook
-    // contracts between COBOL programs that CALL each other.
-    if (hasCobolFiles) {
-      const contractCount = detectCrossProgamContracts(graph);
-      if (isDev && contractCount > 0) {
-        console.log(`[pipeline] Detected ${contractCount} cross-program CONTRACTS edge(s) via shared copybooks`);
-      }
-    }
-
-    // ── Phase 4c: JCL job stream integration ────────────────────────
-    if (process.env.GITNEXUS_JCL_DIRS) {
-      const { isJclFile } = await import('./utils.js');
-      const jclPaths = allPaths.filter(p => isJclFile(p));
-      if (jclPaths.length > 0) {
-        const { processJclFiles } = await import('./jcl-processor.js');
-        const jclContents = await readFileContents(repoPath, jclPaths);
-        const jclResult = processJclFiles(graph, jclPaths, jclContents);
-        if (isDev) {
-          console.log(`[pipeline] JCL integration: ${jclResult.jobCount} jobs, ${jclResult.stepCount} steps, ${jclResult.programLinks} program links`);
-        }
-      }
-    }
-
-    // Free copybook content map — no longer needed
-    cobolCopybookContents = undefined;
-
-    // ── Phase 5: Communities ───────────────────────────────────────────
-    onProgress({
-      phase: 'communities',
-      percent: 82,
-      message: 'Detecting code communities...',
-      stats: { filesProcessed: totalFiles, totalFiles, nodesCreated: graph.nodeCount },
-    });
-
-    const communityResult = await processCommunities(graph, (message, progress) => {
-      const communityProgress = 82 + (progress * 0.10);
+    if (!options?.skipGraphPhases) {
+      // ── Phase 4.5: Method Resolution Order ──────────────────────────────
       onProgress({
-        phase: 'communities',
-        percent: Math.round(communityProgress),
-        message,
+        phase: 'parsing',
+        percent: 81,
+        message: 'Computing method resolution order...',
         stats: { filesProcessed: totalFiles, totalFiles, nodesCreated: graph.nodeCount },
       });
-    });
 
-    if (isDev) {
-      console.log(`🏘️ Community detection: ${communityResult.stats.totalCommunities} communities found (modularity: ${communityResult.stats.modularity.toFixed(3)})`);
-    }
+      const mroResult = computeMRO(graph);
+      if (isDev && mroResult.entries.length > 0) {
+        console.log(`🔀 MRO: ${mroResult.entries.length} classes analyzed, ${mroResult.ambiguityCount} ambiguities found, ${mroResult.overrideEdges} OVERRIDES edges`);
+      }
 
-    communityResult.communities.forEach(comm => {
-      graph.addNode({
-        id: comm.id,
-        label: 'Community' as const,
-        properties: {
-          name: comm.label,
-          filePath: '',
-          heuristicLabel: comm.heuristicLabel,
-          cohesion: comm.cohesion,
-          symbolCount: comm.symbolCount,
+      // ── Phase 4b: Cross-program contract detection (COBOL) ────────────
+      if (hasCobolFiles) {
+        const contractCount = detectCrossProgamContracts(graph);
+        if (isDev && contractCount > 0) {
+          console.log(`[pipeline] Detected ${contractCount} cross-program CONTRACTS edge(s) via shared copybooks`);
         }
+      }
+
+      // ── Phase 4c: JCL job stream integration ────────────────────────
+      if (process.env.GITNEXUS_JCL_DIRS) {
+        const { isJclFile } = await import('./utils.js');
+        const jclPaths = allPaths.filter(p => isJclFile(p));
+        if (jclPaths.length > 0) {
+          const { processJclFiles } = await import('./jcl-processor.js');
+          const jclContents = await readFileContents(repoPath, jclPaths);
+          const jclResult = processJclFiles(graph, jclPaths, jclContents);
+          if (isDev) {
+            console.log(`[pipeline] JCL integration: ${jclResult.jobCount} jobs, ${jclResult.stepCount} steps, ${jclResult.programLinks} program links`);
+          }
+        }
+      }
+
+      // Free copybook content map — no longer needed
+      cobolCopybookContents = undefined;
+
+      // ── Phase 5: Communities ───────────────────────────────────────────
+      onProgress({
+        phase: 'communities',
+        percent: 82,
+        message: 'Detecting code communities...',
+        stats: { filesProcessed: totalFiles, totalFiles, nodesCreated: graph.nodeCount },
       });
-    });
 
-    communityResult.memberships.forEach(membership => {
-      graph.addRelationship({
-        id: `${membership.nodeId}_member_of_${membership.communityId}`,
-        type: 'MEMBER_OF',
-        sourceId: membership.nodeId,
-        targetId: membership.communityId,
-        confidence: 1.0,
-        reason: 'leiden-algorithm',
-      });
-    });
-
-    // ── Phase 6: Processes ─────────────────────────────────────────────
-    onProgress({
-      phase: 'processes',
-      percent: 94,
-      message: 'Detecting execution flows...',
-      stats: { filesProcessed: totalFiles, totalFiles, nodesCreated: graph.nodeCount },
-    });
-
-    let symbolCount = 0;
-    graph.forEachNode(n => { if (n.label !== 'File') symbolCount++; });
-    const dynamicMaxProcesses = Math.max(20, Math.min(300, Math.round(symbolCount / 10)));
-
-    const processResult = await processProcesses(
-      graph,
-      communityResult.memberships,
-      (message, progress) => {
-        const processProgress = 94 + (progress * 0.05);
+      communityResult = await processCommunities(graph, (message, progress) => {
+        const communityProgress = 82 + (progress * 0.10);
         onProgress({
-          phase: 'processes',
-          percent: Math.round(processProgress),
+          phase: 'communities',
+          percent: Math.round(communityProgress),
           message,
           stats: { filesProcessed: totalFiles, totalFiles, nodesCreated: graph.nodeCount },
         });
-      },
-      { maxProcesses: dynamicMaxProcesses, minSteps: 3 }
-    );
+      });
 
-    if (isDev) {
-      console.log(`🔄 Process detection: ${processResult.stats.totalProcesses} processes found (${processResult.stats.crossCommunityCount} cross-community)`);
+      if (isDev) {
+        console.log(`🏘️ Community detection: ${communityResult.stats.totalCommunities} communities found (modularity: ${communityResult.stats.modularity.toFixed(3)})`);
+      }
+
+      communityResult.communities.forEach(comm => {
+        graph.addNode({
+          id: comm.id,
+          label: 'Community' as const,
+          properties: {
+            name: comm.label,
+            filePath: '',
+            heuristicLabel: comm.heuristicLabel,
+            cohesion: comm.cohesion,
+            symbolCount: comm.symbolCount,
+          }
+        });
+      });
+
+      communityResult.memberships.forEach(membership => {
+        graph.addRelationship({
+          id: `${membership.nodeId}_member_of_${membership.communityId}`,
+          type: 'MEMBER_OF',
+          sourceId: membership.nodeId,
+          targetId: membership.communityId,
+          confidence: 1.0,
+          reason: 'leiden-algorithm',
+        });
+      });
+
+      // ── Phase 6: Processes ─────────────────────────────────────────────
+      onProgress({
+        phase: 'processes',
+        percent: 94,
+        message: 'Detecting execution flows...',
+        stats: { filesProcessed: totalFiles, totalFiles, nodesCreated: graph.nodeCount },
+      });
+
+      let symbolCount = 0;
+      graph.forEachNode(n => { if (n.label !== 'File') symbolCount++; });
+      const dynamicMaxProcesses = Math.max(20, Math.min(300, Math.round(symbolCount / 10)));
+
+      processResult = await processProcesses(
+        graph,
+        communityResult.memberships,
+        (message, progress) => {
+          const processProgress = 94 + (progress * 0.05);
+          onProgress({
+            phase: 'processes',
+            percent: Math.round(processProgress),
+            message,
+            stats: { filesProcessed: totalFiles, totalFiles, nodesCreated: graph.nodeCount },
+          });
+        },
+        { maxProcesses: dynamicMaxProcesses, minSteps: 3 }
+      );
+
+      if (isDev) {
+        console.log(`🔄 Process detection: ${processResult.stats.totalProcesses} processes found (${processResult.stats.crossCommunityCount} cross-community)`);
+      }
+
+      processResult.processes.forEach(proc => {
+        graph.addNode({
+          id: proc.id,
+          label: 'Process' as const,
+          properties: {
+            name: proc.label,
+            filePath: '',
+            heuristicLabel: proc.heuristicLabel,
+            processType: proc.processType,
+            stepCount: proc.stepCount,
+            communities: proc.communities,
+            entryPointId: proc.entryPointId,
+            terminalId: proc.terminalId,
+          }
+        });
+      });
+
+      processResult.steps.forEach(step => {
+        graph.addRelationship({
+          id: `${step.nodeId}_step_${step.step}_${step.processId}`,
+          type: 'STEP_IN_PROCESS',
+          sourceId: step.nodeId,
+          targetId: step.processId,
+          confidence: 1.0,
+          reason: 'trace-detection',
+          step: step.step,
+        });
+      });
     }
-
-    processResult.processes.forEach(proc => {
-      graph.addNode({
-        id: proc.id,
-        label: 'Process' as const,
-        properties: {
-          name: proc.label,
-          filePath: '',
-          heuristicLabel: proc.heuristicLabel,
-          processType: proc.processType,
-          stepCount: proc.stepCount,
-          communities: proc.communities,
-          entryPointId: proc.entryPointId,
-          terminalId: proc.terminalId,
-        }
-      });
-    });
-
-    processResult.steps.forEach(step => {
-      graph.addRelationship({
-        id: `${step.nodeId}_step_${step.step}_${step.processId}`,
-        type: 'STEP_IN_PROCESS',
-        sourceId: step.nodeId,
-        targetId: step.processId,
-        confidence: 1.0,
-        reason: 'trace-detection',
-        step: step.step,
-      });
-    });
 
     onProgress({
       phase: 'complete',
       percent: 100,
-      message: `Graph complete! ${communityResult.stats.totalCommunities} communities, ${processResult.stats.totalProcesses} processes detected.`,
+      message: communityResult && processResult
+        ? `Graph complete! ${communityResult.stats.totalCommunities} communities, ${processResult.stats.totalProcesses} processes detected.`
+        : 'Graph complete! (graph phases skipped)',
       stats: {
         filesProcessed: totalFiles,
         totalFiles,
