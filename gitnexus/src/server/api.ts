@@ -12,7 +12,7 @@ import express from 'express';
 import cors from 'cors';
 import path from 'path';
 import fs from 'fs/promises';
-import { loadMeta, listRegisteredRepos } from '../storage/repo-manager.js';
+import { loadMeta, listRegisteredRepos, updateRepoDb } from '../storage/repo-manager.js';
 import { executeQuery, closeLbug, withLbugDb } from '../core/lbug/lbug-adapter.js';
 import { NODE_TABLES } from '../core/lbug/schema.js';
 import { GraphNode, GraphRelationship } from '../core/graph/types.js';
@@ -22,6 +22,20 @@ import { hybridSearch } from '../core/search/hybrid-search.js';
 // at server startup — crashes on unsupported Node ABI versions (#89)
 import { LocalBackend } from '../mcp/local/local-backend.js';
 import { mountMCPEndpoints } from './mcp-http.js';
+import type { DbConfig, NeptuneDbConfig } from '../core/db/interfaces.js';
+import { NeptuneAdapter } from '../core/db/neptune/neptune-adapter.js';
+
+/** Resolve DB config for a registry entry. Falls back to LadybugDB. */
+function getDbConfigFromEntry(entry: { storagePath: string; db?: DbConfig }): DbConfig {
+  if ((entry as any).db) {
+    // Backwards compat: old entries may have type 'kuzu' from before migration
+    if ((entry as any).db.type === 'kuzu') {
+      return { type: 'lbug', lbugPath: path.join(entry.storagePath, 'lbug') };
+    }
+    return (entry as any).db;
+  }
+  return { type: 'lbug', lbugPath: path.join(entry.storagePath, 'lbug') };
+}
 
 const buildGraph = async (): Promise<{ nodes: GraphNode[]; relationships: GraphRelationship[] }> => {
   const nodes: GraphNode[] = [];
@@ -201,6 +215,19 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
         res.status(404).json({ error: 'Repository not found' });
         return;
       }
+
+      const dbConfig = getDbConfigFromEntry(entry);
+      if (dbConfig.type === 'neptune') {
+        const adapter = new NeptuneAdapter(dbConfig as NeptuneDbConfig);
+        try {
+          const result = await adapter.executeQuery(cypher);
+          res.json({ result });
+        } finally {
+          adapter.close();
+        }
+        return;
+      }
+
       const lbugPath = path.join(entry.storagePath, 'lbug');
       const result = await withLbugDb(lbugPath, () => executeQuery(cypher));
       res.json({ result });
@@ -223,6 +250,25 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
         res.status(404).json({ error: 'Repository not found' });
         return;
       }
+
+      const dbConfig = getDbConfigFromEntry(entry);
+      if (dbConfig.type === 'neptune') {
+        // Neptune: CONTAINS-based text search fallback (no FTS)
+        const adapter = new NeptuneAdapter(dbConfig as NeptuneDbConfig);
+        try {
+          const results = await adapter.executeQuery(`
+            MATCH (n)
+            WHERE toLower(n.name) CONTAINS toLower('${query.replace(/'/g, "\\'")}')
+            RETURN n.id AS id, n.name AS name, labels(n)[0] AS type, n.filePath AS filePath
+            LIMIT ${Number(req.body.limit ?? 10)}
+          `);
+          res.json({ results });
+        } finally {
+          adapter.close();
+        }
+        return;
+      }
+
       const lbugPath = path.join(entry.storagePath, 'lbug');
       const parsedLimit = Number(req.body.limit ?? 10);
       const limit = Number.isFinite(parsedLimit)
@@ -241,6 +287,50 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
       res.json({ results });
     } catch (err: any) {
       res.status(500).json({ error: err.message || 'Search failed' });
+    }
+  });
+
+  // Test Neptune DB connection
+  app.post('/api/db/test', async (req, res) => {
+    try {
+      const { neptuneEndpoint, neptuneRegion, neptunePort } = req.body;
+      if (!neptuneEndpoint || !neptuneRegion) {
+        res.status(400).json({ ok: false, error: 'neptuneEndpoint and neptuneRegion are required' });
+        return;
+      }
+      const config: NeptuneDbConfig = {
+        type: 'neptune',
+        endpoint: neptuneEndpoint,
+        region: neptuneRegion,
+        port: neptunePort ?? 8182,
+      };
+      const adapter = new NeptuneAdapter(config);
+      const t0 = Date.now();
+      try {
+        await adapter.executeQuery('MATCH (n) RETURN count(n) AS cnt LIMIT 1');
+        res.json({ ok: true, latencyMs: Date.now() - t0 });
+      } catch (err: any) {
+        res.json({ ok: false, error: err.message || 'Connection failed' });
+      } finally {
+        adapter.close();
+      }
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: err.message || 'Test failed' });
+    }
+  });
+
+  // Update repo DB config
+  app.patch('/api/repo/db', async (req, res) => {
+    try {
+      const { repo, db } = req.body;
+      if (!repo) {
+        res.status(400).json({ ok: false, error: 'Missing "repo" in request body' });
+        return;
+      }
+      await updateRepoDb(repo, db);
+      res.json({ ok: true });
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: err.message || 'Failed to update DB config' });
     }
   });
 

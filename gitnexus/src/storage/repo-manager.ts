@@ -9,6 +9,7 @@
 import fs from 'fs/promises';
 import path from 'path';
 import os from 'os';
+import type { DbConfig } from '../core/db/interfaces.js';
 
 export interface RepoMeta {
   repoPath: string;
@@ -42,6 +43,15 @@ export interface RegistryEntry {
   indexedAt: string;
   lastCommit: string;
   stats?: RepoMeta['stats'];
+  /** DB backend config. If absent, defaults to LadybugDB at storagePath/lbug (backwards compat) */
+  db?: DbConfig;
+  /** Embedding config used during indexing. If absent, defaults to local/snowflake-arctic-embed-xs/384. */
+  embedding?: {
+    provider: string;
+    model: string;
+    dimensions: number;
+    endpoint?: string;
+  };
 }
 
 const GITNEXUS_DIR = '.gitnexus';
@@ -64,6 +74,24 @@ export const getStoragePaths = (repoPath: string) => {
     storagePath,
     lbugPath: path.join(storagePath, 'lbug'),
     metaPath: path.join(storagePath, 'meta.json'),
+  };
+};
+
+/**
+ * Get the database config for a registry entry.
+ * Falls back to LadybugDB at the standard path for old entries that predate Neptune support.
+ */
+export const getDbConfig = (entry: RegistryEntry): DbConfig => {
+  if (entry.db) {
+    // Backwards compat: old entries may have type 'kuzu' from before migration
+    if ((entry.db as any).type === 'kuzu') {
+      return { type: 'lbug', lbugPath: path.join(entry.storagePath, 'lbug') };
+    }
+    return entry.db;
+  }
+  return {
+    type: 'lbug',
+    lbugPath: path.join(entry.storagePath, 'lbug'),
   };
 };
 
@@ -244,7 +272,12 @@ const writeRegistry = async (entries: RegistryEntry[]): Promise<void> => {
  * Register (add or update) a repo in the global registry.
  * Called after `gitnexus analyze` completes.
  */
-export const registerRepo = async (repoPath: string, meta: RepoMeta): Promise<void> => {
+export const registerRepo = async (
+  repoPath: string,
+  meta: RepoMeta,
+  db?: DbConfig,
+  embedding?: RegistryEntry['embedding'],
+): Promise<void> => {
   const resolved = path.resolve(repoPath);
   const name = path.basename(resolved);
   const { storagePath } = getStoragePaths(resolved);
@@ -265,12 +298,35 @@ export const registerRepo = async (repoPath: string, meta: RepoMeta): Promise<vo
     indexedAt: meta.indexedAt,
     lastCommit: meta.lastCommit,
     stats: meta.stats,
+    ...(db ? { db } : {}),
+    ...(embedding ? { embedding } : {}),
   };
 
   if (existing >= 0) {
     entries[existing] = entry;
   } else {
     entries.push(entry);
+  }
+
+  await writeRegistry(entries);
+};
+
+/**
+ * Update the database backend config for a registered repo.
+ * If db is undefined or db.type === 'lbug', the db field is removed (falls back to LadybugDB default).
+ * Throws if the repo is not found in the registry.
+ */
+export const updateRepoDb = async (repoName: string, db?: DbConfig): Promise<void> => {
+  const entries = await readRegistry();
+  const entry = entries.find((e) => e.name === repoName);
+  if (!entry) {
+    throw new Error(`Repository "${repoName}" not found in registry`);
+  }
+
+  if (!db || db.type === 'lbug' || (db as any).type === 'kuzu') {
+    delete entry.db;
+  } else {
+    entry.db = db;
   }
 
   await writeRegistry(entries);

@@ -104,6 +104,14 @@ export interface LLMSettings {
   hasSeenClusteringPrompt: boolean;
   useSameModelForClustering: boolean;
   clusteringProvider?: Partial<ProviderConfig>; // Optional specific config for clustering
+
+  // Database Backend Settings
+  database?: {
+    type: 'lbug' | 'neptune';
+    neptuneEndpoint?: string;
+    neptuneRegion?: string;
+    neptunePort?: number;
+  };
 }
 
 /**
