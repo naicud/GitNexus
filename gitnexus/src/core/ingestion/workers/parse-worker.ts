@@ -1,46 +1,91 @@
 import { parentPort } from 'node:worker_threads';
-import Parser from 'tree-sitter';
-import JavaScript from 'tree-sitter-javascript';
-import TypeScript from 'tree-sitter-typescript';
-import Python from 'tree-sitter-python';
-import Java from 'tree-sitter-java';
-import C from 'tree-sitter-c';
-import CPP from 'tree-sitter-cpp';
-import CSharp from 'tree-sitter-c-sharp';
-import Go from 'tree-sitter-go';
-import Rust from 'tree-sitter-rust';
-import PHP from 'tree-sitter-php';
-import Ruby from 'tree-sitter-ruby';
 import { createRequire } from 'node:module';
 import { SupportedLanguages } from '../../../config/supported-languages.js';
 import { LANGUAGE_QUERIES } from '../tree-sitter-queries.js';
 import { getTreeSitterBufferSize, TREE_SITTER_MAX_BUFFER } from '../constants.js';
-
-// tree-sitter-swift is an optionalDependency — may not be installed
-const _require = createRequire(import.meta.url);
-let Swift: any = null;
-try { Swift = _require('tree-sitter-swift'); } catch {}
-
-// tree-sitter-kotlin is an optionalDependency — may not be installed
-let Kotlin: any = null;
-try { Kotlin = _require('tree-sitter-kotlin'); } catch {}
+import { preprocessCobolSource, extractCobolSymbolsWithRegex } from '../cobol-preprocessor.js';
 import {
   getLanguageFromFilename,
+  getLanguageFromPath,
   FUNCTION_NODE_TYPES,
   extractFunctionName,
   isBuiltInOrNoise,
+  DEFINITION_CAPTURE_KEYS,
   getDefinitionNodeFromCaptures,
   findEnclosingClassId,
   extractMethodSignature,
   countCallArguments,
   inferCallForm,
   extractReceiverName,
+  findSiblingChild,
   extractReceiverNode,
   CALL_EXPRESSION_TYPES,
-  extractCallChain,
+  extractCallChain
 } from '../utils.js';
 import { buildTypeEnv } from '../type-env.js';
 import type { ConstructorBinding } from '../type-env.js';
+
+// ============================================================================
+// Lazy tree-sitter loading — skip native modules for COBOL-only repos
+// ============================================================================
+
+const _require = createRequire(import.meta.url);
+const isCobolOnlyMode = !!process.env.GITNEXUS_COBOL_DIRS;
+
+let treeSitterLoaded = false;
+let Parser: any = null;
+let parser: any = null;
+let languageMap: Record<string, any> = {};
+
+/** Load tree-sitter and all language grammars. No-op after first call. */
+const ensureTreeSitterLoaded = (): void => {
+  if (treeSitterLoaded) return;
+  treeSitterLoaded = true;
+
+  Parser = _require('tree-sitter');
+  parser = new Parser();
+
+  const JavaScript = _require('tree-sitter-javascript');
+  const TypeScript = _require('tree-sitter-typescript');
+  const Python = _require('tree-sitter-python');
+  const Java = _require('tree-sitter-java');
+  const C = _require('tree-sitter-c');
+  const CPP = _require('tree-sitter-cpp');
+  const CSharp = _require('tree-sitter-c-sharp');
+  const Go = _require('tree-sitter-go');
+  const Rust = _require('tree-sitter-rust');
+  const Kotlin = _require('tree-sitter-kotlin');
+  const PHP = _require('tree-sitter-php');
+  const Ruby = _require('tree-sitter-ruby');
+
+  let Swift: any = null;
+  try { Swift = _require('tree-sitter-swift'); } catch {}
+  let COBOL: any = null;
+  try { COBOL = _require('tree-sitter-cobol'); } catch {}
+
+  languageMap = {
+    [SupportedLanguages.JavaScript]: JavaScript,
+    [SupportedLanguages.TypeScript]: TypeScript.typescript,
+    [`${SupportedLanguages.TypeScript}:tsx`]: TypeScript.tsx,
+    [SupportedLanguages.Python]: Python,
+    [SupportedLanguages.Java]: Java,
+    [SupportedLanguages.C]: C,
+    [SupportedLanguages.CPlusPlus]: CPP,
+    [SupportedLanguages.CSharp]: CSharp,
+    [SupportedLanguages.Go]: Go,
+    [SupportedLanguages.Rust]: Rust,
+    [SupportedLanguages.Kotlin]: Kotlin,
+    [SupportedLanguages.PHP]: PHP.php_only,
+    [SupportedLanguages.Ruby]: Ruby,
+    ...(Swift ? { [SupportedLanguages.Swift]: Swift } : {}),
+    ...(COBOL ? { [SupportedLanguages.COBOL]: COBOL } : {}),
+  };
+};
+
+// For non-COBOL repos, load eagerly at module init (no behavior change)
+if (!isCobolOnlyMode) {
+  ensureTreeSitterLoaded();
+}
 import { isNodeExported } from '../export-detection.js';
 import { detectFrameworkFromAST } from '../framework-detection.js';
 import { typeConfigs } from '../type-extractors/index.js';
@@ -75,7 +120,7 @@ interface ParsedRelationship {
   id: string;
   sourceId: string;
   targetId: string;
-  type: 'DEFINES' | 'HAS_METHOD';
+  type: string;
   confidence: number;
   reason: string;
 }
@@ -164,26 +209,245 @@ export interface ParseWorkerInput {
 }
 
 // ============================================================================
-// Worker-local parser + language map
+// COBOL regex-only processing (tree-sitter hangs on pathological files)
 // ============================================================================
 
-const parser = new Parser();
+// ---------------------------------------------------------------------------
+// COBOL deep indexing helpers (shared by processCobolRegexOnly)
+// ---------------------------------------------------------------------------
 
-const languageMap: Record<string, any> = {
-  [SupportedLanguages.JavaScript]: JavaScript,
-  [SupportedLanguages.TypeScript]: TypeScript.typescript,
-  [`${SupportedLanguages.TypeScript}:tsx`]: TypeScript.tsx,
-  [SupportedLanguages.Python]: Python,
-  [SupportedLanguages.Java]: Java,
-  [SupportedLanguages.C]: C,
-  [SupportedLanguages.CPlusPlus]: CPP,
-  [SupportedLanguages.CSharp]: CSharp,
-  [SupportedLanguages.Go]: Go,
-  [SupportedLanguages.Rust]: Rust,
-  ...(Kotlin ? { [SupportedLanguages.Kotlin]: Kotlin } : {}),
-  [SupportedLanguages.PHP]: PHP.php_only,
-  [SupportedLanguages.Ruby]: Ruby,
-  ...(Swift ? { [SupportedLanguages.Swift]: Swift } : {}),
+/** Emit a node + DEFINES relationship + symbol entry in one call. */
+const emitCobolNode = (
+  result: ParseWorkerResult,
+  label: string,
+  nodeId: string,
+  name: string,
+  filePath: string,
+  line: number,
+  fileId: string,
+  opts?: { isExported?: boolean; description?: string },
+): void => {
+  result.nodes.push({
+    id: nodeId, label,
+    properties: {
+      name, filePath, startLine: line, endLine: line,
+      language: SupportedLanguages.COBOL,
+      isExported: opts?.isExported ?? false,
+      ...(opts?.description ? { description: opts.description } : {}),
+    },
+  });
+  result.relationships.push({
+    id: generateId('DEFINES', `${fileId}->${nodeId}`),
+    sourceId: fileId, targetId: nodeId, type: 'DEFINES', confidence: 1.0, reason: '',
+  });
+  result.symbols.push({ filePath, name, nodeId, type: label });
+};
+
+/** Emit a relationship (non-DEFINES). */
+const emitCobolRel = (
+  result: ParseWorkerResult,
+  type: string,
+  sourceId: string,
+  targetId: string,
+  confidence = 1.0,
+  reason = '',
+): void => {
+  result.relationships.push({
+    id: generateId(type, `${sourceId}->${targetId}`),
+    sourceId, targetId, type, confidence, reason,
+  });
+};
+
+/** Build a description string from key-value parts, skipping undefined values. */
+const buildDesc = (parts: Array<[string, string | number | undefined]>): string => {
+  return parts.filter(([, v]) => v !== undefined).map(([k, v]) => `${k}:${v}`).join(' ');
+};
+
+/** Get the node label for a data item based on its level number. */
+const dataItemLabel = (level: number): string =>
+  level === 1 || level === 0o1 ? 'Record' : 'Property';
+
+const processCobolRegexOnly = (file: ParseWorkerInput, result: ParseWorkerResult): void => {
+  const regexResults = extractCobolSymbolsWithRegex(file.content, file.path);
+  const fileId = generateId('File', file.path);
+
+  if (regexResults.programName) {
+    const nodeId = generateId('Module', `${file.path}:${regexResults.programName}`);
+    const metaDesc = buildDesc([
+      ['author', regexResults.programMetadata.author],
+      ['date', regexResults.programMetadata.dateWritten],
+    ]);
+    result.nodes.push({
+      id: nodeId, label: 'Module',
+      properties: {
+        name: regexResults.programName, filePath: file.path, startLine: 0, endLine: 0,
+        language: SupportedLanguages.COBOL, isExported: true,
+        ...(metaDesc ? { description: metaDesc } : {}),
+      },
+    });
+    result.relationships.push({
+      id: generateId('DEFINES', `${fileId}->${nodeId}`),
+      sourceId: fileId, targetId: nodeId, type: 'DEFINES', confidence: 1.0, reason: '',
+    });
+    result.symbols.push({ filePath: file.path, name: regexResults.programName, nodeId, type: 'Module' });
+  }
+
+  const moduleId = regexResults.programName
+    ? generateId('Module', `${file.path}:${regexResults.programName}`)
+    : fileId;
+
+  for (const para of regexResults.paragraphs) {
+    const nodeId = generateId('Function', `${file.path}:${para.name}`);
+    emitCobolNode(result, 'Function', nodeId, para.name, file.path, para.line, fileId, { isExported: true });
+  }
+
+  for (const sec of regexResults.sections) {
+    const nodeId = generateId('Namespace', `${file.path}:${sec.name}`);
+    emitCobolNode(result, 'Namespace', nodeId, sec.name, file.path, sec.line, fileId, { isExported: true });
+  }
+
+  for (const copy of regexResults.copies) {
+    result.imports.push({ filePath: file.path, rawImportPath: copy.target, language: SupportedLanguages.COBOL });
+  }
+
+  for (const call of regexResults.calls) {
+    if (!isBuiltInOrNoise(call.target)) {
+      result.calls.push({ filePath: file.path, calledName: call.target, sourceId: fileId });
+    }
+  }
+
+  for (const perf of regexResults.performs) {
+    if (!isBuiltInOrNoise(perf.target)) {
+      const sourceId = perf.caller
+        ? generateId('Function', `${file.path}:${perf.caller}`)
+        : fileId;
+      result.calls.push({ filePath: file.path, calledName: perf.target, sourceId });
+    }
+  }
+
+  const MAX_DATA_ITEMS_PER_FILE = 500;
+  const cappedDataItems = regexResults.dataItems.length > MAX_DATA_ITEMS_PER_FILE
+    ? regexResults.dataItems.slice(0, MAX_DATA_ITEMS_PER_FILE)
+    : regexResults.dataItems;
+
+  for (const item of cappedDataItems) {
+    if (item.values) {
+      const nodeId = generateId('Const', `${file.path}:${item.name}`);
+      const desc = `level:88 values:${item.values.join(',')}`;
+      emitCobolNode(result, 'Const', nodeId, item.name, file.path, item.line, fileId, { description: desc });
+    } else if (item.level === 1) {
+      const nodeId = generateId('Record', `${file.path}:${item.name}`);
+      const desc = buildDesc([['level', '01'], ['pic', item.pic], ['usage', item.usage], ['occurs', item.occurs], ['section', item.section]]);
+      emitCobolNode(result, 'Record', nodeId, item.name, file.path, item.line, fileId, { description: desc });
+      if (item.redefines) emitCobolRel(result, 'REDEFINES', nodeId, generateId('Record', `${file.path}:${item.redefines}`));
+    } else {
+      const nodeId = generateId('Property', `${file.path}:${item.name}`);
+      const desc = buildDesc([['level', String(item.level).padStart(2, '0')], ['pic', item.pic], ['usage', item.usage], ['occurs', item.occurs], ['section', item.section]]);
+      emitCobolNode(result, 'Property', nodeId, item.name, file.path, item.line, fileId, { description: desc });
+      if (item.redefines) emitCobolRel(result, 'REDEFINES', nodeId, generateId('Property', `${file.path}:${item.redefines}`));
+    }
+  }
+
+  const parentStack: Array<{ level: number; nodeId: string }> = [];
+  for (const item of cappedDataItems) {
+    if (item.values) continue;
+    const label = dataItemLabel(item.level);
+    const nodeId = generateId(label, `${file.path}:${item.name}`);
+    while (parentStack.length > 0 && parentStack[parentStack.length - 1].level >= item.level) parentStack.pop();
+    if (parentStack.length > 0) emitCobolRel(result, 'CONTAINS', parentStack[parentStack.length - 1].nodeId, nodeId);
+    else emitCobolRel(result, 'CONTAINS', moduleId, nodeId);
+    parentStack.push({ level: item.level, nodeId });
+  }
+
+  for (let i = 0; i < cappedDataItems.length; i++) {
+    const item = cappedDataItems[i];
+    if (!item.values) continue;
+    for (let j = i - 1; j >= 0; j--) {
+      if (!cappedDataItems[j].values) {
+        const parentLabel = dataItemLabel(cappedDataItems[j].level);
+        const parentId = generateId(parentLabel, `${file.path}:${cappedDataItems[j].name}`);
+        emitCobolRel(result, 'CONTAINS', parentId, generateId('Const', `${file.path}:${item.name}`));
+        break;
+      }
+    }
+  }
+
+  for (const fd of regexResults.fileDeclarations) {
+    const nodeId = generateId('CodeElement', `${file.path}:SELECT:${fd.selectName}`);
+    const descParts = ['select'];
+    if (fd.organization) descParts.push(`org:${fd.organization}`);
+    if (fd.access) descParts.push(`access:${fd.access}`);
+    if (fd.recordKey) descParts.push(`key:${fd.recordKey}`);
+    if (fd.fileStatus) descParts.push(`status:${fd.fileStatus}`);
+    if (fd.assignTo) descParts.push(`assign:${fd.assignTo}`);
+    emitCobolNode(result, 'CodeElement', nodeId, fd.selectName, file.path, fd.line, fileId, { description: descParts.join(' ') });
+    if (fd.recordKey) emitCobolRel(result, 'RECORD_KEY_OF', generateId('Property', `${file.path}:${fd.recordKey}`), nodeId, 0.8, 'select-clause');
+    if (fd.fileStatus) emitCobolRel(result, 'FILE_STATUS_OF', generateId('Property', `${file.path}:${fd.fileStatus}`), nodeId, 0.8, 'select-clause');
+  }
+
+  for (const fd of regexResults.fdEntries) {
+    const nodeId = generateId('CodeElement', `${file.path}:FD:${fd.fdName}`);
+    const fdDescParts = ['fd'];
+    if (fd.recordName) fdDescParts.push(`record:${fd.recordName}`);
+    emitCobolNode(result, 'CodeElement', nodeId, fd.fdName, file.path, fd.line, fileId, { description: fdDescParts.join(' ') });
+    if (fd.recordName) emitCobolRel(result, 'CONTAINS', nodeId, generateId('Record', `${file.path}:${fd.recordName}`));
+    emitCobolRel(result, 'CONTAINS', generateId('CodeElement', `${file.path}:SELECT:${fd.fdName}`), nodeId, 0.9, 'fd-select-link');
+  }
+
+  const emittedSqlIds = new Set<string>();
+  for (const sql of regexResults.execSqlBlocks) {
+    for (const table of sql.tables) {
+      const tableId = generateId('CodeElement', `${file.path}:sql-table:${table}`);
+      if (!emittedSqlIds.has(tableId)) {
+        emittedSqlIds.add(tableId);
+        emitCobolNode(result, 'CodeElement', tableId, table, file.path, sql.line, fileId, { description: `sql-table op:${sql.operation}` });
+      }
+      emitCobolRel(result, 'ACCESSES', moduleId, tableId, 0.9, 'exec-sql');
+    }
+    for (const cursor of sql.cursors) {
+      const cursorId = generateId('CodeElement', `${file.path}:sql-cursor:${cursor}`);
+      if (!emittedSqlIds.has(cursorId)) {
+        emittedSqlIds.add(cursorId);
+        emitCobolNode(result, 'CodeElement', cursorId, cursor, file.path, sql.line, fileId, { description: 'sql-cursor' });
+      }
+      emitCobolRel(result, 'ACCESSES', moduleId, cursorId, 0.9, 'exec-sql');
+    }
+  }
+
+  const emittedCicsIds = new Set<string>();
+  for (const cics of regexResults.execCicsBlocks) {
+    if (cics.mapName) {
+      const mapId = generateId('CodeElement', `${file.path}:cics-map:${cics.mapName}`);
+      if (!emittedCicsIds.has(mapId)) {
+        emittedCicsIds.add(mapId);
+        emitCobolNode(result, 'CodeElement', mapId, cics.mapName, file.path, cics.line, fileId, { description: `cics-map cmd:${cics.command}` });
+      }
+      emitCobolRel(result, 'ACCESSES', moduleId, mapId, 0.9, 'exec-cics');
+    }
+    if (cics.programName) result.calls.push({ filePath: file.path, calledName: cics.programName, sourceId: moduleId });
+    if (cics.transId) {
+      const transIdNode = generateId('CodeElement', `${file.path}:cics-transid:${cics.transId}`);
+      if (!emittedCicsIds.has(transIdNode)) {
+        emittedCicsIds.add(transIdNode);
+        emitCobolNode(result, 'CodeElement', transIdNode, cics.transId, file.path, cics.line, fileId, { description: `cics-transid cmd:${cics.command}` });
+      }
+      emitCobolRel(result, 'ACCESSES', moduleId, transIdNode, 0.9, 'exec-cics');
+    }
+  }
+
+  for (const paramName of regexResults.procedureUsing) {
+    emitCobolRel(result, 'RECEIVES', moduleId, generateId('Property', `${file.path}:${paramName}`), 0.8, 'procedure-using');
+  }
+
+  for (const entry of regexResults.entryPoints) {
+    const entryId = generateId('Constructor', `${file.path}:${entry.name}`);
+    const desc = entry.parameters.length > 0 ? `entry params:${entry.parameters.join(',')}` : 'entry';
+    emitCobolNode(result, 'Constructor', entryId, entry.name, file.path, entry.line, fileId, { description: desc });
+    emitCobolRel(result, 'CONTAINS', moduleId, entryId);
+    result.symbols.push({ filePath: file.path, name: entry.name, nodeId: entryId, type: 'Constructor' });
+  }
+
+  result.fileCount++;
 };
 
 /**
@@ -200,6 +464,7 @@ const isLanguageAvailable = (language: SupportedLanguages, filePath: string): bo
 };
 
 const setLanguage = (language: SupportedLanguages, filePath: string): void => {
+  ensureTreeSitterLoaded();
   const key = language === SupportedLanguages.TypeScript && filePath.endsWith('.tsx')
     ? `${language}:tsx`
     : language;
@@ -287,7 +552,7 @@ const processBatch = (files: ParseWorkerInput[], onProgress?: (filesProcessed: n
   // Group by language to minimize setLanguage calls
   const byLanguage = new Map<SupportedLanguages, ParseWorkerInput[]>();
   for (const file of files) {
-    const lang = getLanguageFromFilename(file.path);
+    const lang = getLanguageFromPath(file.path);
     if (!lang) continue;
     let list = byLanguage.get(lang);
     if (!list) {
@@ -310,6 +575,16 @@ const processBatch = (files: ParseWorkerInput[], onProgress?: (filesProcessed: n
   } : undefined;
 
   for (const [language, langFiles] of byLanguage) {
+    // COBOL: skip tree-sitter entirely — external scanner hangs on ~5% of files
+    // with no way to timeout. Use regex-only extraction which is fast and reliable.
+    if (language === SupportedLanguages.COBOL) {
+      for (const file of langFiles) {
+        processCobolRegexOnly(file, result);
+        onFileProcessed?.();
+      }
+      continue;
+    }
+
     const queryString = LANGUAGE_QUERIES[language];
     if (!queryString) continue;
 
@@ -1115,12 +1390,10 @@ const processFileGroup = (
         returnType = sig.returnType;
 
         // Language-specific return type fallback (e.g. Ruby YARD @return [Type])
-        // Also upgrades uninformative AST types like PHP `array` with PHPDoc `@return User[]`
-        if ((!returnType || returnType === 'array' || returnType === 'iterable') && definitionNode) {
+        if (!returnType && definitionNode) {
           const tc = typeConfigs[language as keyof typeof typeConfigs];
           if (tc?.extractReturnType) {
-            const docReturn = tc.extractReturnType(definitionNode);
-            if (docReturn) returnType = docReturn;
+            returnType = tc.extractReturnType(definitionNode);
           }
         }
       }
@@ -1254,3 +1527,5 @@ parentPort!.on('message', (msg: any) => {
     parentPort!.postMessage({ type: 'error', error: message });
   }
 });
+
+parentPort!.postMessage({ type: 'ready' });

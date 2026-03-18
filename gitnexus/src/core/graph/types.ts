@@ -32,7 +32,9 @@ export type NodeLabel =
   | 'Delegate'
   | 'Annotation'
   | 'Constructor'
-  | 'Template';
+  | 'Template'
+  // Frontend-only (not stored in LadybugDB)
+  | 'ClusterGroup';
 
 
 import { SupportedLanguages } from '../../config/supported-languages.js';
@@ -82,6 +84,14 @@ export type RelationshipType =
   | 'HAS_METHOD'
   | 'MEMBER_OF'
   | 'STEP_IN_PROCESS'
+  // COBOL deep indexing
+  | 'REDEFINES'
+  | 'RECORD_KEY_OF'
+  | 'FILE_STATUS_OF'
+  | 'ACCESSES'
+  | 'RECEIVES'
+  | 'DATA_FLOW'
+  | 'CONTRACTS'
 
 export interface GraphNode {
   id:  string,

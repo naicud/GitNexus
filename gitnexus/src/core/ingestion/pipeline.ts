@@ -15,14 +15,17 @@ import { createResolutionContext } from './resolution-context.js';
 import { createASTCache } from './ast-cache.js';
 import { PipelineProgress, PipelineResult } from '../../types/pipeline.js';
 import { walkRepositoryPaths, readFileContents } from './filesystem-walker.js';
-import { getLanguageFromFilename } from './utils.js';
+import { getLanguageFromFilename, getLanguageFromPath } from './utils.js';
 import { isLanguageAvailable } from '../tree-sitter/parser-loader.js';
 import { createWorkerPool, WorkerPool } from './workers/worker-pool.js';
+import { expandCopies, DEFAULT_MAX_DEPTH } from './cobol-copy-expander.js';
+import { SupportedLanguages } from '../../config/supported-languages.js';
+import { KnowledgeGraph } from '../graph/types.js';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
-const isDev = process.env.NODE_ENV === 'development';
+const isDev = process.env.NODE_ENV === 'development' || !!process.env.GITNEXUS_VERBOSE;
 
 /** Max bytes of source content to load per parse chunk. Each chunk's source +
  *  parsed ASTs + extracted records + worker serialization overhead all live in
@@ -32,6 +35,210 @@ const CHUNK_BYTE_BUDGET = 20 * 1024 * 1024; // 20MB
 
 /** Max AST trees to keep in LRU cache */
 const AST_CACHE_CAP = 50;
+
+/** Extensions that identify a COBOL file as a copybook (not a program). */
+const COPYBOOK_EXTENSIONS = new Set([
+  '.cpy', '.copy',
+  '.gnm', '.fd', '.wrk', '.sel', '.open', '.close', '.ini', '.def',
+]);
+
+/** COBOL program extensions — files with these are source programs, not copybooks. */
+const COBOL_PROGRAM_EXTENSIONS = new Set(['.cbl', '.cob', '.cobol']);
+
+/**
+ * Determine if a COBOL file is a copybook based on its path.
+ * A file is a copybook if:
+ * - It has a recognized copybook extension (.cpy, .copy, .GNM, .FD, etc.)
+ * - OR: it's an extensionless file in a COBOL directory whose name does NOT
+ *   match a program extension — we conservatively treat extensionless files
+ *   that are NOT in the program source directory as potential copybooks.
+ *   (Refinement: files in GITNEXUS_COBOL_DIRS named "c" or containing "copy"
+ *   in the path segment are classified as copybooks.)
+ */
+function isCobolCopybook(filePath: string): boolean {
+  const basename = filePath.split('/').pop() || '';
+  const dotIdx = basename.lastIndexOf('.');
+  if (dotIdx >= 0) {
+    const ext = basename.substring(dotIdx).toLowerCase();
+    if (COPYBOOK_EXTENSIONS.has(ext)) return true;
+    if (COBOL_PROGRAM_EXTENSIONS.has(ext)) return false;
+  }
+
+  // Extensionless file: check path segments for copybook directory hints
+  const segments = filePath.toLowerCase().split('/');
+  for (const segment of segments) {
+    if (segment === 'c' || segment === 'copy' || segment === 'copybooks' ||
+        segment === 'copylib' || segment === 'cpy') {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+/**
+ * Extract a copybook name from a file path.
+ * Returns the basename without extension, uppercased (COBOL convention).
+ */
+function getCopybookName(filePath: string): string {
+  const basename = filePath.split('/').pop() || filePath;
+  const dotIdx = basename.lastIndexOf('.');
+  const name = dotIdx >= 0 ? basename.substring(0, dotIdx) : basename;
+  return name.toUpperCase();
+}
+
+/**
+ * Expand COBOL COPY statements in a set of files.
+ * Mutates the chunkFiles array in-place, replacing content with expanded content.
+ *
+ * @param chunkFiles    - Files to process (content is replaced in-place)
+ * @param allCobolFiles - All COBOL files in the repo (for copybook resolution)
+ * @param allContents   - Content map for all COBOL files (path -> content)
+ */
+function expandCobolCopies(
+  chunkFiles: Array<{ path: string; content: string }>,
+  allCobolFiles: string[],
+  allContents: Map<string, string>,
+): void {
+  // 1. Build copybook content map: name (uppercase) -> { path, content }
+  const copybookMap = new Map<string, { path: string; content: string }>();
+  for (const filePath of allCobolFiles) {
+    if (isCobolCopybook(filePath)) {
+      const content = allContents.get(filePath);
+      if (content !== undefined) {
+        const name = getCopybookName(filePath);
+        // First match wins — prefer exact name match
+        if (!copybookMap.has(name)) {
+          copybookMap.set(name, { path: filePath, content });
+        }
+      }
+    }
+  }
+
+  if (copybookMap.size === 0) return;
+
+  // 2. Build resolver functions
+  const resolveFile = (name: string): string | null => {
+    const upper = name.toUpperCase();
+
+    // Try exact match
+    const exact = copybookMap.get(upper);
+    if (exact) return upper;
+
+    // Try stripping common extensions from the name
+    for (const ext of ['.CPY', '.COPY', '.GNM', '.FD', '.WRK', '.SEL', '.OPEN', '.CLOSE', '.INI', '.DEF']) {
+      if (upper.endsWith(ext)) {
+        const stripped = upper.substring(0, upper.length - ext.length);
+        const match = copybookMap.get(stripped);
+        if (match) return stripped;
+      }
+    }
+
+    // Try adding common extensions
+    for (const ext of ['.CPY', '.COPY']) {
+      const withExt = copybookMap.get(upper + ext);
+      if (withExt) return upper + ext;
+    }
+
+    return null;
+  };
+
+  const readFile = (resolvedKey: string): string | null => {
+    const entry = copybookMap.get(resolvedKey);
+    return entry?.content ?? null;
+  };
+
+  // 3. Expand each COBOL source file in the chunk.
+  // Share a single warnedCircular set across all files so each circular
+  // copybook (e.g. ANAZI includes itself) is only reported once total.
+  const warnedCircular = new Set<string>();
+  let expandedCount = 0;
+  for (const file of chunkFiles) {
+    if (isCobolCopybook(file.path)) continue; // Don't expand copybooks themselves
+
+    try {
+      const result = expandCopies(file.content, file.path, resolveFile, readFile, DEFAULT_MAX_DEPTH, warnedCircular);
+      if (result.copyResolutions.length > 0) {
+        file.content = result.expandedContent;
+        expandedCount++;
+      }
+    } catch (err) {
+      console.warn(`[pipeline] COPY expansion failed for ${file.path}: ${(err as Error).message}. Using original content.`);
+    }
+  }
+
+  if (isDev && expandedCount > 0) {
+    console.log(`[pipeline] Expanded COPY statements in ${expandedCount} COBOL file(s) using ${copybookMap.size} copybook(s)`);
+  }
+}
+
+/**
+ * Detect cross-program contracts: when two programs that CALL each other
+ * also share a COPY of the same copybook, it implies a data contract.
+ * Adds CONTRACTS edges to the graph.
+ */
+function detectCrossProgamContracts(graph: KnowledgeGraph): number {
+  // 1. Build map: moduleId -> set of imported copybook basenames
+  const moduleImports = new Map<string, Set<string>>();
+
+  graph.forEachRelationship(rel => {
+    if (rel.type !== 'IMPORTS') return;
+
+    // Check if the source is a Module node
+    const sourceNode = graph.getNode(rel.sourceId);
+    if (!sourceNode || sourceNode.label !== 'Module') return;
+
+    // Check if the target looks like a COBOL file (copybook)
+    const targetNode = graph.getNode(rel.targetId);
+    if (!targetNode) return;
+
+    const targetPath = targetNode.properties.filePath || targetNode.id;
+    const lang = getLanguageFromPath(targetPath);
+    if (lang !== SupportedLanguages.COBOL) return;
+
+    if (!moduleImports.has(rel.sourceId)) {
+      moduleImports.set(rel.sourceId, new Set());
+    }
+    moduleImports.get(rel.sourceId)!.add(getCopybookName(targetPath));
+  });
+
+  // 2. For each CALLS edge between modules, check for shared copybooks
+  let contractCount = 0;
+
+  graph.forEachRelationship(rel => {
+    if (rel.type !== 'CALLS') return;
+
+    const callerImports = moduleImports.get(rel.sourceId);
+    const calleeImports = moduleImports.get(rel.targetId);
+    if (!callerImports || !calleeImports) return;
+
+    // Find shared copybooks
+    const shared: string[] = [];
+    for (const copybook of callerImports) {
+      if (calleeImports.has(copybook)) {
+        shared.push(copybook);
+      }
+    }
+
+    if (shared.length === 0) return;
+
+    // Add CONTRACTS edge for each shared copybook
+    for (const copybook of shared) {
+      const contractId = `${rel.sourceId}_contracts_${rel.targetId}_${copybook}`;
+      graph.addRelationship({
+        id: contractId,
+        type: 'CONTRACTS',
+        sourceId: rel.sourceId,
+        targetId: rel.targetId,
+        confidence: 0.9,
+        reason: `shared-copybook:${copybook}`,
+      });
+      contractCount++;
+    }
+  });
+
+  return contractCount;
+}
 
 export interface PipelineOptions {
   /** Skip MRO, community detection, and process extraction for faster test runs. */
@@ -104,14 +311,14 @@ export const runPipelineFromRepo = async (
     // is in memory at a time. Each chunk is: read → parse → extract → free.
 
     const parseableScanned = scannedFiles.filter(f => {
-      const lang = getLanguageFromFilename(f.path);
+      const lang = getLanguageFromPath(f.path);
       return lang && isLanguageAvailable(lang);
     });
 
     // Warn about files skipped due to unavailable parsers
     const skippedByLang = new Map<string, number>();
     for (const f of scannedFiles) {
-      const lang = getLanguageFromFilename(f.path);
+      const lang = getLanguageFromPath(f.path);
       if (lang && !isLanguageAvailable(lang)) {
         skippedByLang.set(lang, (skippedByLang.get(lang) || 0) + 1);
       }
@@ -165,7 +372,9 @@ export const runPipelineFromRepo = async (
     const MIN_BYTES_FOR_WORKERS = 512 * 1024;
     const totalBytes = parseableScanned.reduce((s, f) => s + f.size, 0);
 
-    // Create worker pool once, reuse across chunks
+    // Create worker pool once, reuse across chunks.
+    // For COBOL repos, use smaller sub-batches (200 vs 1500) to prevent worker
+    // timeouts — COBOL tree-sitter + preprocessing + regex takes ~150ms/file.
     let workerPool: WorkerPool | undefined;
     if (totalParseable >= MIN_FILES_FOR_WORKERS || totalBytes >= MIN_BYTES_FOR_WORKERS) {
       try {
@@ -179,7 +388,11 @@ export const runPipelineFromRepo = async (
             workerUrl = pathToFileURL(distWorker) as URL;
           }
         }
-        workerPool = createWorkerPool(workerUrl);
+        const cobolSubBatch = process.env.GITNEXUS_COBOL_DIRS ? 200 : undefined;
+        workerPool = createWorkerPool(workerUrl, undefined, cobolSubBatch);
+        if (isDev && cobolSubBatch) {
+          console.log(`Worker pool: ${workerPool.size} workers, sub-batch=${cobolSubBatch} (COBOL mode)`);
+        }
       } catch (err) {
         if (isDev) console.warn('Worker pool creation failed, using sequential fallback:', (err as Error).message);
       }
@@ -202,6 +415,24 @@ export const runPipelineFromRepo = async (
     // 200-400MB less memory — critical for Linux-kernel-scale repos.
     const sequentialChunkPaths: string[][] = [];
 
+    // ── COBOL COPY expansion: pre-build copybook content map ──────────
+    // Identify all COBOL files and their copybooks so we can expand COPY
+    // statements before dispatching files to workers.
+    const allCobolPaths = allPaths.filter(p => getLanguageFromPath(p) === SupportedLanguages.COBOL);
+    const hasCobolFiles = allCobolPaths.length > 0;
+    let cobolCopybookContents: Map<string, string> | undefined;
+
+    if (hasCobolFiles) {
+      // Read all copybook files upfront (they are typically small)
+      const copybookPaths = allCobolPaths.filter(p => isCobolCopybook(p));
+      if (copybookPaths.length > 0) {
+        cobolCopybookContents = await readFileContents(repoPath, copybookPaths);
+        if (isDev) {
+          console.log(`[pipeline] COBOL COPY expansion: ${copybookPaths.length} copybook(s) loaded, ${allCobolPaths.length} total COBOL files`);
+        }
+      }
+    }
+
     try {
       for (let chunkIdx = 0; chunkIdx < numChunks; chunkIdx++) {
         const chunkPaths = chunks[chunkIdx];
@@ -211,6 +442,27 @@ export const runPipelineFromRepo = async (
         const chunkFiles = chunkPaths
           .filter(p => chunkContents.has(p))
           .map(p => ({ path: p, content: chunkContents.get(p)! }));
+
+        // ── COBOL COPY expansion (per-chunk) ────────────────────────────
+        // Expand COPY statements in COBOL files before parsing. This gives
+        // the regex extractor visibility into copybook symbols (data items,
+        // paragraphs, etc.) that would otherwise be invisible.
+        if (hasCobolFiles && cobolCopybookContents && cobolCopybookContents.size > 0) {
+          const cobolChunkFiles = chunkFiles.filter(
+            f => getLanguageFromPath(f.path) === SupportedLanguages.COBOL,
+          );
+          if (cobolChunkFiles.length > 0) {
+            // Merge chunk content into the copybook map (chunk may contain
+            // copybooks not yet in the pre-loaded set)
+            const mergedContents = new Map(cobolCopybookContents);
+            for (const f of chunkFiles) {
+              if (!mergedContents.has(f.path)) {
+                mergedContents.set(f.path, f.content);
+              }
+            }
+            expandCobolCopies(cobolChunkFiles, allCobolPaths, mergedContents);
+          }
+        }
 
         // Parse this chunk (workers or sequential fallback)
         const chunkWorkerData = await processParsing(
@@ -231,8 +483,8 @@ export const runPipelineFromRepo = async (
 
         const chunkBasePercent = 20 + ((filesParsedSoFar / totalParseable) * 62);
 
-        if (chunkWorkerData) {
-          // Imports
+        if (chunkWorkerData && !chunkWorkerData.sequentialFallback) {
+          // Full worker path — all languages resolved by workers
           await processImportsFromExtracted(graph, allPathObjects, chunkWorkerData.imports, ctx, (current, total) => {
             onProgress({
               phase: 'parsing',
@@ -242,9 +494,6 @@ export const runPipelineFromRepo = async (
               stats: { filesProcessed: filesParsedSoFar, totalFiles: totalParseable, nodesCreated: graph.nodeCount },
             });
           }, repoPath, importCtx);
-          // Calls + Heritage + Routes — resolve in parallel (no shared mutable state between them)
-          // This is safe because each writes disjoint relationship types into idempotent id-keyed Maps,
-          // and the single-threaded event loop prevents races between synchronous addRelationship calls.
           await Promise.all([
             processCallsFromExtracted(
               graph,
@@ -291,6 +540,21 @@ export const runPipelineFromRepo = async (
             ),
           ]);
         } else {
+          // Sequential fallback — disable worker pool for remaining chunks
+          if (workerPool) {
+            await workerPool.terminate();
+            workerPool = undefined;
+          }
+          // Resolve COBOL calls/imports collected by sequential parsing
+          if (chunkWorkerData) {
+            await processImportsFromExtracted(graph, allPathObjects, chunkWorkerData.imports, ctx, undefined, repoPath, importCtx);
+            await processCallsFromExtracted(
+              graph,
+              chunkWorkerData.calls,
+              ctx,
+            );
+          }
+          // Tree-sitter import/call processing for non-COBOL files
           await processImports(graph, chunkFiles, astCache, ctx, undefined, repoPath, allPaths);
           sequentialChunkPaths.push(chunkPaths);
         }
@@ -351,6 +615,31 @@ export const runPipelineFromRepo = async (
       if (isDev && mroResult.entries.length > 0) {
         console.log(`🔀 MRO: ${mroResult.entries.length} classes analyzed, ${mroResult.ambiguityCount} ambiguities found, ${mroResult.overrideEdges} OVERRIDES edges`);
       }
+
+      // ── Phase 4b: Cross-program contract detection (COBOL) ────────────
+      if (hasCobolFiles) {
+        const contractCount = detectCrossProgamContracts(graph);
+        if (isDev && contractCount > 0) {
+          console.log(`[pipeline] Detected ${contractCount} cross-program CONTRACTS edge(s) via shared copybooks`);
+        }
+      }
+
+      // ── Phase 4c: JCL job stream integration ────────────────────────
+      if (process.env.GITNEXUS_JCL_DIRS) {
+        const { isJclFile } = await import('./utils.js');
+        const jclPaths = allPaths.filter(p => isJclFile(p));
+        if (jclPaths.length > 0) {
+          const { processJclFiles } = await import('./jcl-processor.js');
+          const jclContents = await readFileContents(repoPath, jclPaths);
+          const jclResult = processJclFiles(graph, jclPaths, jclContents);
+          if (isDev) {
+            console.log(`[pipeline] JCL integration: ${jclResult.jobCount} jobs, ${jclResult.stepCount} steps, ${jclResult.programLinks} program links`);
+          }
+        }
+      }
+
+      // Free copybook content map — no longer needed
+      cobolCopybookContents = undefined;
 
       // ── Phase 5: Communities ───────────────────────────────────────────
       onProgress({

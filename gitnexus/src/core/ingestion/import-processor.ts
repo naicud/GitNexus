@@ -9,6 +9,7 @@ import { SupportedLanguages } from '../../config/supported-languages.js';
 import { extractNamedBindings } from './named-binding-extraction.js';
 import type { ExtractedImport } from './workers/parse-worker.js';
 import { getTreeSitterBufferSize } from './constants.js';
+import { preprocessCobolSource } from './cobol-preprocessor.js';
 import {
   loadTsconfigPaths,
   loadGoModulePath,
@@ -138,6 +139,45 @@ type ImportResult =
   | null;
 
 /**
+ * Resolve a COBOL COPY/CALL target to a file path.
+ * COBOL imports are name-based: COPY SSTORIA → file named SSTORIA (often extensionless).
+ */
+function resolveCobolImport(
+  importName: string,
+  ctx: ImportResolutionContext,
+): string | null {
+  let name = importName;
+  if ((name.startsWith('"') && name.endsWith('"')) || (name.startsWith("'") && name.endsWith("'"))) {
+    name = name.slice(1, -1);
+  }
+  name = name.trim();
+  if (!name) return null;
+
+  const cacheKey = `cobol::${name}`;
+  if (ctx.resolveCache.has(cacheKey)) return ctx.resolveCache.get(cacheKey) ?? null;
+
+  const cache = (result: string | null): string | null => {
+    ctx.resolveCache.set(cacheKey, result);
+    return result;
+  };
+
+  const exact = ctx.suffixIndex.get(name) || ctx.suffixIndex.getInsensitive(name);
+  if (exact) return cache(exact);
+
+  for (const ext of ['.cpy', '.copy', '.cbl', '.cob', '.cobol']) {
+    const r = ctx.suffixIndex.get(name + ext) || ctx.suffixIndex.getInsensitive(name + ext);
+    if (r) return cache(r);
+  }
+
+  for (const variant of [name.toUpperCase(), name.toLowerCase()]) {
+    const r = ctx.suffixIndex.get(variant) || ctx.suffixIndex.getInsensitive(variant);
+    if (r) return cache(r);
+  }
+
+  return cache(null);
+}
+
+/**
  * Shared language dispatch for import resolution.
  * Used by both processImports and processImportsFromExtracted.
  */
@@ -231,6 +271,14 @@ function resolveLanguageImport(
   // Ruby: require / require_relative
   if (language === SupportedLanguages.Ruby) {
     const resolved = resolveRubyImport(rawImportPath, normalizedFileList, allFileList, index);
+    return resolved ? { kind: 'files', files: [resolved] } : null;
+  }
+
+  // COBOL: handle COPY/CALL name-based imports
+  if (language === SupportedLanguages.COBOL) {
+    const resolved = resolveCobolImport(rawImportPath, {
+      allFilePaths, allFileList, normalizedFileList, suffixIndex: index, resolveCache,
+    });
     return resolved ? { kind: 'files', files: [resolved] } : null;
   }
 
@@ -402,8 +450,11 @@ export const processImports = async (
     let wasReparsed = false;
 
     if (!tree) {
+      const parseContent = language === SupportedLanguages.COBOL
+        ? preprocessCobolSource(file.content)
+        : file.content;
       try {
-        tree = parser.parse(file.content, undefined, { bufferSize: getTreeSitterBufferSize(file.content.length) });
+        tree = parser.parse(parseContent, undefined, { bufferSize: getTreeSitterBufferSize(parseContent.length) });
       } catch (parseError) {
         continue;
       }

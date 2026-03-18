@@ -216,4 +216,33 @@ Confidence: 1.0 = certain, <0.8 = fuzzy match`,
       required: ['target', 'direction'],
     },
   },
+  {
+    name: 'assess',
+    description: `Run modernization assessment on an indexed repository.
+
+Returns dead code analysis, complexity/coupling metrics, and modernization candidate scoring.
+
+WHEN TO USE: Evaluating legacy codebases (especially COBOL/mainframe) for modernization readiness. Understanding which functional areas are good candidates for microservice extraction.
+AFTER THIS: Use context() on specific communities or programs for deeper analysis.
+
+Sections:
+- "summary" — Executive summary with overall readiness score
+- "dead-code" — Unused paragraphs, unreachable programs, orphan copybooks
+- "metrics" — Fan-in/fan-out, community coupling, PERFORM depth
+- "modernization" — Ranked communities with isolation scores and recommendations
+- "full" — All sections combined`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        section: {
+          type: 'string',
+          description: 'Which section to return: summary, dead-code, metrics, modernization, or full (default: summary)',
+          enum: ['summary', 'dead-code', 'metrics', 'modernization', 'full'],
+          default: 'summary',
+        },
+        repo: { type: 'string', description: 'Repository name or path. Omit if only one repo is indexed.' },
+      },
+      required: [],
+    },
+  },
 ];

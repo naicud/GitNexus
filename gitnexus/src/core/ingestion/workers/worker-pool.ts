@@ -19,19 +19,27 @@ export interface WorkerPool {
 }
 
 /**
- * Max files to send to a worker in a single postMessage.
+ * Default max files to send to a worker in a single postMessage.
  * Keeps structured-clone memory bounded per sub-batch.
+ * Can be overridden via `createWorkerPool` for slow parsers (e.g. COBOL).
  */
-const SUB_BATCH_SIZE = 1500;
+const DEFAULT_SUB_BATCH_SIZE = 1500;
 
 /** Per sub-batch timeout. If a single sub-batch takes longer than this,
- *  likely a pathological file (e.g. minified 50MB JS). Fail fast. */
-const SUB_BATCH_TIMEOUT_MS = 30_000;
+ *  likely a pathological file (e.g. minified 50MB JS). Fail fast.
+ *  Configurable via GITNEXUS_WORKER_TIMEOUT_MS for codebases with slow
+ *  parsers (e.g. COBOL with external scanner on large batches). */
+const SUB_BATCH_TIMEOUT_MS = Number(process.env.GITNEXUS_WORKER_TIMEOUT_MS) || 120_000;
+
+/** Time to wait for all workers to signal readiness before giving up.
+ *  Workers send { type: 'ready' } after module init (tree-sitter loading etc.).
+ *  Configurable via GITNEXUS_WORKER_STARTUP_TIMEOUT_MS. */
+const WORKER_STARTUP_TIMEOUT_MS = Number(process.env.GITNEXUS_WORKER_STARTUP_TIMEOUT_MS) || 10_000;
 
 /**
  * Create a pool of worker threads.
  */
-export const createWorkerPool = (workerUrl: URL, poolSize?: number): WorkerPool => {
+export const createWorkerPool = (workerUrl: URL, poolSize?: number, subBatchSize?: number): WorkerPool => {
   // Validate worker script exists before spawning to prevent uncaught
   // MODULE_NOT_FOUND crashes in worker threads (e.g. when running from src/ via vitest)
   const workerPath = fileURLToPath(workerUrl);
@@ -39,15 +47,66 @@ export const createWorkerPool = (workerUrl: URL, poolSize?: number): WorkerPool 
     throw new Error(`Worker script not found: ${workerPath}`);
   }
 
+  const effectiveSubBatchSize = subBatchSize ?? DEFAULT_SUB_BATCH_SIZE;
   const size = poolSize ?? Math.min(8, Math.max(1, os.cpus().length - 1));
   const workers: Worker[] = [];
 
+  // Track worker readiness — each worker sends { type: 'ready' } after module init
+  const readyPromises: Promise<void>[] = [];
+
   for (let i = 0; i < size; i++) {
-    workers.push(new Worker(workerUrl));
+    const worker = new Worker(workerUrl);
+    workers.push(worker);
+
+    readyPromises.push(new Promise<void>((resolve, reject) => {
+      const onReady = (msg: any) => {
+        if (msg && msg.type === 'ready') {
+          cleanup();
+          resolve();
+        }
+      };
+      const onError = (err: Error) => {
+        cleanup();
+        reject(new Error(`Worker ${i} failed during startup: ${err.message}`));
+      };
+      const onExit = (code: number) => {
+        cleanup();
+        reject(new Error(`Worker ${i} exited with code ${code} during startup.`));
+      };
+      const cleanup = () => {
+        worker.removeListener('message', onReady);
+        worker.removeListener('error', onError);
+        worker.removeListener('exit', onExit);
+      };
+      worker.on('message', onReady);
+      worker.once('error', onError);
+      worker.once('exit', onExit);
+    }));
   }
+
+  const allWorkersReady = new Promise<void[]>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new Error(
+        `Workers failed to become ready within ${WORKER_STARTUP_TIMEOUT_MS / 1000}s. ` +
+        `Increase GITNEXUS_WORKER_STARTUP_TIMEOUT_MS or check for native module loading issues.`
+      ));
+    }, WORKER_STARTUP_TIMEOUT_MS);
+    if (typeof timer.unref === 'function') timer.unref();
+
+    Promise.all(readyPromises).then(
+      (result) => { clearTimeout(timer); resolve(result); },
+      (err) => { clearTimeout(timer); reject(err); },
+    );
+  });
+
+  // Prevent unhandled rejection if terminate() is called before any dispatch()
+  allWorkersReady.catch(() => {});
 
   const dispatch = <TInput, TResult>(items: TInput[], onProgress?: (filesProcessed: number) => void): Promise<TResult[]> => {
     if (items.length === 0) return Promise.resolve([]);
+
+    // Wait for all workers to finish initialization before sending work
+    return allWorkersReady.then(() => {
 
     const chunkSize = Math.ceil(items.length / size);
     const chunks: TInput[][] = [];
@@ -76,6 +135,7 @@ export const createWorkerPool = (workerUrl: URL, poolSize?: number): WorkerPool 
             if (!settled) {
               settled = true;
               cleanup();
+              worker.terminate().catch(() => {});
               reject(new Error(`Worker ${i} sub-batch timed out after ${SUB_BATCH_TIMEOUT_MS / 1000}s (chunk: ${chunk.length} items).`));
             }
           }, SUB_BATCH_TIMEOUT_MS);
@@ -84,12 +144,12 @@ export const createWorkerPool = (workerUrl: URL, poolSize?: number): WorkerPool 
         let subBatchIdx = 0;
 
         const sendNextSubBatch = () => {
-          const start = subBatchIdx * SUB_BATCH_SIZE;
+          const start = subBatchIdx * effectiveSubBatchSize;
           if (start >= chunk.length) {
             worker.postMessage({ type: 'flush' });
             return;
           }
-          const subBatch = chunk.slice(start, start + SUB_BATCH_SIZE);
+          const subBatch = chunk.slice(start, start + effectiveSubBatchSize);
           subBatchIdx++;
           resetSubBatchTimer();
           worker.postMessage({ type: 'sub-batch', files: subBatch });
@@ -140,6 +200,7 @@ export const createWorkerPool = (workerUrl: URL, poolSize?: number): WorkerPool 
     });
 
     return Promise.all(promises);
+    }); // end allWorkersReady.then
   };
 
   const terminate = async (): Promise<void> => {

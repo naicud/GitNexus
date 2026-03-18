@@ -318,6 +318,8 @@ export class LocalBackend {
         return this.detectChanges(repo, params);
       case 'rename':
         return this.rename(repo, params);
+      case 'assess':
+        return this.assess(repo, params);
       // Legacy aliases for backwards compatibility
       case 'search':
         return this.query(repo, params);
@@ -1658,6 +1660,80 @@ export class LocalBackend {
         step: s.step || s[3], name: s.name || s[0], type: s.type || s[1], filePath: s.filePath || s[2],
       })),
     };
+  }
+
+  // ─── Modernization Assessment ───────────────────────────────────
+
+  /** In-memory assessment cache, invalidated on repo refresh */
+  private assessCache = new Map<string, { deadCode: any; metrics: any; modernization: any; timestamp: number }>();
+
+  private async assess(repo: RepoHandle, params: { section?: string }): Promise<any> {
+    await this.ensureInitialized(repo.id);
+    const section = params.section || 'summary';
+
+    // Use cached results if fresh (5 minutes)
+    let cached = this.assessCache.get(repo.id);
+    if (cached && Date.now() - cached.timestamp < 5 * 60 * 1000) {
+      return this.formatAssessSection(cached, section, repo.name);
+    }
+
+    // Run analysis
+    const queryFn = (cypher: string) => executeQuery(repo.id, cypher);
+
+    const { analyzeDeadCode } = await import('../../core/analysis/dead-code.js');
+    const { computeMetrics } = await import('../../core/analysis/metrics.js');
+    const { scoreModernization } = await import('../../core/analysis/mod-scorer.js');
+
+    const deadCode = await analyzeDeadCode(queryFn);
+    const metrics = await computeMetrics(queryFn);
+    const modernization = await scoreModernization(metrics, deadCode, queryFn);
+
+    cached = { deadCode, metrics, modernization, timestamp: Date.now() };
+    this.assessCache.set(repo.id, cached);
+
+    return this.formatAssessSection(cached, section, repo.name);
+  }
+
+  private formatAssessSection(
+    data: { deadCode: any; metrics: any; modernization: any },
+    section: string,
+    repoName: string,
+  ): any {
+    const { deadCode, metrics, modernization } = data;
+
+    if (section === 'summary') {
+      return {
+        repoName,
+        overallScore: modernization.overallScore,
+        deadCodePct: deadCode.summary.deadCodePct,
+        totalPrograms: metrics.global.totalPrograms,
+        totalCommunities: metrics.global.totalCommunities,
+        extractCandidates: modernization.candidates.filter((c: any) => c.recommendation === 'extract').length,
+        refactorFirst: modernization.candidates.filter((c: any) => c.recommendation === 'refactor-first').length,
+        leaveInPlace: modernization.candidates.filter((c: any) => c.recommendation === 'leave-in-place').length,
+      };
+    }
+
+    if (section === 'dead-code') {
+      return deadCode;
+    }
+
+    if (section === 'metrics') {
+      return {
+        global: metrics.global,
+        topFanOut: [...metrics.programs].sort((a: any, b: any) => b.fanOut - a.fanOut).slice(0, 20),
+        topFanIn: [...metrics.programs].sort((a: any, b: any) => b.fanIn - a.fanIn).slice(0, 20),
+        topCopybooks: [...metrics.copybooks].sort((a: any, b: any) => b.fanIn - a.fanIn).slice(0, 20),
+        communities: metrics.communities,
+      };
+    }
+
+    if (section === 'modernization') {
+      return modernization;
+    }
+
+    // full
+    return { repoName, deadCode, metrics, modernization };
   }
 
   async disconnect(): Promise<void> {
