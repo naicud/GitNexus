@@ -341,7 +341,9 @@ export const analyzeCommand = async (
   let embeddingSkipReason = 'off (use --embeddings to enable)';
 
   if (options?.embeddings) {
-    if (stats.nodes > EMBEDDING_NODE_LIMIT) {
+    if (isNeptune) {
+      embeddingSkipReason = 'skipped (Neptune embedding support not yet available — use LadybugDB for embeddings)';
+    } else if (stats.nodes > EMBEDDING_NODE_LIMIT) {
       embeddingSkipReason = `skipped (${stats.nodes.toLocaleString()} nodes > ${EMBEDDING_NODE_LIMIT.toLocaleString()} limit)`;
     } else {
       embeddingSkipped = false;
