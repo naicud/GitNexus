@@ -18,7 +18,7 @@ import {
   cleanupOldKuzuFiles,
   type RegistryEntry,
 } from '../../storage/repo-manager.js';
-import type { NeptuneDbConfig } from '../../core/db/interfaces.js';
+import type { DbConfig, NeptuneDbConfig } from '../../core/db/interfaces.js';
 import { NeptuneAdapter } from '../../core/db/neptune/neptune-adapter.js';
 // AI context generation is CLI-only (gitnexus analyze)
 // import { generateAIContextFiles } from '../../cli/ai-context.js';
@@ -88,7 +88,7 @@ interface RepoHandle {
   lastCommit: string;
   stats?: RegistryEntry['stats'];
   /** DB backend config — present when repo has a non-default DB (e.g. Neptune) */
-  db?: { type: 'lbug' | 'neptune'; endpoint?: string; region?: string; port?: number; lbugPath?: string };
+  db?: DbConfig;
   /** Embedding config used during indexing — for query-time provider matching */
   embedding?: { provider: string; model: string; dimensions: number; endpoint?: string };
 }
@@ -141,7 +141,7 @@ export class LocalBackend {
         indexedAt: entry.indexedAt,
         lastCommit: entry.lastCommit,
         stats: entry.stats,
-        db: (entry as any).db,
+        db: entry.db,
         embedding: entry.embedding,
       };
 
