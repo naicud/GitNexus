@@ -14,7 +14,7 @@ import type { KnowledgeGraph } from '../../graph/types.js';
 import type { NeptuneDbConfig } from '../interfaces.js';
 
 const NODE_BATCH_SIZE = 500;
-const EDGE_BATCH_SIZE = 25;
+const EDGE_BATCH_SIZE = 100;
 const MAX_RETRIES = 5;
 
 export interface NeptuneLoadResult {
