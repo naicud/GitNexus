@@ -264,35 +264,3 @@ export function parseJcl(content: string, filePath: string): JclParseResults {
 
   return results;
 }
-
-/**
- * Check if a file path is a JCL file based on extension or directory.
- */
-export function isJclFile(filePath: string): boolean {
-  const lower = filePath.toLowerCase();
-  // Extension-based detection
-  if (lower.endsWith('.jcl') || lower.endsWith('.jclproc') || lower.endsWith('.proc')) {
-    return true;
-  }
-  // Directory-based detection via GITNEXUS_JCL_DIRS
-  const jclDirs = getJclDirs();
-  if (jclDirs.size > 0) {
-    const basename = filePath.split('/').pop() || '';
-    // Extensionless files in JCL directories
-    if (!basename.includes('.')) {
-      const segments = lower.split('/');
-      for (const segment of segments) {
-        if (jclDirs.has(segment)) return true;
-      }
-    }
-  }
-  return false;
-}
-
-let _jclDirs: Set<string> | null = null;
-function getJclDirs(): Set<string> {
-  if (_jclDirs) return _jclDirs;
-  const raw = process.env.GITNEXUS_JCL_DIRS;
-  _jclDirs = raw ? new Set(raw.split(',').map(d => d.trim().toLowerCase())) : new Set();
-  return _jclDirs;
-}

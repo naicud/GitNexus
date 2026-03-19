@@ -18,7 +18,7 @@ import { walkRepositoryPaths, readFileContents } from './filesystem-walker.js';
 import { getLanguageFromFilename, getLanguageFromPath } from './utils.js';
 import { isLanguageAvailable } from '../tree-sitter/parser-loader.js';
 import { createWorkerPool, WorkerPool } from './workers/worker-pool.js';
-import { expandCopies, DEFAULT_MAX_DEPTH } from './cobol-copy-expander.js';
+import { expandCopies, DEFAULT_MAX_DEPTH } from './languages/cobol/cobol-copy-expander.js';
 import { SupportedLanguages } from '../../config/supported-languages.js';
 import { KnowledgeGraph } from '../graph/types.js';
 import fs from 'node:fs';
@@ -629,7 +629,7 @@ export const runPipelineFromRepo = async (
         const { isJclFile } = await import('./utils.js');
         const jclPaths = allPaths.filter(p => isJclFile(p));
         if (jclPaths.length > 0) {
-          const { processJclFiles } = await import('./jcl-processor.js');
+          const { processJclFiles } = await import('./languages/jcl/jcl-processor.js');
           const jclContents = await readFileContents(repoPath, jclPaths);
           const jclResult = processJclFiles(graph, jclPaths, jclContents);
           if (isDev) {

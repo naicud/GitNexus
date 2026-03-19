@@ -27,7 +27,7 @@ import { buildTypeEnv } from './type-env.js';
 import type { ConstructorBinding } from './type-env.js';
 import { getTreeSitterBufferSize } from './constants.js';
 import { SupportedLanguages } from '../../config/supported-languages.js';
-import { preprocessCobolSource } from './cobol-preprocessor.js';
+import { preprocessCobolSource } from './languages/cobol/cobol-preprocessor.js';
 import type { ExtractedCall, ExtractedHeritage, ExtractedRoute, FileConstructorBindings } from './workers/parse-worker.js';
 import { callRouters } from './call-routing.js';
 

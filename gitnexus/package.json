@@ -45,7 +45,7 @@
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
     "prepare": "npm run build",
-    "postinstall": "node scripts/patch-tree-sitter-swift.cjs && node scripts/patch-tree-sitter-cobol.cjs"
+    "postinstall": "node scripts/patch-tree-sitter-swift.cjs"
   },
   "dependencies": {
     "@huggingface/transformers": "^3.0.0",
@@ -78,7 +78,6 @@
     "uuid": "^13.0.0"
   },
   "optionalDependencies": {
-    "tree-sitter-cobol": "^0.0.1",
     "tree-sitter-kotlin": "^0.3.8",
     "tree-sitter-swift": "^0.6.0"
   },

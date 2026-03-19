@@ -9,7 +9,7 @@ import { SupportedLanguages } from '../../config/supported-languages.js';
 import { extractNamedBindings } from './named-binding-extraction.js';
 import type { ExtractedImport } from './workers/parse-worker.js';
 import { getTreeSitterBufferSize } from './constants.js';
-import { preprocessCobolSource } from './cobol-preprocessor.js';
+import { preprocessCobolSource } from './languages/cobol/cobol-preprocessor.js';
 import {
   loadTsconfigPaths,
   loadGoModulePath,

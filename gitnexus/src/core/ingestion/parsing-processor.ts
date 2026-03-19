@@ -7,7 +7,7 @@ import { SymbolTable } from './symbol-table.js';
 import { ASTCache } from './ast-cache.js';
 import { getLanguageFromFilename, getLanguageFromPath, yieldToEventLoop, DEFINITION_CAPTURE_KEYS, getDefinitionNodeFromCaptures, findEnclosingClassId, extractMethodSignature, isBuiltInOrNoise } from './utils.js';
 import { isNodeExported } from './export-detection.js';
-import { preprocessCobolSource, extractCobolSymbolsWithRegex } from './cobol-preprocessor.js';
+import { preprocessCobolSource, extractCobolSymbolsWithRegex } from './languages/cobol/cobol-preprocessor.js';
 import { SupportedLanguages } from '../../config/supported-languages.js';
 import { detectFrameworkFromAST } from './framework-detection.js';
 import { typeConfigs } from './type-extractors/index.js';

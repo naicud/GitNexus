@@ -17,11 +17,14 @@ import { SupportedLanguages } from '../../src/config/supported-languages.js';
 
 describe('tree-sitter queries', () => {
   describe('LANGUAGE_QUERIES map', () => {
-    it('has entries for all supported languages', () => {
-      const allLanguages = Object.values(SupportedLanguages);
-      for (const lang of allLanguages) {
+    it('has entries for all tree-sitter supported languages', () => {
+      // COBOL uses regex-only extraction (no tree-sitter), so it has no query entry
+      const treeSitterLanguages = Object.values(SupportedLanguages).filter(
+        lang => lang !== SupportedLanguages.COBOL,
+      );
+      for (const lang of treeSitterLanguages) {
         expect(LANGUAGE_QUERIES[lang]).toBeDefined();
-        expect(LANGUAGE_QUERIES[lang].length).toBeGreaterThan(0);
+        expect(LANGUAGE_QUERIES[lang]!.length).toBeGreaterThan(0);
       }
     });
 

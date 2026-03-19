@@ -3,7 +3,7 @@ import { createRequire } from 'node:module';
 import { SupportedLanguages } from '../../../config/supported-languages.js';
 import { LANGUAGE_QUERIES } from '../tree-sitter-queries.js';
 import { getTreeSitterBufferSize, TREE_SITTER_MAX_BUFFER } from '../constants.js';
-import { preprocessCobolSource, extractCobolSymbolsWithRegex } from '../cobol-preprocessor.js';
+import { preprocessCobolSource, extractCobolSymbolsWithRegex } from '../languages/cobol/cobol-preprocessor.js';
 import {
   getLanguageFromFilename,
   getLanguageFromPath,
@@ -60,8 +60,6 @@ const ensureTreeSitterLoaded = (): void => {
 
   let Swift: any = null;
   try { Swift = _require('tree-sitter-swift'); } catch {}
-  let COBOL: any = null;
-  try { COBOL = _require('tree-sitter-cobol'); } catch {}
 
   languageMap = {
     [SupportedLanguages.JavaScript]: JavaScript,
@@ -78,7 +76,6 @@ const ensureTreeSitterLoaded = (): void => {
     [SupportedLanguages.PHP]: PHP.php_only,
     [SupportedLanguages.Ruby]: Ruby,
     ...(Swift ? { [SupportedLanguages.Swift]: Swift } : {}),
-    ...(COBOL ? { [SupportedLanguages.COBOL]: COBOL } : {}),
   };
 };
 
