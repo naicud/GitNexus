@@ -256,12 +256,14 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
         // Neptune: CONTAINS-based text search fallback (no FTS)
         const adapter = new NeptuneAdapter(dbConfig as NeptuneDbConfig);
         try {
-          const results = await adapter.executeQuery(`
+          // Neptune openCypher does NOT support parameterized LIMIT — must be inline literal.
+          const limit = Math.max(1, Math.min(100, Math.trunc(Number(req.body.limit ?? 10))));
+          const results = await adapter.executeParameterized(`
             MATCH (n)
-            WHERE toLower(n.name) CONTAINS toLower('${query.replace(/'/g, "\\'")}')
+            WHERE toLower(n.name) CONTAINS toLower($q)
             RETURN n.id AS id, n.name AS name, labels(n)[0] AS type, n.filePath AS filePath
-            LIMIT ${Number(req.body.limit ?? 10)}
-          `);
+            LIMIT ${limit}
+          `, { q: query });
           res.json({ results });
         } finally {
           adapter.close();
