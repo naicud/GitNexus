@@ -702,7 +702,7 @@ describe('Rust ::default() constructor resolution', () => {
 
   it('detects save methods on both structs', () => {
     const methods = [...getNodesByLabel(result, 'Function'), ...getNodesByLabel(result, 'Method')];
-    expect(methods.filter((m: string) => m === 'save').length).toBeGreaterThanOrEqual(2);
+    expect(methods.filter((m: string) => m === 'save').length).toBe(2);
   });
 
   it('resolves user.save() in process_with_new() via User::new() constructor', () => {
@@ -774,7 +774,7 @@ describe('Rust async .await constructor binding resolution', () => {
 
   it('detects save methods in separate files', () => {
     const methods = [...getNodesByLabel(result, 'Function'), ...getNodesByLabel(result, 'Method')];
-    expect(methods.filter((m: string) => m === 'save').length).toBeGreaterThanOrEqual(2);
+    expect(methods.filter((m: string) => m === 'save').length).toBe(2);
   });
 
   it('resolves user.save() after .await to user.rs via return type of get_user()', () => {
@@ -832,10 +832,25 @@ describe('Rust nullable receiver resolution (Option<T>)', () => {
     expect(saveFns.length).toBe(2);
   });
 
-  // Known limitation: user.unwrap().save() chains two method calls. unwrap()
-  // returns User but TypeEnv doesn't track intermediate return values in chains.
-  // Disambiguating through .unwrap() requires chained return type inference (Phase 5).
-  it.todo('resolves user.unwrap().save() to User.save (requires chained call inference)');
+  it('resolves user.unwrap().save() to User#save via Option<User> unwrapping', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const userSave = calls.find(c =>
+      c.target === 'save' &&
+      c.source === 'process_entities' &&
+      c.targetFilePath?.includes('user'),
+    );
+    expect(userSave).toBeDefined();
+  });
+
+  it('resolves repo.unwrap().save() to Repo#save via Option<Repo> unwrapping', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const repoSave = calls.find(c =>
+      c.target === 'save' &&
+      c.source === 'process_entities' &&
+      c.targetFilePath?.includes('repo'),
+    );
+    expect(repoSave).toBeDefined();
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -1277,5 +1292,140 @@ describe('Rust for-loop direct call_expression iterable resolution (Phase 7.3)',
       c.target === 'save' && c.source === 'process_repos' && c.targetFilePath?.includes('user.rs'),
     );
     expect(wrongSave).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 8: Field/property type resolution — struct field capture
+// ---------------------------------------------------------------------------
+
+describe('Field type resolution (Rust)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'rust-field-types'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects structs: Address, User', () => {
+    expect(getNodesByLabel(result, 'Struct')).toEqual(['Address', 'User']);
+  });
+
+  it('detects Property nodes for Rust struct fields', () => {
+    const properties = getNodesByLabel(result, 'Property');
+    expect(properties).toContain('address');
+    expect(properties).toContain('name');
+    expect(properties).toContain('city');
+  });
+
+  it('emits HAS_PROPERTY edges linking fields to structs', () => {
+    const propEdges = getRelationships(result, 'HAS_PROPERTY');
+    expect(propEdges.length).toBe(3);
+    expect(edgeSet(propEdges)).toContain('User → name');
+    expect(edgeSet(propEdges)).toContain('User → address');
+    expect(edgeSet(propEdges)).toContain('Address → city');
+  });
+
+  it('resolves user.address.save() → Address#save via field type', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCalls = calls.filter(
+      e => e.target === 'save' && e.source === 'process_user',
+    );
+    expect(saveCalls.length).toBe(1);
+    expect(saveCalls[0].targetFilePath).toContain('models');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 8B: Deep field chain resolution (3-level)
+// ---------------------------------------------------------------------------
+
+describe('Deep field chain resolution (Rust)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'rust-deep-field-chain'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects structs: Address, City, User', () => {
+    expect(getNodesByLabel(result, 'Struct')).toEqual(['Address', 'City', 'User']);
+  });
+
+  it('detects Property nodes for Rust struct fields', () => {
+    const properties = getNodesByLabel(result, 'Property');
+    expect(properties).toContain('address');
+    expect(properties).toContain('city');
+    expect(properties).toContain('zip_code');
+  });
+
+  it('emits HAS_PROPERTY edges for nested type chain', () => {
+    const propEdges = getRelationships(result, 'HAS_PROPERTY');
+    expect(propEdges.length).toBe(5);
+    expect(edgeSet(propEdges)).toContain('User → name');
+    expect(edgeSet(propEdges)).toContain('User → address');
+    expect(edgeSet(propEdges)).toContain('Address → city');
+    expect(edgeSet(propEdges)).toContain('Address → street');
+    expect(edgeSet(propEdges)).toContain('City → zip_code');
+  });
+
+  it('resolves 2-level chain: user.address.save() → Address#save', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCalls = calls.filter(e => e.target === 'save' && e.source === 'process_user');
+    const addressSave = saveCalls.find(e => e.targetFilePath.includes('models'));
+    expect(addressSave).toBeDefined();
+  });
+
+  it('resolves 3-level chain: user.address.city.get_name() → City#get_name', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const getNameCalls = calls.filter(e => e.target === 'get_name' && e.source === 'process_user');
+    const cityGetName = getNameCalls.find(e => e.targetFilePath.includes('models'));
+    expect(cityGetName).toBeDefined();
+  });
+});
+
+// ACCESSES write edges from assignment expressions
+// ---------------------------------------------------------------------------
+
+describe('Write access tracking (Rust)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'rust-write-access'),
+      () => {},
+    );
+  }, 60000);
+
+  it('emits ACCESSES write edges for field assignments', () => {
+    const accesses = getRelationships(result, 'ACCESSES');
+    const writes = accesses.filter(e => e.rel.reason === 'write');
+    expect(writes.length).toBe(3);
+    const fieldNames = writes.map(e => e.target);
+    expect(fieldNames).toContain('name');
+    expect(fieldNames).toContain('address');
+    expect(fieldNames).toContain('score');
+    const sources = writes.map(e => e.source);
+    expect(sources).toContain('update_user');
+  });
+
+  it('write ACCESSES edges have confidence 1.0', () => {
+    const accesses = getRelationships(result, 'ACCESSES');
+    const writes = accesses.filter(e => e.rel.reason === 'write');
+    for (const edge of writes) {
+      expect(edge.rel.confidence).toBe(1.0);
+    }
+  });
+
+  it('emits ACCESSES write edge for compound assignment', () => {
+    const accesses = getRelationships(result, 'ACCESSES');
+    const writes = accesses.filter(e => e.rel.reason === 'write');
+    const scoreWrite = writes.find(e => e.target === 'score');
+    expect(scoreWrite).toBeDefined();
+    expect(scoreWrite!.source).toBe('update_user');
   });
 });

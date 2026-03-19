@@ -122,7 +122,6 @@ It does not:
 - perform full semantic type checking
 - run fixpoint inference
 - propagate inferred bindings across files as ordinary environment entries
-- model deep field/property chains such as `user.address.city`
 - guarantee resolution for every ambiguous construct
 
 ---
@@ -366,31 +365,45 @@ So return-type-aware receiver inference already exists in a constrained downstre
 
 ## Language Feature Matrix
 
-| Feature | TS/JS | Java | Kotlin | C# | Go | Rust | Python | PHP | Ruby | Swift | C/C++ |
-|---------|:-----:|:----:|:------:|:--:|:--:|:----:|:------:|:---:|:----:|:-----:|:-----:|
-| Declarations | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
-| Parameters | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
-| Initializer / constructor inference | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
-| Constructor binding scan | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
-| For-loop element types | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No | Yes |
-| Pattern binding | Yes | Yes | Yes | Yes | No | Yes | Yes | No | No | No | No |
-| Assignment chains | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No | Yes |
-| Comment-based types | JSDoc | No | No | No | No | No | No | PHPDoc | YARD | No | No |
-| Return type extraction | JSDoc | No | No | No | No | No | No | PHPDoc | YARD | No | No |
+| Feature | TS | JS | Java | Kotlin | C# | Go | Rust | Python | PHP | Ruby | Swift | C++ | C |
+|---------|:--:|:--:|:----:|:------:|:--:|:--:|:----:|:------:|:---:|:----:|:-----:|:---:|:-:|
+| Declarations | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
+| Parameters | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
+| Initializer / constructor inference | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
+| Constructor binding scan | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
+| For-loop element types | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No | Yes | Yes |
+| Pattern binding | Yes | Yes | Yes | Yes | No | Yes | Yes | No | No | No | No | No | No |
+| Assignment chains | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No | Yes | Yes | Yes |
+| Field/property type resolution | Yes | No† | Yes | Yes | Yes | Yes | Yes | Yes* | Yes | YARD | No | Yes | No‡ |
+| Comment-based types | JSDoc | JSDoc | No | No | No | No | No | No | PHPDoc | YARD | No | No | No |
+| Return type extraction | JSDoc | JSDoc | No | No | No | No | No | No | PHPDoc | YARD | No | No | No |
+| Write access (ACCESSES write) | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes§ | Yes | Yes | Yes | No |
+
+\* Python class-level annotated attributes (`address: Address`) now resolve `declaredType` correctly. The `self.x` instance attribute pattern is not yet supported.
+
+† JS field topology is captured (`field_definition` → `HAS_PROPERTY` edges) but `declaredType` is never set — JS has no AST type annotations. Disambiguation via `lookupFieldByOwner` requires `declaredType`. JSDoc `@type` support is a Phase 9 candidate.
+
+‡ C has no `@definition.property` query pattern. Struct member fields are not captured. C++ captures class/struct member fields via `field_declaration`.
+
+§ PHP write access covers instance property writes (`$obj->field = value`) and static property writes (`ClassName::$field = value`). Nullsafe writes (`$obj?->field = value`) are not tracked because this is invalid PHP syntax — null-safe member access on the left-hand side of assignment is a parse error.
 
 ---
 
 ## Current Strengths
 
-The current system already provides strong value for call resolution because it combines:
+The current system provides strong value for call resolution because it combines:
 
-- explicit annotation extraction
-- generic-aware loop element typing
-- initializer-based inference
+- explicit annotation extraction across 13 languages
+- generic-aware loop element typing (including call-expression iterables)
+- initializer-based inference with SymbolTable validation
 - selected pattern-based narrowing
 - scope-aware lookups
-- comment-based fallbacks for dynamic ecosystems
+- comment-based fallbacks for dynamic ecosystems (JSDoc, PHPDoc, YARD)
 - constrained return-type-aware receiver inference in call processing
+- deep field/property chains up to 3 levels across 9 languages
+- ACCESSES edge emission for field read access (via chain walking) and field write access (via assignment capture) across 12 languages
+- mixed field+method chain resolution (e.g. `svc.getUser().address.save()`)
+- type-preserving stdlib passthrough for `unwrap()`, `clone()`, `expect()`, etc.
 
 This is enough to materially improve call-edge precision even without implementing a full static type system.
 
@@ -400,7 +413,6 @@ This is enough to materially improve call-edge precision even without implementi
 
 Important gaps still remain:
 
-- no field / property type map for deep chains such as `user.address.city`
 - no general cross-file propagation of inferred bindings
 - no fixpoint inference
 - limited branch-sensitive narrowing outside selected pattern constructs

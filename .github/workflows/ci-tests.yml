@@ -1,20 +1,22 @@
-name: Unit Tests
+name: Tests
 
 on:
   workflow_call:
 
 jobs:
-  unit-tests:
-    name: unit (ubuntu / coverage)
+  tests:
+    name: ubuntu / coverage
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: ./.github/actions/setup-gitnexus
+        with:
+          build: 'true'
 
-      - name: Run unit tests with coverage
+      - name: Run all tests with coverage
         run: >-
-          npx vitest run test/unit
+          npx vitest run
           --reporter=default
           --reporter=json
           --outputFile=test-results.json
@@ -38,16 +40,18 @@ jobs:
           retention-days: 5
 
   cross-platform:
-    name: unit (${{ matrix.os }})
+    name: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         # Ubuntu already covered by the coverage job above
         os: [windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 15
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: ./.github/actions/setup-gitnexus
-      - run: npx vitest run test/unit
+        with:
+          build: 'true'
+      - run: npx vitest run
         working-directory: gitnexus

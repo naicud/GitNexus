@@ -82,6 +82,8 @@ export type RelationshipType =
   | 'IMPLEMENTS'
   | 'EXTENDS'
   | 'HAS_METHOD'
+  | 'HAS_PROPERTY'
+  | 'ACCESSES'
   | 'MEMBER_OF'
   | 'STEP_IN_PROCESS'
   // COBOL deep indexing
@@ -106,7 +108,7 @@ export interface GraphRelationship {
   type: RelationshipType,
   /** Confidence score 0-1 (1.0 = certain, lower = uncertain resolution) */
   confidence: number,
-  /** Resolution reason: 'import-resolved', 'same-file', 'fuzzy-global', or empty for non-CALLS */
+  /** Semantics are edge-type-dependent: CALLS uses resolution tier, ACCESSES uses 'read'/'write', OVERRIDES uses MRO reason */
   reason: string,
   /** Step number for STEP_IN_PROCESS relationships (1-indexed) */
   step?: number,
