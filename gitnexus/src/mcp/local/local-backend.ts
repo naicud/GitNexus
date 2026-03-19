@@ -1529,21 +1529,21 @@ export class LocalBackend {
 
       // Affected processes: which execution flows are broken and at which step
       const [processRows, moduleRows, directModuleRows] = await Promise.all([
-        executeQuery(repo.id, `
+        this.runQuery(repo.id, `
           MATCH (s)-[r:CodeRelation {type: 'STEP_IN_PROCESS'}]->(p:Process)
           WHERE s.id IN [${allIds}]
           RETURN p.heuristicLabel AS name, COUNT(DISTINCT s.id) AS hits, MIN(r.step) AS minStep, p.stepCount AS stepCount
           ORDER BY hits DESC
           LIMIT 20
         `).catch(() => []),
-        executeQuery(repo.id, `
+        this.runQuery(repo.id, `
           MATCH (s)-[:CodeRelation {type: 'MEMBER_OF'}]->(c:Community)
           WHERE s.id IN [${allIds}]
           RETURN c.heuristicLabel AS name, COUNT(DISTINCT s.id) AS hits
           ORDER BY hits DESC
           LIMIT 20
         `).catch(() => []),
-        d1Ids ? executeQuery(repo.id, `
+        d1Ids ? this.runQuery(repo.id, `
           MATCH (s)-[:CodeRelation {type: 'MEMBER_OF'}]->(c:Community)
           WHERE s.id IN [${d1Ids}]
           RETURN DISTINCT c.heuristicLabel AS name
