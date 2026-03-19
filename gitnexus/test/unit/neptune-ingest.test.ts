@@ -192,14 +192,14 @@ describe('loadGraphToNeptune', () => {
     });
 
     // Override: fail only on edge-related sendCypher calls
-    // We do this by failing after the index creation calls
-    const nodeAndIndexCalls = 10 + 2; // 10 indexes + 2 label groups
+    // We do this by failing after the node insertion calls
+    const nodeInsertCalls = 2; // 2 label groups (Function, Class)
     let sendCount = 0;
     mockSend.mockImplementation(async () => {
       sendCount++;
-      // After nodes + indexes, the edge calls start.
+      // After nodes, the edge calls start.
       // Fail the first edge batch with a non-retryable error.
-      if (sendCount === nodeAndIndexCalls + 1) {
+      if (sendCount === nodeInsertCalls + 1) {
         const err = new Error('ConcurrentModificationException');
         err.name = 'NonRetryableError';
         throw err;
@@ -220,7 +220,7 @@ describe('loadGraphToNeptune', () => {
     expect(result.edgesFailed).toBe(0);
   });
 
-  it('attempts to create indexes for standard labels', async () => {
+  it('should NOT send CREATE INDEX queries (Neptune manages indexes automatically)', async () => {
     const graph = createMockGraph(1, 0);
     await loadGraphToNeptune(graph, testConfig);
 
@@ -228,9 +228,7 @@ describe('loadGraphToNeptune', () => {
       (call: any[]) => call[0].openCypherQuery,
     );
     const indexCalls = cypherCalls.filter((q: string) => q.includes('CREATE INDEX'));
-    // Should attempt indexes for Function, File, Class, Method, Interface, Module,
-    // Namespace, Variable, Property, CodeElement
-    expect(indexCalls.length).toBe(10);
+    expect(indexCalls.length).toBe(0);
   });
 
   it('destroys client in finally block', async () => {

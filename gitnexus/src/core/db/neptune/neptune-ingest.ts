@@ -178,20 +178,11 @@ export async function loadGraphToNeptune(
       }
     }
 
-    // 3. Create indexes BEFORE edges — critical for MATCH performance
-    const allLabels = new Set([...nodesByLabel.keys(),
-      'Function', 'File', 'Class', 'Method', 'Interface', 'Module',
-      'Namespace', 'Variable', 'Property', 'CodeElement']);
-    onProgress?.(`Creating Neptune indexes on ${allLabels.size} labels...`);
-    for (const lbl of allLabels) {
-      try {
-        await sendCypher(client, `CREATE INDEX ON :\`${lbl}\`(id)`);
-      } catch {
-        // Index may already exist or label may not exist — non-fatal
-      }
-    }
+    // Note: Neptune manages indexes automatically via its DFE query engine.
+    // Unlike Neo4j, there is no user-facing CREATE INDEX in Neptune openCypher.
+    // MATCH performance is handled by Neptune's internal index structures.
 
-    // 4. Upsert relationships
+    // 3. Upsert relationships
     const relRows: NeptuneBatchRow[] = [];
     graph.forEachRelationship((rel) => {
       const row: NeptuneBatchRow = {
