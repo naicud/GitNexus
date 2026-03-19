@@ -4,9 +4,10 @@ import { useAppState } from '../hooks/useAppState';
 
 interface Props {
   onClose: () => void;
+  dbType?: 'lbug' | 'neptune';
 }
 
-export const CypherConsole: React.FC<Props> = ({ onClose }) => {
+export const CypherConsole: React.FC<Props> = ({ onClose, dbType }) => {
   const { projectName } = useAppState();
   const [query, setQuery] = useState('MATCH (n) RETURN n.name LIMIT 10');
   const [results, setResults] = useState<Record<string, unknown>[] | null>(null);
@@ -40,7 +41,12 @@ export const CypherConsole: React.FC<Props> = ({ onClose }) => {
       <div className="bg-gray-900 rounded-xl border border-white/10 w-full max-w-4xl h-[80vh] flex flex-col shadow-2xl">
         {/* Header */}
         <div className="flex items-center justify-between px-4 py-3 border-b border-white/10">
-          <h2 className="text-white font-semibold">Cypher Console</h2>
+          <div className="flex items-center gap-2">
+            <h2 className="text-white font-semibold">Cypher Console</h2>
+            <span className="px-2 py-0.5 text-xs rounded-full bg-white/10 text-white/60">
+              {dbType === 'neptune' ? 'Neptune' : 'LadybugDB'}
+            </span>
+          </div>
           <button onClick={onClose} className="text-white/40 hover:text-white transition-colors">✕</button>
         </div>
 

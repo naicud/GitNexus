@@ -1021,7 +1021,7 @@ export const SettingsPanel = ({ isOpen, onClose, onSettingsSaved, backendUrl, is
           </div>
 
           {/* Cypher Console Modal */}
-          {showCypherConsole && <CypherConsole onClose={() => setShowCypherConsole(false)} />}
+          {showCypherConsole && <CypherConsole onClose={() => setShowCypherConsole(false)} dbType={dbType} />}
 
           {/* Privacy Note */}
           <div className="p-4 bg-elevated/50 border border-border-subtle rounded-xl">
