@@ -225,7 +225,8 @@ export async function loadGraphToNeptune(
     try {
       for (;;) {
         const res = await client.send(new ExecuteOpenCypherQueryCommand({
-          openCypherQuery: `MATCH (n) WHERE n._gen <> '${generation}' OR NOT exists(n._gen) WITH n LIMIT ${CLEANUP_BATCH} DETACH DELETE n RETURN count(*) AS deleted`,
+          openCypherQuery: `MATCH (n) WHERE n._gen <> $gen OR n._gen IS NULL WITH n LIMIT ${CLEANUP_BATCH} DETACH DELETE n RETURN count(*) AS deleted`,
+          parameters: JSON.stringify({ gen: generation }),
         }));
         const rows = (res.results as Record<string, unknown>[]) ?? [];
         const deleted = Number(rows[0]?.['deleted'] ?? 0);
