@@ -569,11 +569,14 @@ const processParsingSequential = async (
         ? extractMethodSignature(definitionNode)
         : undefined;
 
-      // Language-specific return type fallback (e.g. Ruby YARD @return [Type])
-      if (methodSig && !methodSig.returnType && definitionNode) {
+      // Language-specific return type override (e.g. Ruby YARD, PHP PHPDoc, TS JSDoc).
+      // Doc annotations are often more specific than AST types (e.g. PHP `@return User[]`
+      // vs AST `: array`), so prefer them when available.
+      if (methodSig && definitionNode) {
         const tc = typeConfigs[language as keyof typeof typeConfigs];
         if (tc?.extractReturnType) {
-          methodSig.returnType = tc.extractReturnType(definitionNode);
+          const langReturnType = tc.extractReturnType(definitionNode);
+          if (langReturnType) methodSig.returnType = langReturnType;
         }
       }
 
