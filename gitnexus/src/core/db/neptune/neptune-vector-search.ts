@@ -23,21 +23,9 @@ interface EmbeddingCache {
 /** Module-level cache keyed by adapter identifier (endpoint:port) */
 const cache = new Map<string, EmbeddingCache>();
 
-/**
- * Derive a stable cache key from a NeptuneAdapter.
- *
- * NeptuneAdapter stores its config privately, so we use toString()
- * of the adapter instance as a fallback. However, since we control
- * the call sites, callers can also provide an explicit adapterId.
- */
+/** Derive a stable cache key from a NeptuneAdapter (endpoint:port). */
 function adapterKey(adapter: NeptuneAdapter): string {
-  // NeptuneAdapter doesn't expose config, so we use its object identity
-  // via a WeakMap approach would be cleaner, but a simple string key
-  // derived from the adapter works if we supplement with an explicit id.
-  // Fallback: use the adapter's constructor name + object hash
-  return (adapter as unknown as { config?: { endpoint?: string; port?: number } }).config
-    ? `${(adapter as unknown as { config: { endpoint: string; port: number } }).config.endpoint}:${(adapter as unknown as { config: { endpoint: string; port: number } }).config.port}`
-    : `neptune-adapter-${String(adapter)}`;
+  return adapter.id;
 }
 
 /**

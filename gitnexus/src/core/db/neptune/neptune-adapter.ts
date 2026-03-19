@@ -47,6 +47,11 @@ export class NeptuneAdapter implements IDbQueryAdapter {
     });
   }
 
+  /** Stable identifier for this adapter instance (endpoint:port) */
+  get id(): string {
+    return `${this.config.endpoint}:${this.config.port}`;
+  }
+
   async executeQuery(cypher: string): Promise<Record<string, unknown>[]> {
     const command = new ExecuteOpenCypherQueryCommand({
       openCypherQuery: cypher,
