@@ -20,6 +20,7 @@ import {
 } from '../../storage/repo-manager.js';
 import type { DbConfig, NeptuneDbConfig } from '../../core/db/interfaces.js';
 import { NeptuneAdapter } from '../../core/db/neptune/neptune-adapter.js';
+import { invalidateNeptuneEmbeddingCache } from '../../core/db/neptune/neptune-vector-search.js';
 // AI context generation is CLI-only (gitnexus analyze)
 // import { generateAIContextFiles } from '../../cli/ai-context.js';
 
@@ -115,6 +116,9 @@ export class LocalBackend {
    * LadybugDB connections for removed repos are NOT closed (they idle-timeout naturally).
    */
   private async refreshRepos(): Promise<void> {
+    // Clear stale Neptune embedding cache when repos refresh (re-indexing may have occurred)
+    invalidateNeptuneEmbeddingCache();
+
     const entries = await listRegisteredRepos({ validate: true });
     const freshIds = new Set<string>();
 
