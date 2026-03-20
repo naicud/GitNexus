@@ -1,5 +1,5 @@
 import type { SyntaxNode } from '../utils.js';
-import type { LanguageTypeConfig, ParameterExtractor, TypeBindingExtractor, InitializerExtractor, ClassNameLookup, ConstructorBindingScanner, ReturnTypeExtractor, PendingAssignmentExtractor, ForLoopExtractor, PatternBindingExtractor } from './types.js';
+import type { LanguageTypeConfig, ParameterExtractor, TypeBindingExtractor, InitializerExtractor, ClassNameLookup, ConstructorBindingScanner, ReturnTypeExtractor, PendingAssignmentExtractor, PendingAssignment, ForLoopExtractor, PatternBindingExtractor } from './types.js';
 import { extractSimpleTypeName, extractVarName, hasTypeAnnotation, unwrapAwait, extractCalleeName, extractElementTypeFromString, extractGenericTypeArgs, resolveIterableElementType, methodToTypeArgPosition, type TypeArgPosition } from './shared.js';
 
 const DECLARATION_NODE_TYPES: ReadonlySet<string> = new Set([
@@ -333,12 +333,7 @@ const findTsIterableElementType = (iterableName: string, startNode: SyntaxNode, 
  *   3. AST walk — walks up to the enclosing function's parameters to read User[] annotations directly
  * Only handles `for...of`; `for...in` produces string keys, not element types.
  */
-const extractForLoopBinding: ForLoopExtractor = (
-  node: SyntaxNode,
-  scopeEnv: Map<string, string>,
-  declarationTypeNodes: ReadonlyMap<string, SyntaxNode>,
-  scope: string,
-): void => {
+const extractForLoopBinding: ForLoopExtractor = (node, { scopeEnv, declarationTypeNodes, scope, returnTypeLookup }): void => {
   if (node.type !== 'for_in_statement') return;
 
   // Confirm this is `for...of`, not `for...in`, by scanning unnamed children for the keyword text.
@@ -352,10 +347,11 @@ const extractForLoopBinding: ForLoopExtractor = (
   }
   if (!isForOf) return;
 
-  // The iterable is the `right` field — may be identifier or call_expression.
+  // The iterable is the `right` field — may be identifier, member_expression, or call_expression.
   const rightNode = node.childForFieldName('right');
   let iterableName: string | undefined;
   let methodName: string | undefined;
+  let callExprElementType: string | undefined;
   if (rightNode?.type === 'identifier') {
     iterableName = rightNode.text;
   } else if (rightNode?.type === 'member_expression') {
@@ -364,6 +360,7 @@ const extractForLoopBinding: ForLoopExtractor = (
   } else if (rightNode?.type === 'call_expression') {
     // entries.values() → call_expression > function: member_expression > object + property
     // this.repos.values() → nested member_expression: extract property from inner member
+    // getUsers() → call_expression > function: identifier (Phase 7.3 — return-type path)
     const fn = rightNode.childForFieldName('function');
     if (fn?.type === 'member_expression') {
       const obj = fn.childForFieldName('object');
@@ -376,18 +373,27 @@ const extractForLoopBinding: ForLoopExtractor = (
         if (innerProp) iterableName = innerProp.text;
       }
       if (prop?.type === 'property_identifier') methodName = prop.text;
+    } else if (fn?.type === 'identifier') {
+      // Direct function call: for (const user of getUsers())
+      const rawReturn = returnTypeLookup.lookupRawReturnType(fn.text);
+      if (rawReturn) callExprElementType = extractElementTypeFromString(rawReturn);
     }
   }
-  if (!iterableName) return;
+  if (!iterableName && !callExprElementType) return;
 
-  // Look up the container's base type name for descriptor-aware resolution
-  const containerTypeName = scopeEnv.get(iterableName);
-  const typeArgPos = methodToTypeArgPosition(methodName, containerTypeName);
-  const elementType = resolveIterableElementType(
-    iterableName, node, scopeEnv, declarationTypeNodes, scope,
-    extractTsElementTypeFromAnnotation, findTsIterableElementType,
-    typeArgPos,
-  );
+  let elementType: string | undefined;
+  if (callExprElementType) {
+    elementType = callExprElementType;
+  } else {
+    // Look up the container's base type name for descriptor-aware resolution
+    const containerTypeName = scopeEnv.get(iterableName!);
+    const typeArgPos = methodToTypeArgPosition(methodName, containerTypeName);
+    elementType = resolveIterableElementType(
+      iterableName!, node, scopeEnv, declarationTypeNodes, scope,
+      extractTsElementTypeFromAnnotation, findTsIterableElementType,
+      typeArgPos,
+    );
+  }
   if (!elementType) return;
 
   // The loop variable is the `left` field.
@@ -423,7 +429,8 @@ const extractForLoopBinding: ForLoopExtractor = (
   if (loopVarName) scopeEnv.set(loopVarName, elementType);
 };
 
-/** TS/JS: const alias = u → variable_declarator with name/value fields */
+/** TS/JS: const alias = u → variable_declarator with name/value fields.
+ *  Also handles destructuring: `const { a, b } = obj` → N fieldAccess items. */
 const extractPendingAssignment: PendingAssignmentExtractor = (node, scopeEnv) => {
   for (let i = 0; i < node.namedChildCount; i++) {
     const child = node.namedChild(i);
@@ -431,26 +438,163 @@ const extractPendingAssignment: PendingAssignmentExtractor = (node, scopeEnv) =>
     const nameNode = child.childForFieldName('name');
     const valueNode = child.childForFieldName('value');
     if (!nameNode || !valueNode) continue;
+
+    // Object destructuring: `const { address, name } = user`
+    // Emits N fieldAccess items — one per destructured binding.
+    if (nameNode.type === 'object_pattern' && valueNode.type === 'identifier') {
+      const receiver = valueNode.text;
+      const items: PendingAssignment[] = [];
+      for (let j = 0; j < nameNode.namedChildCount; j++) {
+        const prop = nameNode.namedChild(j);
+        if (!prop) continue;
+        if (prop.type === 'shorthand_property_identifier_pattern') {
+          // `const { name } = user` → shorthand: varName = fieldName
+          const varName = prop.text;
+          if (!scopeEnv.has(varName)) {
+            items.push({ kind: 'fieldAccess', lhs: varName, receiver, field: varName });
+          }
+        } else if (prop.type === 'pair_pattern') {
+          // `const { address: addr } = user` → pair_pattern: key=field, value=varName
+          const keyNode = prop.childForFieldName('key');
+          const valNode = prop.childForFieldName('value');
+          if (keyNode && valNode) {
+            const fieldName = keyNode.text;
+            const varName = valNode.text;
+            if (!scopeEnv.has(varName)) {
+              items.push({ kind: 'fieldAccess', lhs: varName, receiver, field: fieldName });
+            }
+          }
+        }
+      }
+      if (items.length > 0) return items;
+      continue;
+    }
+
     const lhs = nameNode.text;
     if (scopeEnv.has(lhs)) continue;
-    if (valueNode.type === 'identifier') return { lhs, rhs: valueNode.text };
+    if (valueNode.type === 'identifier') return { kind: 'copy', lhs, rhs: valueNode.text };
+    // member_expression RHS → fieldAccess (a.field, this.field)
+    if (valueNode.type === 'member_expression') {
+      const obj = valueNode.childForFieldName('object');
+      const prop = valueNode.childForFieldName('property');
+      if (obj && prop?.type === 'property_identifier' &&
+          (obj.type === 'identifier' || obj.type === 'this')) {
+        return { kind: 'fieldAccess', lhs, receiver: obj.text, field: prop.text };
+      }
+      continue;
+    }
+    // Unwrap await: `const user = await fetchUser()` or `await a.getC()`
+    const callNode = unwrapAwait(valueNode);
+    if (!callNode || callNode.type !== 'call_expression') continue;
+    const funcNode = callNode.childForFieldName('function');
+    if (!funcNode) continue;
+    // Simple call → callResult: getUser()
+    if (funcNode.type === 'identifier') {
+      return { kind: 'callResult', lhs, callee: funcNode.text };
+    }
+    // Method call with receiver → methodCallResult: a.getC()
+    if (funcNode.type === 'member_expression') {
+      const obj = funcNode.childForFieldName('object');
+      const prop = funcNode.childForFieldName('property');
+      if (obj && prop?.type === 'property_identifier' &&
+          (obj.type === 'identifier' || obj.type === 'this')) {
+        return { kind: 'methodCallResult', lhs, receiver: obj.text, method: prop.text };
+      }
+    }
+  }
+  return undefined;
+};
+
+/** Null-check keywords that indicate a null-comparison in binary expressions. */
+const NULL_CHECK_KEYWORDS = new Set(['null', 'undefined']);
+
+/**
+ * Find the if-body (consequence) block for a null-check binary_expression.
+ * Walks up from the binary_expression through parenthesized_expression to if_statement,
+ * then returns the consequence block (statement_block).
+ *
+ * AST structure: if_statement > parenthesized_expression > binary_expression
+ *                if_statement > statement_block (consequence)
+ */
+const findIfConsequenceBlock = (binaryExpr: SyntaxNode): SyntaxNode | undefined => {
+  // Walk up to find the if_statement (typically: binary_expression > parenthesized_expression > if_statement)
+  let current = binaryExpr.parent;
+  while (current) {
+    if (current.type === 'if_statement') {
+      // The consequence is the first statement_block child of if_statement
+      for (let i = 0; i < current.childCount; i++) {
+        const child = current.child(i);
+        if (child?.type === 'statement_block') return child;
+      }
+      return undefined;
+    }
+    // Stop climbing at function/block boundaries — don't cross scope
+    if (current.type === 'function_declaration' || current.type === 'function_expression'
+      || current.type === 'arrow_function' || current.type === 'method_definition') return undefined;
+    current = current.parent;
   }
   return undefined;
 };
 
 /** TS instanceof narrowing: `x instanceof User` → bind x to User.
- *  Only works when x has no prior type binding (e.g. x: unknown, untyped params).
- *  Typed params (x: Animal) are blocked by the !scopeEnv.has() guard in buildTypeEnv.
- *  Uses first-writer-wins, same as Rust match arm bindings. */
-const extractPatternBinding: PatternBindingExtractor = (node) => {
+ *  Also handles null-check narrowing: `x !== null`, `x != undefined` etc.
+ *  instanceof: first-writer-wins (no prior type binding).
+ *  null-check: position-indexed narrowing via narrowingRange. */
+const extractPatternBinding: PatternBindingExtractor = (node, scopeEnv, declarationTypeNodes, scope) => {
   if (node.type !== 'binary_expression') return undefined;
-  const op = node.children.find(c => !c.isNamed && c.text === 'instanceof');
+
+  // Check for instanceof first (existing behavior)
+  const instanceofOp = node.children.find(c => !c.isNamed && c.text === 'instanceof');
+  if (instanceofOp) {
+    const left = node.namedChild(0);
+    const right = node.namedChild(1);
+    if (left?.type !== 'identifier' || right?.type !== 'identifier') return undefined;
+    return { varName: left.text, typeName: right.text };
+  }
+
+  // Null-check narrowing: x !== null, x != null, x !== undefined, x != undefined
+  const op = node.children.find(c => !c.isNamed && (c.text === '!==' || c.text === '!='));
   if (!op) return undefined;
-  // binary_expression children are positional — no left/right fields
+
   const left = node.namedChild(0);
   const right = node.namedChild(1);
-  if (left?.type !== 'identifier' || right?.type !== 'identifier') return undefined;
-  return { varName: left.text, typeName: right.text };
+  if (!left || !right) return undefined;
+
+  // Determine which side is the variable and which is null/undefined
+  let varNode: SyntaxNode | undefined;
+  let isNullCheck = false;
+  if (left.type === 'identifier' && NULL_CHECK_KEYWORDS.has(right.text)) {
+    varNode = left;
+    isNullCheck = true;
+  } else if (right.type === 'identifier' && NULL_CHECK_KEYWORDS.has(left.text)) {
+    varNode = right;
+    isNullCheck = true;
+  }
+  if (!isNullCheck || !varNode) return undefined;
+
+  const varName = varNode.text;
+  // Look up the variable's resolved type (already stripped of nullable by extractSimpleTypeName)
+  const resolvedType = scopeEnv.get(varName);
+  if (!resolvedType) return undefined;
+
+  // Check if the original declaration type was nullable by looking at the raw AST type node.
+  // extractSimpleTypeName already strips nullable markers, so we need the original to know
+  // if narrowing is meaningful (i.e., the variable was declared as nullable).
+  const declTypeNode = declarationTypeNodes.get(`${scope}\0${varName}`);
+  if (!declTypeNode) return undefined;
+  const declText = declTypeNode.text;
+  // Only narrow if the original declaration was nullable
+  if (!declText.includes('null') && !declText.includes('undefined')) return undefined;
+
+  // Find the if-body block to scope the narrowing
+  const ifBody = findIfConsequenceBlock(node);
+  if (!ifBody) return undefined;
+
+  return {
+    varName,
+    typeName: resolvedType,
+    narrowingRange: { startIndex: ifBody.startIndex, endIndex: ifBody.endIndex },
+  };
 };
 
 export const typeConfig: LanguageTypeConfig = {

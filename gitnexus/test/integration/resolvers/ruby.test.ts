@@ -105,7 +105,7 @@ describe('Ruby require_relative, heritage & property resolution', () => {
 
   it('emits EXTENDS edge: User → BaseModel', () => {
     const extends_ = getRelationships(result, 'EXTENDS');
-    expect(extends_.length).toBeGreaterThanOrEqual(1);
+    expect(extends_.length).toBe(1);
     const edges = edgeSet(extends_);
     expect(edges).toContain('User → BaseModel');
   });
@@ -124,15 +124,15 @@ describe('Ruby require_relative, heritage & property resolution', () => {
     expect(props).toContain('email');
   });
 
-  it('emits HAS_METHOD from User to attr_reader :name', () => {
-    const hasMethod = getRelationships(result, 'HAS_METHOD');
-    const edge = hasMethod.find(e => e.source === 'User' && e.target === 'name');
+  it('emits HAS_PROPERTY from User to attr_reader :name', () => {
+    const hasProperty = getRelationships(result, 'HAS_PROPERTY');
+    const edge = hasProperty.find(e => e.source === 'User' && e.target === 'name');
     expect(edge).toBeDefined();
   });
 
-  it('emits HAS_METHOD from BaseModel to attr_accessor :id', () => {
-    const hasMethod = getRelationships(result, 'HAS_METHOD');
-    const edge = hasMethod.find(e => e.source === 'BaseModel' && e.target === 'id');
+  it('emits HAS_PROPERTY from BaseModel to attr_accessor :id', () => {
+    const hasProperty = getRelationships(result, 'HAS_PROPERTY');
+    const edge = hasProperty.find(e => e.source === 'BaseModel' && e.target === 'id');
     expect(edge).toBeDefined();
   });
 
@@ -620,7 +620,7 @@ describe('Ruby return type inference via function call', () => {
   it('detects save method on both User and Repo (disambiguation required)', () => {
     const methods = getNodesByLabel(result, 'Method');
     // Both classes have save — fuzzy match alone cannot resolve this
-    expect(methods.filter(m => m === 'save').length).toBeGreaterThanOrEqual(2);
+    expect(methods.filter(m => m === 'save').length).toBe(2);
   });
 
   it('resolves user.save to User#save via YARD @return [User] on get_user()', () => {
@@ -844,5 +844,217 @@ describe('Ruby for-in loop resolution', () => {
       c.target === 'save' && c.source === 'process_users' && c.targetFilePath?.includes('repo'),
     );
     expect(wrongSave).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 8: Field/property type resolution via YARD @return annotations
+// ---------------------------------------------------------------------------
+
+describe('Field type resolution (Ruby)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'ruby-field-types'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects classes: Address, User', () => {
+    expect(getNodesByLabel(result, 'Class')).toEqual(['Address', 'User']);
+  });
+
+  it('detects Property nodes for attr_accessor fields', () => {
+    const properties = getNodesByLabel(result, 'Property');
+    expect(properties).toContain('address');
+    expect(properties).toContain('name');
+    expect(properties).toContain('city');
+  });
+
+  it('emits HAS_PROPERTY edges linking properties to classes', () => {
+    const propEdges = getRelationships(result, 'HAS_PROPERTY');
+    expect(propEdges.length).toBe(3);
+    expect(edgeSet(propEdges)).toContain('User → address');
+    expect(edgeSet(propEdges)).toContain('User → name');
+    expect(edgeSet(propEdges)).toContain('Address → city');
+  });
+
+  it('resolves user.address.save → Address#save via YARD @return [Address]', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCalls = calls.filter(e => e.target === 'save');
+    const addressSave = saveCalls.find(
+      e => e.source === 'process_user' && e.targetFilePath.includes('models'),
+    );
+    expect(addressSave).toBeDefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 8: Field type disambiguation — both User and Address have save()
+// ---------------------------------------------------------------------------
+
+describe('Field type disambiguation (Ruby)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'ruby-field-type-disambig'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects both User#save and Address#save', () => {
+    const methods = getNodesByLabel(result, 'Method');
+    const saveMethods = methods.filter(m => m === 'save');
+    expect(saveMethods.length).toBe(2);
+  });
+
+  it('resolves user.address.save → Address#save (not User#save)', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCalls = calls.filter(
+      e => e.target === 'save' && e.source === 'process_user',
+    );
+    expect(saveCalls.length).toBe(1);
+    expect(saveCalls[0].targetFilePath).toContain('address');
+    expect(saveCalls[0].targetFilePath).not.toContain('user');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// ACCESSES write edges from assignment expressions
+// ---------------------------------------------------------------------------
+
+describe('Write access tracking (Ruby)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'ruby-write-access'),
+      () => {},
+    );
+  }, 60000);
+
+  it('emits ACCESSES write edges for setter assignments', () => {
+    const accesses = getRelationships(result, 'ACCESSES');
+    const writes = accesses.filter(e => e.rel.reason === 'write');
+    expect(writes.length).toBe(3);
+    const nameWrite = writes.find(e => e.target === 'name');
+    const addressWrite = writes.find(e => e.target === 'address');
+    const scoreWrite = writes.find(e => e.target === 'score');
+    expect(nameWrite).toBeDefined();
+    expect(nameWrite!.source).toBe('update_user');
+    expect(addressWrite).toBeDefined();
+    expect(addressWrite!.source).toBe('update_user');
+    expect(scoreWrite).toBeDefined();
+    expect(scoreWrite!.source).toBe('update_user');
+  });
+
+  it('emits ACCESSES write edge for compound assignment (operator_assignment)', () => {
+    const accesses = getRelationships(result, 'ACCESSES');
+    const writes = accesses.filter(e => e.rel.reason === 'write');
+    const scoreWrite = writes.find(e => e.target === 'score');
+    expect(scoreWrite).toBeDefined();
+    expect(scoreWrite!.source).toBe('update_user');
+  });
+
+  it('write ACCESSES edges have confidence 1.0', () => {
+    const accesses = getRelationships(result, 'ACCESSES');
+    const writes = accesses.filter(e => e.rel.reason === 'write');
+    for (const edge of writes) {
+      expect(edge.rel.confidence).toBe(1.0);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Call-result variable binding (Phase 9): user = get_user(); user.save
+// ---------------------------------------------------------------------------
+
+describe('Ruby call-result variable binding (Tier 2b)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'ruby-call-result-binding'),
+      () => {},
+    );
+  }, 60000);
+
+  it('resolves user.save to User#save via call-result binding', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCall = calls.find(c =>
+      c.target === 'save' && c.source === 'process_user' && c.targetFilePath.includes('app')
+    );
+    expect(saveCall).toBeDefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Method chain binding (Phase 9C): get_user() → .get_address() → .get_city() → .save
+// ---------------------------------------------------------------------------
+
+describe('Ruby method chain binding via unified fixpoint (Phase 9C)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'ruby-method-chain-binding'),
+      () => {},
+    );
+  }, 60000);
+
+  it('resolves city.save to City#save via method chain', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCall = calls.find(c =>
+      c.target === 'save' && c.source === 'process_chain' && c.targetFilePath.includes('app')
+    );
+    expect(saveCall).toBeDefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase B: Deep MRO — walkParentChain() at depth 2 (C→B→A)
+// greet is defined on A, accessed via C. Tests BFS depth-2 parent traversal.
+// ---------------------------------------------------------------------------
+
+describe('Ruby grandparent method resolution via MRO (Phase B)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'ruby-grandparent-resolution'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects A, B, C, Greeting classes', () => {
+    const classes = getNodesByLabel(result, 'Class');
+    expect(classes).toContain('A');
+    expect(classes).toContain('B');
+    expect(classes).toContain('C');
+    expect(classes).toContain('Greeting');
+  });
+
+  it('emits EXTENDS edges: B→A, C→B', () => {
+    const extends_ = getRelationships(result, 'EXTENDS');
+    expect(edgeSet(extends_)).toContain('B → A');
+    expect(edgeSet(extends_)).toContain('C → B');
+  });
+
+  it('resolves c.greet.save to Greeting#save via depth-2 MRO lookup', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCall = calls.find(c =>
+      c.target === 'save' && c.targetFilePath.includes('greeting'),
+    );
+    expect(saveCall).toBeDefined();
+  });
+
+  it('resolves c.greet to A#greet (method found via MRO walk)', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const greetCall = calls.find(c =>
+      c.target === 'greet' && c.targetFilePath.includes('a.rb'),
+    );
+    expect(greetCall).toBeDefined();
   });
 });

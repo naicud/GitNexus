@@ -122,11 +122,11 @@ describe('LadybugDB Schema', () => {
 
     it('has all FROM/TO pairs needed for HAS_METHOD edges', () => {
       // HAS_METHOD sources: Class, Interface, Struct, Trait, Impl, Record
-      // HAS_METHOD targets: Method, Constructor, Property
+      // HAS_METHOD targets: Method, Constructor (Property is now HAS_PROPERTY)
       const sources = ['Class', 'Interface'];
       const backtickSources = ['Struct', 'Trait', 'Impl', 'Record'];
       const targets = ['Method'];
-      const backtickTargets = ['Constructor', 'Property'];
+      const backtickTargets = ['Constructor'];
 
       // Non-backtick source → non-backtick target
       for (const src of sources) {
@@ -171,9 +171,9 @@ describe('LadybugDB Schema', () => {
       expect(REL_SCHEMA_QUERIES).toHaveLength(1);
     });
 
-    it('SCHEMA_QUERIES includes all node + rel + embedding schemas', () => {
-      // 27 node + 1 rel + 1 embedding = 29
-      expect(SCHEMA_QUERIES).toHaveLength(29);
+    it('SCHEMA_QUERIES includes all node + rel schemas (embedding excluded — created dynamically)', () => {
+      // 27 node + 1 rel = 28 (embedding schema excluded — dims depend on configured model)
+      expect(SCHEMA_QUERIES).toHaveLength(28);
     });
 
     it('node schemas come before relation schemas in SCHEMA_QUERIES', () => {

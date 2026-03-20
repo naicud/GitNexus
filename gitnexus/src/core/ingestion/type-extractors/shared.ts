@@ -169,7 +169,7 @@ export function resolveIterableElementType(
 /** Known single-arg nullable wrapper types that unwrap to their inner type
  *  for receiver resolution. Optional<User> → "User", Option<User> → "User".
  *  Only nullable wrappers — NOT containers (List, Vec) or async wrappers (Promise, Future).
- *  See call-processor.ts WRAPPER_GENERICS for the full set used in return-type inference. */
+ *  See WRAPPER_GENERICS below for the full set used in return-type inference. */
 const NULLABLE_WRAPPER_TYPES = new Set([
   'Optional',    // Java
   'Option',      // Rust, Scala
@@ -263,8 +263,14 @@ export const extractSimpleTypeName = (typeNode: SyntaxNode, depth = 0): string |
 
   // Pointer/reference types (C++, Rust): User*, &User, &mut User
   if (typeNode.type === 'pointer_type' || typeNode.type === 'reference_type') {
-    const inner = typeNode.firstNamedChild;
-    if (inner) return extractSimpleTypeName(inner, depth + 1);
+    // Skip mutable_specifier for Rust &mut references — firstNamedChild would be
+    // `mutable_specifier` not the actual type. Walk named children to find the type.
+    for (let i = 0; i < typeNode.namedChildCount; i++) {
+      const child = typeNode.namedChild(i);
+      if (child && child.type !== 'mutable_specifier') {
+        return extractSimpleTypeName(child, depth + 1);
+      }
+    }
   }
 
   // Primitive/predefined types: string, int, float, bool, number, unknown, any
@@ -608,3 +614,239 @@ export function extractElementTypeFromString(typeStr: string, pos: TypeArgPositi
 
   return undefined;
 }
+
+// ── Return type text helpers ─────────────────────────────────────────────
+// extractReturnTypeName works on raw return-type text already stored in
+// SymbolDefinition (e.g. "User", "Promise<User>", "User | null", "*User").
+// Extracts the base user-defined type name.
+
+/** Primitive / built-in types that should NOT produce a receiver binding. */
+const PRIMITIVE_TYPES = new Set([
+  'string', 'number', 'boolean', 'void', 'int', 'float', 'double', 'long',
+  'short', 'byte', 'char', 'bool', 'str', 'i8', 'i16', 'i32', 'i64',
+  'u8', 'u16', 'u32', 'u64', 'f32', 'f64', 'usize', 'isize',
+  'undefined', 'null', 'None', 'nil',
+]);
+
+/**
+ * Extract a simple type name from raw return-type text.
+ * Handles common patterns:
+ *   "User"                → "User"
+ *   "Promise<User>"       → "User"   (unwrap wrapper generics)
+ *   "Option<User>"        → "User"
+ *   "Result<User, Error>" → "User"   (first type arg)
+ *   "User | null"         → "User"   (strip nullable union)
+ *   "User?"               → "User"   (strip nullable suffix)
+ *   "*User"               → "User"   (Go pointer)
+ *   "&User"               → "User"   (Rust reference)
+ * Returns undefined for complex types or primitives.
+ */
+const WRAPPER_GENERICS = new Set([
+  'Promise', 'Observable', 'Future', 'CompletableFuture', 'Task', 'ValueTask',  // async wrappers
+  'Option', 'Some', 'Optional', 'Maybe',                                         // nullable wrappers
+  'Result', 'Either',                                                             // result wrappers
+  // Rust smart pointers (Deref to inner type)
+  'Rc', 'Arc', 'Weak',                                                          // pointer types
+  'MutexGuard', 'RwLockReadGuard', 'RwLockWriteGuard',                          // guard types
+  'Ref', 'RefMut',                                                               // RefCell guards
+  'Cow',                                                                         // copy-on-write
+  // Containers (List, Array, Vec, Set, etc.) are intentionally excluded —
+  // methods are called on the container, not the element type.
+  // Non-wrapper generics return the base type (e.g., List) via the else branch.
+]);
+
+/**
+ * Extracts the first type argument from a comma-separated generic argument string,
+ * respecting nested angle brackets. For example:
+ *   "Result<User, Error>"  → "Result<User, Error>"  (no top-level comma)
+ *   "User, Error"          → "User"
+ *   "Map<K, V>, string"    → "Map<K, V>"
+ */
+function extractFirstGenericArg(args: string): string {
+  let depth = 0;
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === '<') depth++;
+    else if (args[i] === '>') depth--;
+    else if (args[i] === ',' && depth === 0) return args.slice(0, i).trim();
+  }
+  return args.trim();
+}
+
+/**
+ * Extract the first non-lifetime type argument from a generic argument string.
+ * Skips Rust lifetime parameters (e.g., `'a`, `'_`) to find the actual type.
+ *   "'_, User"       → "User"
+ *   "'a, User"       → "User"
+ *   "User, Error"    → "User"  (no lifetime — delegates to extractFirstGenericArg)
+ */
+function extractFirstTypeArg(args: string): string {
+  let remaining = args;
+  while (remaining) {
+    const first = extractFirstGenericArg(remaining);
+    if (!first.startsWith("'")) return first;
+    // Skip past this lifetime arg + the comma separator
+    const commaIdx = remaining.indexOf(',', first.length);
+    if (commaIdx < 0) return first; // only lifetimes — fall through
+    remaining = remaining.slice(commaIdx + 1).trim();
+  }
+  return args.trim();
+}
+
+const MAX_RETURN_TYPE_INPUT_LENGTH = 2048;
+const MAX_RETURN_TYPE_LENGTH = 512;
+
+export const extractReturnTypeName = (raw: string, depth = 0): string | undefined => {
+  if (depth > 10) return undefined;
+  if (raw.length > MAX_RETURN_TYPE_INPUT_LENGTH) return undefined;
+  let text = raw.trim();
+  if (!text) return undefined;
+
+  // Strip pointer/reference prefixes: *User, &User, &mut User
+  text = text.replace(/^[&*]+\s*(mut\s+)?/, '');
+
+  // Strip nullable suffix: User?
+  text = text.replace(/\?$/, '');
+
+  // Handle union types: "User | null" → "User"
+  if (text.includes('|')) {
+    const parts = text.split('|').map(p => p.trim()).filter(p =>
+      p !== 'null' && p !== 'undefined' && p !== 'void' && p !== 'None' && p !== 'nil'
+    );
+    if (parts.length === 1) text = parts[0];
+    else return undefined; // genuine union — too complex
+  }
+
+  // Handle generics: Promise<User> → unwrap if wrapper, else take base
+  const genericMatch = text.match(/^(\w+)\s*<(.+)>$/);
+  if (genericMatch) {
+    const [, base, args] = genericMatch;
+    if (WRAPPER_GENERICS.has(base)) {
+      // Take the first non-lifetime type argument, using bracket-balanced splitting
+      // so that nested generics like Result<User, Error> are not split at the inner
+      // comma. Lifetime parameters (Rust 'a, '_) are skipped.
+      const firstArg = extractFirstTypeArg(args);
+      return extractReturnTypeName(firstArg, depth + 1);
+    }
+    // Non-wrapper generic: return the base type (e.g., Map<K,V> → Map)
+    return PRIMITIVE_TYPES.has(base.toLowerCase()) ? undefined : base;
+  }
+
+  // Bare wrapper type without generic argument (e.g. Task, Promise, Option)
+  // should not produce a binding — these are meaningless without a type parameter
+  if (WRAPPER_GENERICS.has(text)) return undefined;
+
+  // Handle qualified names: models.User → User, Models::User → User, \App\Models\User → User
+  if (text.includes('::') || text.includes('.') || text.includes('\\')) {
+    text = text.split(/::|[.\\]/).pop()!;
+  }
+
+  // Final check: skip primitives
+  if (PRIMITIVE_TYPES.has(text) || PRIMITIVE_TYPES.has(text.toLowerCase())) return undefined;
+
+  // Must start with uppercase (class/type convention) or be a valid identifier
+  if (!/^[A-Z_]\w*$/.test(text)) return undefined;
+
+  // If the final extracted type name is too long, reject it
+  if (text.length > MAX_RETURN_TYPE_LENGTH) return undefined;
+
+  return text;
+};
+
+// ── Property declared-type extraction ────────────────────────────────────
+// Shared between parse-worker (worker path) and parsing-processor (sequential path).
+
+/**
+ * Extract the declared type of a property/field from its AST definition node.
+ * Handles cross-language patterns:
+ * - TypeScript: `name: Type` → type_annotation child
+ * - Java: `Type name` → type child on field_declaration
+ * - C#: `Type Name { get; set; }` → type child on property_declaration
+ * - Go: `Name Type` → type child on field_declaration
+ * - Kotlin: `var name: Type` → variable_declaration child with type field
+ *
+ * Returns the normalized type name, or undefined if no type can be extracted.
+ */
+export const extractPropertyDeclaredType = (definitionNode: SyntaxNode | null): string | undefined => {
+  if (!definitionNode) return undefined;
+
+  // Strategy 1: Look for a `type` or `type_annotation` named field
+  const typeNode = definitionNode.childForFieldName?.('type');
+  if (typeNode) {
+    const typeName = extractSimpleTypeName(typeNode);
+    if (typeName) return typeName;
+    // Fallback: use the raw text (for complex types like User[] or List<User>)
+    const text = typeNode.text?.trim();
+    if (text && text.length < 100) return text;
+  }
+
+  // Strategy 2: Walk children looking for type_annotation (TypeScript pattern)
+  for (let i = 0; i < definitionNode.childCount; i++) {
+    const child = definitionNode.child(i);
+    if (!child) continue;
+    if (child.type === 'type_annotation') {
+      // Type annotation has the actual type as a child
+      for (let j = 0; j < child.childCount; j++) {
+        const typeChild = child.child(j);
+        if (typeChild && typeChild.type !== ':') {
+          const typeName = extractSimpleTypeName(typeChild);
+          if (typeName) return typeName;
+          const text = typeChild.text?.trim();
+          if (text && text.length < 100) return text;
+        }
+      }
+    }
+  }
+
+  // Strategy 3: For Java field_declaration, the type is a sibling of variable_declarator
+  // AST: (field_declaration type: (type_identifier) declarator: (variable_declarator ...))
+  const parentDecl = definitionNode.parent;
+  if (parentDecl) {
+    const parentType = parentDecl.childForFieldName?.('type');
+    if (parentType) {
+      const typeName = extractSimpleTypeName(parentType);
+      if (typeName) return typeName;
+    }
+  }
+
+  // Strategy 4: Kotlin property_declaration — type is nested inside variable_declaration child
+  // AST: (property_declaration (variable_declaration (simple_identifier) ":" (user_type (type_identifier))))
+  // Kotlin's variable_declaration has NO named 'type' field — children are all positional.
+  for (let i = 0; i < definitionNode.childCount; i++) {
+    const child = definitionNode.child(i);
+    if (child?.type === 'variable_declaration') {
+      // Try named field first (works for other languages sharing this strategy)
+      const varType = child.childForFieldName?.('type');
+      if (varType) {
+        const typeName = extractSimpleTypeName(varType);
+        if (typeName) return typeName;
+        const text = varType.text?.trim();
+        if (text && text.length < 100) return text;
+      }
+      // Fallback: walk unnamed children for user_type / type_identifier (Kotlin)
+      for (let j = 0; j < child.namedChildCount; j++) {
+        const varChild = child.namedChild(j);
+        if (varChild && (varChild.type === 'user_type' || varChild.type === 'type_identifier'
+          || varChild.type === 'nullable_type' || varChild.type === 'generic_type')) {
+          const typeName = extractSimpleTypeName(varChild);
+          if (typeName) return typeName;
+        }
+      }
+    }
+  }
+
+  // Strategy 5: PHP @var PHPDoc — look for preceding comment with @var Type
+  // Handles pre-PHP-7.4 code: /** @var Address */ public $address;
+  const prevSibling = definitionNode.previousNamedSibling ?? definitionNode.parent?.previousNamedSibling;
+  if (prevSibling?.type === 'comment') {
+    const commentText = prevSibling.text;
+    const varMatch = commentText?.match(/@var\s+([A-Z][\w\\]*)/);
+    if (varMatch) {
+      // Strip namespace prefix: \App\Models\User → User
+      const raw = varMatch[1];
+      const base = raw.includes('\\') ? raw.split('\\').pop()! : raw;
+      if (base && /^[A-Z]\w*$/.test(base)) return base;
+    }
+  }
+
+  return undefined;
+};

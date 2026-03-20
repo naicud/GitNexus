@@ -2,6 +2,60 @@
 
 All notable changes to GitNexus will be documented in this file.
 
+## [1.4.7] - 2026-03-19
+
+### Added
+- **Phase 8 field/property type resolution** — ACCESSES edges with `declaredType` for field reads/writes (#354)
+- **Phase 9 return-type variable binding** — call-result variable binding across 11 languages (#379)
+  - `extractPendingAssignment` in per-language type extractors captures `let x = getUser()` patterns
+  - Unified fixpoint loop resolves variable types from function return types after initial walk
+  - Field access on call-result variables: `user.name` resolves `name` via return type's class definition
+  - Method-call-result chaining: `user.getProfile().bio` resolves through intermediate return types
+  - 22 new test fixtures covering call-result and method-chain binding across all supported languages
+  - Integration tests added for all 10 language resolver suites
+- **ACCESSES edge type** with read/write field access tracking (#372)
+- **Python `enumerate()` for-loop support** with nested tuple patterns (#356)
+- **MCP tool/resource descriptions** updated to reflect Phase 9 ACCESSES edge semantics and `declaredType` property
+
+### Fixed
+- **mcp**: server crashes under parallel tool calls (#326, #349)
+- **parsing**: undefined error on languages missing from call routers (#364)
+- **web**: add missing Kotlin entries to `Record<SupportedLanguages>` maps
+- **rust**: `await` expression unwrapping in `extractPendingAssignment` for async call-result binding
+- **tests**: update property edge and write access expectations across multiple language tests
+- **docs**: corrected stale "single-pass" claims in type-resolution-system.md to reflect walk+fixpoint architecture
+
+### Changed
+- **Upgrade `@ladybugdb/core` to 0.15.2** and remove segfault workarounds (#374)
+- **type-resolution-roadmap.md** overhauled — completed phases condensed to summaries, Phases 10–14 added with full engineering specs
+
+## [1.4.6] - 2026-03-18
+
+### Added
+- **Phase 7 type resolution** — return-aware loop inference for call-expression iterables (#341)
+  - `ReturnTypeLookup` interface with `lookupReturnType` / `lookupRawReturnType` split
+  - `ForLoopExtractorContext` context object replacing positional `(node, env)` signature
+  - Call-expression iterable resolution across 8 languages (TS/JS, Java, Kotlin, C#, Go, Rust, Python, PHP)
+  - PHP `$this->property` foreach via `@var` class property scan (Strategy C)
+  - PHP `function_call_expression` and `member_call_expression` foreach paths
+  - `extractElementTypeFromString` as canonical raw-string container unwrapper in `shared.ts`
+  - `extractReturnTypeName` deduplicated from `call-processor.ts` into `shared.ts` (137 lines removed)
+  - `SKIP_SUBTREE_TYPES` performance optimization with documented `template_string` exclusion
+  - `pendingCallResults` infrastructure (dormant — Phase 9 work)
+
+### Fixed
+- **impact**: return structured error + partial results instead of crashing (#345)
+- **impact**: add `HAS_METHOD` and `OVERRIDES` to `VALID_RELATION_TYPES` (#350)
+- **cli**: write tool output to stdout via fd 1 instead of stderr (#346)
+- **postinstall**: add permission fix for CLI and hook scripts (#348)
+- **workflow**: use prefixed temporary branch name for fork PRs to prevent overwriting real branches
+- **test**: add `--repo` to CLI e2e tool tests for multi-repo environment
+- **php**: add `declaration_list` type guard on `findClassPropertyElementType` fallback
+- **docs**: correct `pendingCallResults` description in roadmap and system docs
+
+### Chore
+- Add `.worktrees/` to `.gitignore`
+
 ## [1.4.5] - 2026-03-17
 
 ### Added

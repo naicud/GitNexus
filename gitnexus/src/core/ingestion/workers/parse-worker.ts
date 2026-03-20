@@ -1,91 +1,47 @@
 import { parentPort } from 'node:worker_threads';
+import Parser from 'tree-sitter';
+import JavaScript from 'tree-sitter-javascript';
+import TypeScript from 'tree-sitter-typescript';
+import Python from 'tree-sitter-python';
+import Java from 'tree-sitter-java';
+import C from 'tree-sitter-c';
+import CPP from 'tree-sitter-cpp';
+import CSharp from 'tree-sitter-c-sharp';
+import Go from 'tree-sitter-go';
+import Rust from 'tree-sitter-rust';
+import PHP from 'tree-sitter-php';
+import Ruby from 'tree-sitter-ruby';
 import { createRequire } from 'node:module';
 import { SupportedLanguages } from '../../../config/supported-languages.js';
 import { LANGUAGE_QUERIES } from '../tree-sitter-queries.js';
 import { getTreeSitterBufferSize, TREE_SITTER_MAX_BUFFER } from '../constants.js';
-import { preprocessCobolSource, extractCobolSymbolsWithRegex } from '../cobol-preprocessor.js';
+
+// tree-sitter-swift is an optionalDependency — may not be installed
+const _require = createRequire(import.meta.url);
+let Swift: any = null;
+try { Swift = _require('tree-sitter-swift'); } catch {}
+
+// tree-sitter-kotlin is an optionalDependency — may not be installed
+let Kotlin: any = null;
+try { Kotlin = _require('tree-sitter-kotlin'); } catch {}
 import {
   getLanguageFromFilename,
   getLanguageFromPath,
   FUNCTION_NODE_TYPES,
   extractFunctionName,
   isBuiltInOrNoise,
-  DEFINITION_CAPTURE_KEYS,
   getDefinitionNodeFromCaptures,
   findEnclosingClassId,
   extractMethodSignature,
   countCallArguments,
   inferCallForm,
   extractReceiverName,
-  findSiblingChild,
   extractReceiverNode,
-  CALL_EXPRESSION_TYPES,
-  extractCallChain
+  extractMixedChain,
+  type MixedChainStep,
 } from '../utils.js';
 import { buildTypeEnv } from '../type-env.js';
 import type { ConstructorBinding } from '../type-env.js';
-
-// ============================================================================
-// Lazy tree-sitter loading — skip native modules for COBOL-only repos
-// ============================================================================
-
-const _require = createRequire(import.meta.url);
-const isCobolOnlyMode = !!process.env.GITNEXUS_COBOL_DIRS;
-
-let treeSitterLoaded = false;
-let Parser: any = null;
-let parser: any = null;
-let languageMap: Record<string, any> = {};
-
-/** Load tree-sitter and all language grammars. No-op after first call. */
-const ensureTreeSitterLoaded = (): void => {
-  if (treeSitterLoaded) return;
-  treeSitterLoaded = true;
-
-  Parser = _require('tree-sitter');
-  parser = new Parser();
-
-  const JavaScript = _require('tree-sitter-javascript');
-  const TypeScript = _require('tree-sitter-typescript');
-  const Python = _require('tree-sitter-python');
-  const Java = _require('tree-sitter-java');
-  const C = _require('tree-sitter-c');
-  const CPP = _require('tree-sitter-cpp');
-  const CSharp = _require('tree-sitter-c-sharp');
-  const Go = _require('tree-sitter-go');
-  const Rust = _require('tree-sitter-rust');
-  const Kotlin = _require('tree-sitter-kotlin');
-  const PHP = _require('tree-sitter-php');
-  const Ruby = _require('tree-sitter-ruby');
-
-  let Swift: any = null;
-  try { Swift = _require('tree-sitter-swift'); } catch {}
-  let COBOL: any = null;
-  try { COBOL = _require('tree-sitter-cobol'); } catch {}
-
-  languageMap = {
-    [SupportedLanguages.JavaScript]: JavaScript,
-    [SupportedLanguages.TypeScript]: TypeScript.typescript,
-    [`${SupportedLanguages.TypeScript}:tsx`]: TypeScript.tsx,
-    [SupportedLanguages.Python]: Python,
-    [SupportedLanguages.Java]: Java,
-    [SupportedLanguages.C]: C,
-    [SupportedLanguages.CPlusPlus]: CPP,
-    [SupportedLanguages.CSharp]: CSharp,
-    [SupportedLanguages.Go]: Go,
-    [SupportedLanguages.Rust]: Rust,
-    [SupportedLanguages.Kotlin]: Kotlin,
-    [SupportedLanguages.PHP]: PHP.php_only,
-    [SupportedLanguages.Ruby]: Ruby,
-    ...(Swift ? { [SupportedLanguages.Swift]: Swift } : {}),
-    ...(COBOL ? { [SupportedLanguages.COBOL]: COBOL } : {}),
-  };
-};
-
-// For non-COBOL repos, load eagerly at module init (no behavior change)
-if (!isCobolOnlyMode) {
-  ensureTreeSitterLoaded();
-}
 import { isNodeExported } from '../export-detection.js';
 import { detectFrameworkFromAST } from '../framework-detection.js';
 import { typeConfigs } from '../type-extractors/index.js';
@@ -93,6 +49,9 @@ import { generateId } from '../../../lib/utils.js';
 import { extractNamedBindings } from '../named-binding-extraction.js';
 import { appendKotlinWildcard } from '../resolvers/index.js';
 import { callRouters } from '../call-routing.js';
+import { extractPropertyDeclaredType } from '../type-extractors/shared.js';
+import type { NodeLabel } from '../../graph/types.js';
+import { extractCobolSymbolsWithRegex } from '../cobol-preprocessor.js';
 
 // ============================================================================
 // Types for serializable results
@@ -120,7 +79,7 @@ interface ParsedRelationship {
   id: string;
   sourceId: string;
   targetId: string;
-  type: string;
+  type: 'DEFINES' | 'HAS_METHOD' | 'HAS_PROPERTY';
   confidence: number;
   reason: string;
 }
@@ -129,9 +88,10 @@ interface ParsedSymbol {
   filePath: string;
   name: string;
   nodeId: string;
-  type: string;
+  type: NodeLabel;
   parameterCount?: number;
   returnType?: string;
+  declaredType?: string;
   ownerId?: string;
 }
 
@@ -156,13 +116,26 @@ export interface ExtractedCall {
   /** Resolved type name of the receiver (e.g., 'User' for user.save() when user: User) */
   receiverTypeName?: string;
   /**
-   * Chained call names when the receiver is itself a call expression.
-   * For `svc.getUser().save()`, the `save` ExtractedCall gets receiverCallChain = ['getUser']
-   * with receiverName = 'svc'.  The chain is ordered outermost-last, e.g.:
-   *   `a.b().c().d()` → calledName='d', receiverCallChain=['b','c'], receiverName='a'
+   * Unified mixed chain when the receiver is a chain of field accesses and/or method calls.
+   * Steps are ordered base-first (innermost to outermost). Examples:
+   *   `svc.getUser().save()`        → chain=[{kind:'call',name:'getUser'}], receiverName='svc'
+   *   `user.address.save()`         → chain=[{kind:'field',name:'address'}], receiverName='user'
+   *   `svc.getUser().address.save()` → chain=[{kind:'call',name:'getUser'},{kind:'field',name:'address'}]
    * Length is capped at MAX_CHAIN_DEPTH (3).
    */
-  receiverCallChain?: string[];
+  receiverMixedChain?: MixedChainStep[];
+}
+
+export interface ExtractedAssignment {
+  filePath: string;
+  /** generateId of enclosing function, or generateId('File', filePath) for top-level */
+  sourceId: string;
+  /** Receiver text (e.g., 'user' from user.address = value) */
+  receiverText: string;
+  /** Property name being written (e.g., 'address') */
+  propertyName: string;
+  /** Resolved type name of the receiver if available from TypeEnv */
+  receiverTypeName?: string;
 }
 
 export interface ExtractedHeritage {
@@ -196,6 +169,7 @@ export interface ParseWorkerResult {
   symbols: ParsedSymbol[];
   imports: ExtractedImport[];
   calls: ExtractedCall[];
+  assignments: ExtractedAssignment[];
   heritage: ExtractedHeritage[];
   routes: ExtractedRoute[];
   constructorBindings: FileConstructorBindings[];
@@ -209,14 +183,32 @@ export interface ParseWorkerInput {
 }
 
 // ============================================================================
-// COBOL regex-only processing (tree-sitter hangs on pathological files)
+// Worker-local parser + language map
 // ============================================================================
 
-// ---------------------------------------------------------------------------
-// COBOL deep indexing helpers (shared by processCobolRegexOnly)
-// ---------------------------------------------------------------------------
+const parser = new Parser();
 
-/** Emit a node + DEFINES relationship + symbol entry in one call. */
+const languageMap: Record<string, any> = {
+  [SupportedLanguages.JavaScript]: JavaScript,
+  [SupportedLanguages.TypeScript]: TypeScript.typescript,
+  [`${SupportedLanguages.TypeScript}:tsx`]: TypeScript.tsx,
+  [SupportedLanguages.Python]: Python,
+  [SupportedLanguages.Java]: Java,
+  [SupportedLanguages.C]: C,
+  [SupportedLanguages.CPlusPlus]: CPP,
+  [SupportedLanguages.CSharp]: CSharp,
+  [SupportedLanguages.Go]: Go,
+  [SupportedLanguages.Rust]: Rust,
+  ...(Kotlin ? { [SupportedLanguages.Kotlin]: Kotlin } : {}),
+  [SupportedLanguages.PHP]: PHP.php_only,
+  [SupportedLanguages.Ruby]: Ruby,
+  ...(Swift ? { [SupportedLanguages.Swift]: Swift } : {}),
+};
+
+// ============================================================================
+// COBOL deep indexing helpers
+// ============================================================================
+
 const emitCobolNode = (
   result: ParseWorkerResult,
   label: string,
@@ -240,10 +232,9 @@ const emitCobolNode = (
     id: generateId('DEFINES', `${fileId}->${nodeId}`),
     sourceId: fileId, targetId: nodeId, type: 'DEFINES', confidence: 1.0, reason: '',
   });
-  result.symbols.push({ filePath, name, nodeId, type: label });
+  result.symbols.push({ filePath, name, nodeId, type: label as NodeLabel });
 };
 
-/** Emit a relationship (non-DEFINES). */
 const emitCobolRel = (
   result: ParseWorkerResult,
   type: string,
@@ -255,17 +246,13 @@ const emitCobolRel = (
   result.relationships.push({
     id: generateId(type, `${sourceId}->${targetId}`),
     sourceId, targetId, type, confidence, reason,
-  });
+  } as any);
 };
 
-/** Build a description string from key-value parts, skipping undefined values. */
-const buildDesc = (parts: Array<[string, string | number | undefined]>): string => {
-  return parts.filter(([, v]) => v !== undefined).map(([k, v]) => `${k}:${v}`).join(' ');
-};
+const buildDesc = (parts: Array<[string, string | number | undefined]>): string =>
+  parts.filter(([, v]) => v !== undefined).map(([k, v]) => `${k}:${v}`).join(' ');
 
-/** Get the node label for a data item based on its level number. */
-const dataItemLabel = (level: number): string =>
-  level === 1 || level === 0o1 ? 'Record' : 'Property';
+const dataItemLabel = (level: number): string => (level === 1 ? 'Record' : 'Property');
 
 const processCobolRegexOnly = (file: ParseWorkerInput, result: ParseWorkerResult): void => {
   const regexResults = extractCobolSymbolsWithRegex(file.content, file.path);
@@ -289,7 +276,7 @@ const processCobolRegexOnly = (file: ParseWorkerInput, result: ParseWorkerResult
       id: generateId('DEFINES', `${fileId}->${nodeId}`),
       sourceId: fileId, targetId: nodeId, type: 'DEFINES', confidence: 1.0, reason: '',
     });
-    result.symbols.push({ filePath: file.path, name: regexResults.programName, nodeId, type: 'Module' });
+    result.symbols.push({ filePath: file.path, name: regexResults.programName, nodeId, type: 'Module' as NodeLabel });
   }
 
   const moduleId = regexResults.programName
@@ -444,7 +431,7 @@ const processCobolRegexOnly = (file: ParseWorkerInput, result: ParseWorkerResult
     const desc = entry.parameters.length > 0 ? `entry params:${entry.parameters.join(',')}` : 'entry';
     emitCobolNode(result, 'Constructor', entryId, entry.name, file.path, entry.line, fileId, { description: desc });
     emitCobolRel(result, 'CONTAINS', moduleId, entryId);
-    result.symbols.push({ filePath: file.path, name: entry.name, nodeId: entryId, type: 'Constructor' });
+    result.symbols.push({ filePath: file.path, name: entry.name, nodeId: entryId, type: 'Constructor' as NodeLabel });
   }
 
   result.fileCount++;
@@ -464,7 +451,6 @@ const isLanguageAvailable = (language: SupportedLanguages, filePath: string): bo
 };
 
 const setLanguage = (language: SupportedLanguages, filePath: string): void => {
-  ensureTreeSitterLoaded();
   const key = language === SupportedLanguages.TypeScript && filePath.endsWith('.tsx')
     ? `${language}:tsx`
     : language;
@@ -498,7 +484,7 @@ const findEnclosingFunctionId = (node: any, filePath: string): string | null => 
 // Label detection from capture map
 // ============================================================================
 
-const getLabelFromCaptures = (captureMap: Record<string, any>): string | null => {
+const getLabelFromCaptures = (captureMap: Record<string, any>): NodeLabel | null => {
   // Skip imports (handled separately) and calls
   if (captureMap['import'] || captureMap['call']) return null;
   if (!captureMap['name']) return null;
@@ -542,6 +528,7 @@ const processBatch = (files: ParseWorkerInput[], onProgress?: (filesProcessed: n
     symbols: [],
     imports: [],
     calls: [],
+    assignments: [],
     heritage: [],
     routes: [],
     constructorBindings: [],
@@ -552,7 +539,7 @@ const processBatch = (files: ParseWorkerInput[], onProgress?: (filesProcessed: n
   // Group by language to minimize setLanguage calls
   const byLanguage = new Map<SupportedLanguages, ParseWorkerInput[]>();
   for (const file of files) {
-    const lang = getLanguageFromPath(file.path);
+    const lang = getLanguageFromFilename(file.path) || getLanguageFromPath(file.path);
     if (!lang) continue;
     let list = byLanguage.get(lang);
     if (!list) {
@@ -575,8 +562,7 @@ const processBatch = (files: ParseWorkerInput[], onProgress?: (filesProcessed: n
   } : undefined;
 
   for (const [language, langFiles] of byLanguage) {
-    // COBOL: skip tree-sitter entirely — external scanner hangs on ~5% of files
-    // with no way to timeout. Use regex-only extraction which is fast and reliable.
+    // COBOL: skip tree-sitter — use regex-only extraction
     if (language === SupportedLanguages.COBOL) {
       for (const file of langFiles) {
         processCobolRegexOnly(file, result);
@@ -1147,21 +1133,45 @@ const processFileGroup = (
     result.fileCount++;
     onFileProcessed?.();
 
-    // Build per-file type environment + constructor bindings in a single AST walk.
-    // Constructor bindings are verified against the SymbolTable in processCallsFromExtracted.
-    const typeEnv = buildTypeEnv(tree, language);
-    const callRouter = callRouters[language];
-
-    if (typeEnv.constructorBindings.length > 0) {
-      result.constructorBindings.push({ filePath: file.path, bindings: [...typeEnv.constructorBindings] });
-    }
-
     let matches;
     try {
       matches = query.matches(tree.rootNode);
     } catch (err) {
       console.warn(`Query execution failed for ${file.path}: ${err instanceof Error ? err.message : String(err)}`);
       continue;
+    }
+
+    // Pre-pass: extract heritage from query matches to build parentMap for buildTypeEnv.
+    // Heritage edges (EXTENDS/IMPLEMENTS) are created by heritage-processor which runs
+    // in PARALLEL with call-processor, so the graph edges don't exist when buildTypeEnv
+    // runs. This pre-pass makes parent class information available for type resolution.
+    const fileParentMap = new Map<string, string[]>();
+    for (const match of matches) {
+      const captureMap: Record<string, any> = {};
+      for (const c of match.captures) {
+        captureMap[c.name] = c.node;
+      }
+      if (captureMap['heritage.class'] && captureMap['heritage.extends']) {
+        const className: string = captureMap['heritage.class'].text;
+        const parentName: string = captureMap['heritage.extends'].text;
+        // Skip Go named fields (only anonymous fields are struct embedding)
+        const extendsNode = captureMap['heritage.extends'];
+        const fieldDecl = extendsNode.parent;
+        if (fieldDecl?.type === 'field_declaration' && fieldDecl.childForFieldName('name')) continue;
+        let parents = fileParentMap.get(className);
+        if (!parents) { parents = []; fileParentMap.set(className, parents); }
+        if (!parents.includes(parentName)) parents.push(parentName);
+      }
+    }
+
+    // Build per-file type environment + constructor bindings in a single AST walk.
+    // Constructor bindings are verified against the SymbolTable in processCallsFromExtracted.
+    const parentMap: ReadonlyMap<string, readonly string[]> = fileParentMap;
+    const typeEnv = buildTypeEnv(tree, language, { parentMap });
+    const callRouter = callRouters[language];
+
+    if (typeEnv.constructorBindings.length > 0) {
+      result.constructorBindings.push({ filePath: file.path, bindings: [...typeEnv.constructorBindings] });
     }
 
     for (const match of matches) {
@@ -1183,6 +1193,28 @@ const processFileGroup = (
           ...(namedBindings ? { namedBindings } : {}),
         });
         continue;
+      }
+
+      // Extract assignment sites (field write access)
+      if (captureMap['assignment'] && captureMap['assignment.receiver'] && captureMap['assignment.property']) {
+        const receiverText = captureMap['assignment.receiver'].text;
+        const propertyName = captureMap['assignment.property'].text;
+        if (receiverText && propertyName) {
+          const srcId = findEnclosingFunctionId(captureMap['assignment'], file.path)
+            || generateId('File', file.path);
+          let receiverTypeName: string | undefined;
+          if (typeEnv) {
+            receiverTypeName = typeEnv.lookup(receiverText, captureMap['assignment']) ?? undefined;
+          }
+          result.assignments.push({
+            filePath: file.path,
+            sourceId: srcId,
+            receiverText,
+            propertyName,
+            ...(receiverTypeName ? { receiverTypeName } : {}),
+          });
+        }
+        if (!captureMap['call']) continue;
       }
 
       // Extract call sites
@@ -1240,6 +1272,7 @@ const processFileGroup = (
                   nodeId,
                   type: 'Property',
                   ...(propEnclosingClassId ? { ownerId: propEnclosingClassId } : {}),
+                  ...(item.declaredType ? { declaredType: item.declaredType } : {}),
                 });
                 const fileId = generateId('File', file.path);
                 const relId = generateId('DEFINES', `${fileId}->${nodeId}`);
@@ -1253,10 +1286,10 @@ const processFileGroup = (
                 });
                 if (propEnclosingClassId) {
                   result.relationships.push({
-                    id: generateId('HAS_METHOD', `${propEnclosingClassId}->${nodeId}`),
+                    id: generateId('HAS_PROPERTY', `${propEnclosingClassId}->${nodeId}`),
                     sourceId: propEnclosingClassId,
                     targetId: nodeId,
-                    type: 'HAS_METHOD',
+                    type: 'HAS_PROPERTY',
                     confidence: 1.0,
                     reason: '',
                   });
@@ -1275,27 +1308,20 @@ const processFileGroup = (
             const callForm = inferCallForm(callNode, callNameNode);
             let receiverName = callForm === 'member' ? extractReceiverName(callNameNode) : undefined;
             let receiverTypeName = receiverName ? typeEnv.lookup(receiverName, callNode) : undefined;
-            let receiverCallChain: string[] | undefined;
+            let receiverMixedChain: MixedChainStep[] | undefined;
 
-            // When the receiver is a call_expression (e.g. svc.getUser().save()),
-            // extractReceiverName returns undefined because it refuses complex expressions.
-            // Instead, walk the receiver node to build a call chain for deferred resolution.
-            // We capture the base receiver name so processCallsFromExtracted can look it up
-            // from constructor bindings. receiverTypeName is intentionally left unset here —
-            // the chain resolver in processCallsFromExtracted needs the base type as input and
-            // produces the final receiver type as output.
+            // When the receiver is a complex expression (call chain, field chain, or mixed),
+            // extractReceiverName returns undefined. Walk the receiver node to build a unified
+            // mixed chain for deferred resolution in processCallsFromExtracted.
             if (callForm === 'member' && receiverName === undefined && !receiverTypeName) {
               const receiverNode = extractReceiverNode(callNameNode);
-              if (receiverNode && CALL_EXPRESSION_TYPES.has(receiverNode.type)) {
-                const extracted = extractCallChain(receiverNode);
-                if (extracted) {
-                  receiverCallChain = extracted.chain;
-                  // Set receiverName to the base object so Step 1 in processCallsFromExtracted
-                  // can resolve it via constructor bindings to a base type for the chain.
+              if (receiverNode) {
+                const extracted = extractMixedChain(receiverNode);
+                if (extracted && extracted.chain.length > 0) {
+                  receiverMixedChain = extracted.chain;
                   receiverName = extracted.baseReceiverName;
-                  // Also try the type environment immediately (covers explicitly-typed locals
-                  // and annotated parameters like `fn process(svc: &UserService)`).
-                  // This sets a base type that chain resolution (Step 2) will use as input.
+                  // Try the type environment immediately for the base receiver
+                  // (covers explicitly-typed locals and annotated parameters).
                   if (receiverName) {
                     receiverTypeName = typeEnv.lookup(receiverName, callNode);
                   }
@@ -1311,7 +1337,7 @@ const processFileGroup = (
               ...(callForm !== undefined ? { callForm } : {}),
               ...(receiverName !== undefined ? { receiverName } : {}),
               ...(receiverTypeName !== undefined ? { receiverTypeName } : {}),
-              ...(receiverCallChain !== undefined ? { receiverCallChain } : {}),
+              ...(receiverMixedChain !== undefined ? { receiverMixedChain } : {}),
             });
           }
         }
@@ -1361,6 +1387,23 @@ const processFileGroup = (
       const nodeLabel = getLabelFromCaptures(captureMap);
       if (!nodeLabel) continue;
 
+      // C/C++: @definition.function is broad and also matches inline class methods (inside
+      // a class/struct body). Those are already captured by @definition.method, so skip
+      // the duplicate Function entry to prevent double-indexing in globalIndex.
+      if (
+        (language === SupportedLanguages.CPlusPlus || language === SupportedLanguages.C) &&
+        nodeLabel === 'Function'
+      ) {
+        let ancestor = captureMap['definition.function']?.parent;
+        while (ancestor) {
+          if (ancestor.type === 'class_specifier' || ancestor.type === 'struct_specifier') {
+            break; // inside a class body — duplicate of @definition.method
+          }
+          ancestor = ancestor.parent;
+        }
+        if (ancestor) continue; // found a class/struct ancestor → skip
+      }
+
       const nameNode = captureMap['name'];
       // Synthesize name for constructors without explicit @name capture (e.g. Swift init)
       if (!nameNode && nodeLabel !== 'Constructor') continue;
@@ -1384,18 +1427,25 @@ const processFileGroup = (
 
       let parameterCount: number | undefined;
       let returnType: string | undefined;
+      let declaredType: string | undefined;
       if (nodeLabel === 'Function' || nodeLabel === 'Method' || nodeLabel === 'Constructor') {
         const sig = extractMethodSignature(definitionNode);
         parameterCount = sig.parameterCount;
         returnType = sig.returnType;
 
         // Language-specific return type fallback (e.g. Ruby YARD @return [Type])
-        if (!returnType && definitionNode) {
+        // Also upgrades uninformative AST types like PHP `array` with PHPDoc `@return User[]`
+        if ((!returnType || returnType === 'array' || returnType === 'iterable') && definitionNode) {
           const tc = typeConfigs[language as keyof typeof typeConfigs];
           if (tc?.extractReturnType) {
-            returnType = tc.extractReturnType(definitionNode);
+            const docReturn = tc.extractReturnType(definitionNode);
+            if (docReturn) returnType = docReturn;
           }
         }
+      } else if (nodeLabel === 'Property' && definitionNode) {
+        // Extract the declared type for property/field nodes.
+        // Walk the definition node for type annotation children.
+        declaredType = extractPropertyDeclaredType(definitionNode);
       }
 
       result.nodes.push({
@@ -1430,6 +1480,7 @@ const processFileGroup = (
         type: nodeLabel,
         ...(parameterCount !== undefined ? { parameterCount } : {}),
         ...(returnType !== undefined ? { returnType } : {}),
+        ...(declaredType !== undefined ? { declaredType } : {}),
         ...(enclosingClassId ? { ownerId: enclosingClassId } : {}),
       });
 
@@ -1444,13 +1495,14 @@ const processFileGroup = (
         reason: '',
       });
 
-      // ── HAS_METHOD: link method/constructor/property to enclosing class ──
+      // ── HAS_METHOD / HAS_PROPERTY: link member to enclosing class ──
       if (enclosingClassId) {
+        const memberEdgeType = nodeLabel === 'Property' ? 'HAS_PROPERTY' : 'HAS_METHOD';
         result.relationships.push({
-          id: generateId('HAS_METHOD', `${enclosingClassId}->${nodeId}`),
+          id: generateId(memberEdgeType, `${enclosingClassId}->${nodeId}`),
           sourceId: enclosingClassId,
           targetId: nodeId,
-          type: 'HAS_METHOD',
+          type: memberEdgeType,
           confidence: 1.0,
           reason: '',
         });
@@ -1472,7 +1524,7 @@ const processFileGroup = (
 /** Accumulated result across sub-batches */
 let accumulated: ParseWorkerResult = {
   nodes: [], relationships: [], symbols: [],
-  imports: [], calls: [], heritage: [], routes: [], constructorBindings: [], skippedLanguages: {}, fileCount: 0,
+  imports: [], calls: [], assignments: [], heritage: [], routes: [], constructorBindings: [], skippedLanguages: {}, fileCount: 0,
 };
 let cumulativeProcessed = 0;
 
@@ -1482,6 +1534,7 @@ const mergeResult = (target: ParseWorkerResult, src: ParseWorkerResult) => {
   target.symbols.push(...src.symbols);
   target.imports.push(...src.imports);
   target.calls.push(...src.calls);
+  target.assignments.push(...src.assignments);
   target.heritage.push(...src.heritage);
   target.routes.push(...src.routes);
   target.constructorBindings.push(...src.constructorBindings);
@@ -1509,7 +1562,7 @@ parentPort!.on('message', (msg: any) => {
     if (msg && msg.type === 'flush') {
       parentPort!.postMessage({ type: 'result', data: accumulated });
       // Reset for potential reuse
-      accumulated = { nodes: [], relationships: [], symbols: [], imports: [], calls: [], heritage: [], routes: [], constructorBindings: [], skippedLanguages: {}, fileCount: 0 };
+      accumulated = { nodes: [], relationships: [], symbols: [], imports: [], calls: [], assignments: [], heritage: [], routes: [], constructorBindings: [], skippedLanguages: {}, fileCount: 0 };
       cumulativeProcessed = 0;
       return;
     }
@@ -1527,5 +1580,3 @@ parentPort!.on('message', (msg: any) => {
     parentPort!.postMessage({ type: 'error', error: message });
   }
 });
-
-parentPort!.postMessage({ type: 'ready' });

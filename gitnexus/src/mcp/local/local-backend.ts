@@ -52,7 +52,7 @@ export const VALID_NODE_LABELS = new Set([
 ]);
 
 /** Valid relation types for impact analysis filtering */
-export const VALID_RELATION_TYPES = new Set(['CALLS', 'IMPORTS', 'EXTENDS', 'IMPLEMENTS']);
+export const VALID_RELATION_TYPES = new Set(['CALLS', 'IMPORTS', 'EXTENDS', 'IMPLEMENTS', 'HAS_METHOD', 'HAS_PROPERTY', 'OVERRIDES', 'ACCESSES']);
 
 /** Regex to detect write operations in user-supplied Cypher queries */
 export const CYPHER_WRITE_RE = /\b(CREATE|DELETE|SET|MERGE|REMOVE|DROP|ALTER|COPY|DETACH)\b/i;
@@ -985,7 +985,7 @@ export class LocalBackend {
     // Categorized incoming refs
     const incomingRows = await this.runParameterized(repo.id, `
       MATCH (caller)-[r:CodeRelation]->(n {id: $symId})
-      WHERE r.type IN ['CALLS', 'IMPORTS', 'EXTENDS', 'IMPLEMENTS']
+      WHERE r.type IN ['CALLS', 'IMPORTS', 'EXTENDS', 'IMPLEMENTS', 'HAS_METHOD', 'HAS_PROPERTY', 'OVERRIDES', 'ACCESSES']
       RETURN r.type AS relType, caller.id AS uid, caller.name AS name, caller.filePath AS filePath, labels(caller)[0] AS kind
       LIMIT 30
     `, { symId });
@@ -993,7 +993,7 @@ export class LocalBackend {
     // Categorized outgoing refs
     const outgoingRows = await this.runParameterized(repo.id, `
       MATCH (n {id: $symId})-[r:CodeRelation]->(target)
-      WHERE r.type IN ['CALLS', 'IMPORTS', 'EXTENDS', 'IMPLEMENTS']
+      WHERE r.type IN ['CALLS', 'IMPORTS', 'EXTENDS', 'IMPLEMENTS', 'HAS_METHOD', 'HAS_PROPERTY', 'OVERRIDES', 'ACCESSES']
       RETURN r.type AS relType, target.id AS uid, target.name AS name, target.filePath AS filePath, labels(target)[0] AS kind
       LIMIT 30
     `, { symId });
@@ -1417,6 +1417,29 @@ export class LocalBackend {
     includeTests?: boolean;
     minConfidence?: number;
   }): Promise<any> {
+    try {
+      return await this._impactImpl(repo, params);
+    } catch (err: any) {
+      // Return structured error instead of crashing (#321)
+      return {
+        error: (err instanceof Error ? err.message : String(err)) || 'Impact analysis failed',
+        target: { name: params.target },
+        direction: params.direction,
+        impactedCount: 0,
+        risk: 'UNKNOWN',
+        suggestion: 'The graph query failed — try gitnexus context <symbol> as a fallback',
+      };
+    }
+  }
+
+  private async _impactImpl(repo: RepoHandle, params: {
+    target: string;
+    direction: 'upstream' | 'downstream';
+    maxDepth?: number;
+    relationTypes?: string[];
+    includeTests?: boolean;
+    minConfidence?: number;
+  }): Promise<any> {
     await this.ensureInitialized(repo.id);
     
     const { target, direction } = params;
@@ -1445,6 +1468,7 @@ export class LocalBackend {
     const impacted: any[] = [];
     const visited = new Set<string>([symId]);
     let frontier = [symId];
+    let traversalComplete = true;
     
     for (let depth = 1; depth <= maxDepth && frontier.length > 0; depth++) {
       const nextFrontier: string[] = [];
@@ -1478,7 +1502,13 @@ export class LocalBackend {
             });
           }
         }
-      } catch (e) { logQueryError('impact:depth-traversal', e); }
+      } catch (e) {
+        logQueryError('impact:depth-traversal', e);
+        // Break out of depth loop on query failure but return partial results
+        // collected so far, rather than silently swallowing the error (#321)
+        traversalComplete = false;
+        break;
+      }
       
       frontier = nextFrontier;
     }
@@ -1561,6 +1591,7 @@ export class LocalBackend {
       direction,
       impactedCount: impacted.length,
       risk,
+      ...(!traversalComplete && { partial: true }),
       summary: {
         direct: directCount,
         processes_affected: processCount,

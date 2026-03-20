@@ -27,7 +27,7 @@ export type CallRouter = (
 const noRouting: CallRouter = () => null;
 
 /** Per-language call routing. noRouting = no special routing (normal call processing) */
-export const callRouters: Record<SupportedLanguages, CallRouter> = {
+export const callRouters = {
   [SupportedLanguages.JavaScript]: noRouting,
   [SupportedLanguages.TypeScript]: noRouting,
   [SupportedLanguages.Python]: noRouting,
@@ -42,7 +42,7 @@ export const callRouters: Record<SupportedLanguages, CallRouter> = {
   [SupportedLanguages.C]: noRouting,
   [SupportedLanguages.Ruby]: routeRubyCall,
   [SupportedLanguages.COBOL]: noRouting,
-};
+} satisfies Record<SupportedLanguages, CallRouter>;
 
 // ── Result types ────────────────────────────────────────────────────────────
 
@@ -66,6 +66,8 @@ export interface RubyPropertyItem {
   accessorType: RubyAccessorType;
   startLine: number;
   endLine: number;
+  /** YARD @return [Type] annotation preceding the attr_accessor call */
+  declaredType?: string;
 }
 
 // ── Pre-allocated singletons for common return values ────────────────────────
@@ -130,6 +132,25 @@ export function routeRubyCall(calledName: string, callNode: any): RubyCallRoutin
 
   // ── attr_accessor / attr_reader / attr_writer → property definitions ───
   if (calledName === 'attr_accessor' || calledName === 'attr_reader' || calledName === 'attr_writer') {
+    // Extract YARD @return [Type] from preceding comment (e.g. `# @return [Address]`)
+    let yardType: string | undefined;
+    let sibling = callNode.previousSibling;
+    while (sibling) {
+      if (sibling.type === 'comment') {
+        const match = /@return\s+\[([^\]]+)\]/.exec(sibling.text);
+        if (match) {
+          const raw = match[1].trim();
+          // Extract simple type name: "User", "Array<User>" → "User"
+          const simple = raw.match(/^([A-Z]\w*)/);
+          if (simple) yardType = simple[1];
+          break;
+        }
+      } else if (sibling.isNamed) {
+        break; // stop at non-comment named sibling
+      }
+      sibling = sibling.previousSibling;
+    }
+
     const items: RubyPropertyItem[] = [];
     const argList = callNode.childForFieldName?.('arguments');
     for (const arg of (argList?.children ?? [])) {
@@ -139,6 +160,7 @@ export function routeRubyCall(calledName: string, callNode: any): RubyCallRoutin
           accessorType: calledName as RubyAccessorType,
           startLine: arg.startPosition.row,
           endLine: arg.endPosition.row,
+          ...(yardType ? { declaredType: yardType } : {}),
         });
       }
     }

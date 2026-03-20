@@ -720,10 +720,10 @@ describe('Python static/classmethod class resolution (issue #289)', () => {
     const hasMethod = getRelationships(result, 'HAS_METHOD');
 
     const userServiceMethods = hasMethod.filter(e => e.source === 'UserService');
-    expect(userServiceMethods.length).toBeGreaterThanOrEqual(3); // find_user, create_user, from_config
+    expect(userServiceMethods.length).toBe(3); // find_user, create_user, from_config
 
     const adminServiceMethods = hasMethod.filter(e => e.source === 'AdminService');
-    expect(adminServiceMethods.length).toBeGreaterThanOrEqual(2); // find_user, delete_user
+    expect(adminServiceMethods.length).toBe(2); // find_user, delete_user
   });
 
   it('resolves unique static method calls (create_user, delete_user, from_config)', () => {
@@ -1169,5 +1169,308 @@ describe('Python member access iterable for-loop', () => {
       c.target === 'save' && c.source === 'process_repos' && c.targetFilePath?.includes('repo.py'),
     );
     expect(repoSave).toBeDefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Python for-loop with call_expression iterable: for user in get_users()
+// Phase 7.3: call_expression iterable resolution via ReturnTypeLookup
+// ---------------------------------------------------------------------------
+
+describe('Python for-loop call_expression iterable resolution (Phase 7.3)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'python-for-call-expr'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects User and Repo classes with competing save methods', () => {
+    expect(getNodesByLabel(result, 'Class')).toContain('User');
+    expect(getNodesByLabel(result, 'Class')).toContain('Repo');
+  });
+
+  it('resolves user.save() in for-loop over get_users() to User#save', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const userSave = calls.find(c =>
+      c.target === 'save' && c.source === 'process_users' && c.targetFilePath?.includes('models.py'),
+    );
+    expect(userSave).toBeDefined();
+  });
+
+  it('resolves repo.save() in for-loop over get_repos() to Repo#save', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const repoSave = calls.find(c =>
+      c.target === 'save' && c.source === 'process_repos' && c.targetFilePath?.includes('models.py'),
+    );
+    expect(repoSave).toBeDefined();
+  });
+
+  it('process_users resolves exactly one save call (no cross-binding)', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCalls = calls.filter(c =>
+      c.target === 'save' && c.source === 'process_users',
+    );
+    expect(saveCalls.length).toBe(1);
+  });
+
+  it('process_repos resolves exactly one save call (no cross-binding)', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCalls = calls.filter(c =>
+      c.target === 'save' && c.source === 'process_repos',
+    );
+    expect(saveCalls.length).toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// enumerate() for-loop: for i, k, v in enumerate(d.items())
+// ---------------------------------------------------------------------------
+
+describe('Python enumerate() for-loop resolution', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'python-enumerate-loop'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects User class with save method', () => {
+    expect(getNodesByLabel(result, 'Class')).toContain('User');
+  });
+
+  it('resolves v.save() in enumerate(users.items()) loop to User#save', () => {
+    // for i, k, v in enumerate(users.items()): v.save()
+    // v must bind to User (value type of dict[str, User]).
+    // Without enumerate() support, v is unbound → resolver emits 0 CALLS.
+    const calls = getRelationships(result, 'CALLS');
+    const userSave = calls.find(c =>
+      c.target === 'save' && c.source === 'process_users' && c.targetFilePath?.includes('user.py'),
+    );
+    expect(userSave).toBeDefined();
+  });
+
+  it('does NOT resolve v.save() to a non-User target', () => {
+    // i is the int index from enumerate — must not produce a spurious CALLS edge
+    const calls = getRelationships(result, 'CALLS');
+    const wrongSave = calls.find(c =>
+      c.target === 'save' && c.source === 'process_users' && !c.targetFilePath?.includes('user.py'),
+    );
+    expect(wrongSave).toBeUndefined();
+  });
+
+  it('resolves nested tuple pattern: for i, (k, v) in enumerate(d.items())', () => {
+    // Nested tuple_pattern inside pattern_list — must descend to find v
+    const calls = getRelationships(result, 'CALLS');
+    const userSave = calls.find(c =>
+      c.target === 'save' && c.source === 'process_nested_tuple' && c.targetFilePath?.includes('user.py'),
+    );
+    expect(userSave).toBeDefined();
+  });
+
+  it('resolves parenthesized tuple: for (i, u) in enumerate(users)', () => {
+    // tuple_pattern as top-level left node (not pattern_list)
+    const calls = getRelationships(result, 'CALLS');
+    const userSave = calls.find(c =>
+      c.target === 'save' && c.source === 'process_parenthesized_tuple' && c.targetFilePath?.includes('user.py'),
+    );
+    expect(userSave).toBeDefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 8: Field/property type resolution — annotated attribute capture
+// ---------------------------------------------------------------------------
+
+describe('Field type resolution (Python)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'python-field-types'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects classes: Address, User', () => {
+    expect(getNodesByLabel(result, 'Class')).toEqual(['Address', 'User']);
+  });
+
+  it('detects Property nodes for Python annotated attributes', () => {
+    const properties = getNodesByLabel(result, 'Property');
+    expect(properties).toContain('address');
+    expect(properties).toContain('name');
+    expect(properties).toContain('city');
+  });
+
+  it('emits HAS_PROPERTY edges linking attributes to classes', () => {
+    const propEdges = getRelationships(result, 'HAS_PROPERTY');
+    expect(propEdges.length).toBe(3);
+    expect(edgeSet(propEdges)).toContain('User → address');
+    expect(edgeSet(propEdges)).toContain('User → name');
+    expect(edgeSet(propEdges)).toContain('Address → city');
+  });
+
+  it('resolves user.address.save() → Address#save via field type', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCalls = calls.filter(e => e.target === 'save');
+    const addressSave = saveCalls.find(
+      e => e.source === 'process_user' && e.targetFilePath.includes('models'),
+    );
+    expect(addressSave).toBeDefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 8: Field type disambiguation — both User and Address have save()
+// ---------------------------------------------------------------------------
+
+describe('Field type disambiguation (Python)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'python-field-type-disambig'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects both User#save and Address#save', () => {
+    const methods = getNodesByLabel(result, 'Function');
+    const saveMethods = methods.filter(m => m === 'save');
+    expect(saveMethods.length).toBe(2);
+  });
+
+  it('resolves user.address.save() → Address#save (not User#save)', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCalls = calls.filter(
+      e => e.target === 'save' && e.source === 'process_user',
+    );
+    expect(saveCalls.length).toBe(1);
+    expect(saveCalls[0].targetFilePath).toContain('address');
+    expect(saveCalls[0].targetFilePath).not.toContain('user');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// ACCESSES write edges from assignment expressions
+// ---------------------------------------------------------------------------
+
+describe('Write access tracking (Python)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'python-write-access'),
+      () => {},
+    );
+  }, 60000);
+
+  it('emits ACCESSES write edges for attribute assignments', () => {
+    const accesses = getRelationships(result, 'ACCESSES');
+    const writes = accesses.filter(e => e.rel.reason === 'write');
+    expect(writes.length).toBe(2);
+    const nameWrite = writes.find(e => e.target === 'name');
+    const addressWrite = writes.find(e => e.target === 'address');
+    expect(nameWrite).toBeDefined();
+    expect(nameWrite!.source).toBe('update_user');
+    expect(addressWrite).toBeDefined();
+    expect(addressWrite!.source).toBe('update_user');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Call-result variable binding (Phase 9): user = get_user(); user.save()
+// ---------------------------------------------------------------------------
+
+describe('Python call-result variable binding (Tier 2b)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'python-call-result-binding'),
+      () => {},
+    );
+  }, 60000);
+
+  it('resolves user.save() to User#save via call-result binding', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCall = calls.find(c =>
+      c.target === 'save' && c.source === 'process_user' && c.targetFilePath.includes('models')
+    );
+    expect(saveCall).toBeDefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Method chain binding (Phase 9C): get_user() → .get_city() → .save()
+// ---------------------------------------------------------------------------
+
+describe('Python method chain binding via unified fixpoint (Phase 9C)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'python-method-chain-binding'),
+      () => {},
+    );
+  }, 60000);
+
+  it('resolves city.save() to City#save via method chain', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCall = calls.find(c =>
+      c.target === 'save' && c.source === 'process_chain' && c.targetFilePath.includes('models')
+    );
+    expect(saveCall).toBeDefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase B: Deep MRO — walkParentChain() at depth 2 (C→B→A)
+// greet() is defined on A, accessed via C. Tests BFS depth-2 parent traversal.
+// ---------------------------------------------------------------------------
+
+describe('Python grandparent method resolution via MRO (Phase B)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'python-grandparent-resolution'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects A, B, C, Greeting classes', () => {
+    const classes = getNodesByLabel(result, 'Class');
+    expect(classes).toContain('A');
+    expect(classes).toContain('B');
+    expect(classes).toContain('C');
+    expect(classes).toContain('Greeting');
+  });
+
+  it('emits EXTENDS edges: B→A, C→B', () => {
+    const extends_ = getRelationships(result, 'EXTENDS');
+    expect(edgeSet(extends_)).toContain('B → A');
+    expect(edgeSet(extends_)).toContain('C → B');
+  });
+
+  it('resolves c.greet().save() to Greeting#save via depth-2 MRO lookup', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCall = calls.find(c =>
+      c.target === 'save' && c.targetFilePath.includes('greeting'),
+    );
+    expect(saveCall).toBeDefined();
+  });
+
+  it('resolves c.greet() to A#greet (method found via MRO walk)', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const greetCall = calls.find(c =>
+      c.target === 'greet' && c.targetFilePath.includes('a.py'),
+    );
+    expect(greetCall).toBeDefined();
   });
 });

@@ -4,7 +4,7 @@
 import { describe, it, expect, beforeAll } from 'vitest';
 import path from 'path';
 import {
-  FIXTURES, getRelationships, getNodesByLabel,
+  FIXTURES, getRelationships, getNodesByLabel, edgeSet,
   runPipelineFromRepo, type PipelineResult,
 } from './helpers.js';
 
@@ -232,5 +232,125 @@ describe('JavaScript chained method call resolution', () => {
       c.targetFilePath?.includes('repo.js'),
     );
     expect(repoSave).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 8: Field/property type resolution — class field_definition capture
+// ---------------------------------------------------------------------------
+
+describe('Field type resolution (JavaScript)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'js-field-types'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects classes: Address, Config, User', () => {
+    expect(getNodesByLabel(result, 'Class')).toEqual(['Address', 'Config', 'User']);
+  });
+
+  it('detects Property nodes for JS class fields', () => {
+    const properties = getNodesByLabel(result, 'Property');
+    expect(properties).toContain('address');
+    expect(properties).toContain('name');
+    expect(properties).toContain('city');
+  });
+
+  it('emits HAS_PROPERTY edges linking fields to classes', () => {
+    const propEdges = getRelationships(result, 'HAS_PROPERTY');
+    expect(propEdges.length).toBe(4);
+    expect(edgeSet(propEdges)).toContain('User → address');
+    expect(edgeSet(propEdges)).toContain('User → name');
+    expect(edgeSet(propEdges)).toContain('Address → city');
+    expect(edgeSet(propEdges)).toContain('Config → DEFAULT');
+  });
+});
+
+// ACCESSES write edges from assignment expressions
+// ---------------------------------------------------------------------------
+
+describe('Write access tracking (JavaScript)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'js-write-access'),
+      () => {},
+    );
+  }, 60000);
+
+  it('emits ACCESSES write edges for field assignments', () => {
+    const accesses = getRelationships(result, 'ACCESSES');
+    const writes = accesses.filter(e => e.rel.reason === 'write');
+    expect(writes.length).toBe(2);
+    const fieldNames = writes.map(e => e.target);
+    expect(fieldNames).toContain('name');
+    expect(fieldNames).toContain('address');
+    const sources = writes.map(e => e.source);
+    expect(sources).toContain('updateUser');
+  });
+
+  it('write ACCESSES edges have confidence 1.0', () => {
+    const accesses = getRelationships(result, 'ACCESSES');
+    const writes = accesses.filter(e => e.rel.reason === 'write');
+    for (const edge of writes) {
+      expect(edge.rel.confidence).toBe(1.0);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase A: JS object destructuring — const { field } = receiver → fieldAccess PendingAssignment
+// ---------------------------------------------------------------------------
+
+describe('JavaScript object destructuring resolution (Phase A)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'js-object-destructuring'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects User, Address classes', () => {
+    const classes = getNodesByLabel(result, 'Class');
+    expect(classes).toContain('User');
+    expect(classes).toContain('Address');
+  });
+
+  it('resolves address.save() to Address#save via object destructuring', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCall = calls.find(c =>
+      c.target === 'save' && c.targetFilePath.includes('models'),
+    );
+    expect(saveCall).toBeDefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase A: Post-fixpoint for-loop replay — iterable resolved via callResult fixpoint
+// ---------------------------------------------------------------------------
+
+describe('JavaScript post-fixpoint for-loop replay (Phase A ex-9B)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'js-fixpoint-for-loop'),
+      () => {},
+    );
+  }, 60000);
+
+  it('resolves u.save() to User#save via post-fixpoint for-loop replay', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCall = calls.find(c =>
+      c.target === 'save' && c.source === 'process' && c.targetFilePath.includes('models'),
+    );
+    expect(saveCall).toBeDefined();
   });
 });

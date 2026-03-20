@@ -884,3 +884,301 @@ describe('Go map range type resolution (Tier 1c)', () => {
     expect(wrongSave).toBeUndefined();
   });
 });
+
+// ---------------------------------------------------------------------------
+// Go for-loop with call_expression iterable: for _, user := range GetUsers()
+// Phase 7.3: call_expression iterable resolution via ReturnTypeLookup
+// ---------------------------------------------------------------------------
+
+describe('Go for-loop call_expression iterable resolution (Phase 7.3)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'go-for-call-expr'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects User and Repo structs with competing Save methods', () => {
+    const structs = getNodesByLabel(result, 'Struct');
+    expect(structs).toContain('User');
+    expect(structs).toContain('Repo');
+    const methods = getNodesByLabel(result, 'Method');
+    expect(methods.filter(m => m === 'Save').length).toBe(2);
+  });
+
+  it('resolves user.Save() in range GetUsers() to User#Save', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const userSave = calls.find(c =>
+      c.target === 'Save' && c.source === 'processUsers' && c.targetFilePath?.includes('user.go'),
+    );
+    expect(userSave).toBeDefined();
+  });
+
+  it('resolves repo.Save() in range GetRepos() to Repo#Save', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const repoSave = calls.find(c =>
+      c.target === 'Save' && c.source === 'processRepos' && c.targetFilePath?.includes('repo.go'),
+    );
+    expect(repoSave).toBeDefined();
+  });
+
+  it('does NOT resolve user.Save() to Repo#Save (negative disambiguation)', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const wrongSave = calls.find(c =>
+      c.target === 'Save' && c.source === 'processUsers' && c.targetFilePath?.includes('repo.go'),
+    );
+    expect(wrongSave).toBeUndefined();
+  });
+
+  it('does NOT resolve repo.Save() to User#Save (negative disambiguation)', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const wrongSave = calls.find(c =>
+      c.target === 'Save' && c.source === 'processRepos' && c.targetFilePath?.includes('user.go'),
+    );
+    expect(wrongSave).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 8: Field/property type resolution (1-level)
+// ---------------------------------------------------------------------------
+
+describe('Field type resolution (Go)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'go-field-types'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects structs: Address, User', () => {
+    expect(getNodesByLabel(result, 'Struct')).toEqual(['Address', 'User']);
+  });
+
+  it('detects Property nodes for Go struct fields', () => {
+    const properties = getNodesByLabel(result, 'Property');
+    expect(properties).toContain('Address');
+    expect(properties).toContain('Name');
+    expect(properties).toContain('City');
+  });
+
+  it('emits HAS_PROPERTY edges linking struct fields to structs', () => {
+    const propEdges = getRelationships(result, 'HAS_PROPERTY');
+    expect(propEdges.length).toBe(3);
+    expect(edgeSet(propEdges)).toContain('User → Name');
+    expect(edgeSet(propEdges)).toContain('User → Address');
+    expect(edgeSet(propEdges)).toContain('Address → City');
+  });
+
+  it('resolves user.Address.Save() → Address#Save via field type', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCalls = calls.filter(e => e.target === 'Save');
+    const addressSave = saveCalls.find(
+      e => e.source === 'processUser' && e.targetFilePath.includes('models'),
+    );
+    expect(addressSave).toBeDefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 8A: Deep field chain resolution (3-level)
+// ---------------------------------------------------------------------------
+
+describe('Deep field chain resolution (Go)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'go-deep-field-chain'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects structs: Address, City, User', () => {
+    expect(getNodesByLabel(result, 'Struct')).toEqual(['Address', 'City', 'User']);
+  });
+
+  it('detects Property nodes for Go struct fields', () => {
+    const properties = getNodesByLabel(result, 'Property');
+    expect(properties).toContain('Address');
+    expect(properties).toContain('City');
+    expect(properties).toContain('ZipCode');
+  });
+
+  it('emits HAS_PROPERTY edges for nested type chain', () => {
+    const propEdges = getRelationships(result, 'HAS_PROPERTY');
+    expect(propEdges.length).toBe(5);
+    expect(edgeSet(propEdges)).toContain('User → Name');
+    expect(edgeSet(propEdges)).toContain('User → Address');
+    expect(edgeSet(propEdges)).toContain('Address → City');
+    expect(edgeSet(propEdges)).toContain('Address → Street');
+    expect(edgeSet(propEdges)).toContain('City → ZipCode');
+  });
+
+  it('resolves 2-level chain: user.Address.Save() → Address#Save', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCalls = calls.filter(e => e.target === 'Save' && e.source === 'processUser');
+    const addressSave = saveCalls.find(e => e.targetFilePath.includes('models'));
+    expect(addressSave).toBeDefined();
+  });
+
+  it('resolves 3-level chain: user.Address.City.GetName() → City#GetName', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const getNameCalls = calls.filter(e => e.target === 'GetName' && e.source === 'processUser');
+    const cityGetName = getNameCalls.find(e => e.targetFilePath.includes('models'));
+    expect(cityGetName).toBeDefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Mixed field+call chain resolution (Go)
+// ---------------------------------------------------------------------------
+
+describe('Mixed field+call chain resolution (Go)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'go-mixed-chain'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects structs: Address, City, User, UserService', () => {
+    expect(getNodesByLabel(result, 'Struct')).toEqual(['Address', 'City', 'User', 'UserService']);
+  });
+
+  it('detects Property nodes for mixed-chain fields', () => {
+    const properties = getNodesByLabel(result, 'Property');
+    expect(properties).toContain('City');
+    expect(properties).toContain('Address');
+  });
+
+  it('resolves call→field chain: svc.GetUser().Address.Save() → Address#Save', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCalls = calls.filter(e => e.target === 'Save' && e.source === 'processWithService');
+    expect(saveCalls.length).toBe(1);
+    expect(saveCalls[0].targetFilePath).toContain('models');
+  });
+
+  it('resolves field→call chain: user.GetAddress().City.GetName() → City#GetName', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const getNameCalls = calls.filter(e => e.target === 'GetName' && e.source === 'processWithUser');
+    expect(getNameCalls.length).toBe(1);
+    expect(getNameCalls[0].targetFilePath).toContain('models');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// ACCESSES write edges from assignment statements
+// ---------------------------------------------------------------------------
+
+describe('Write access tracking (Go)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'go-write-access'),
+      () => {},
+    );
+  }, 60000);
+
+  it('emits ACCESSES write edges for field assignments', () => {
+    const accesses = getRelationships(result, 'ACCESSES');
+    const writes = accesses.filter(e => e.rel.reason === 'write');
+    expect(writes.length).toBe(2);
+    const nameWrite = writes.find(e => e.target === 'Name');
+    const addressWrite = writes.find(e => e.target === 'Address');
+    expect(nameWrite).toBeDefined();
+    expect(nameWrite!.source).toBe('updateUser');
+    expect(addressWrite).toBeDefined();
+    expect(addressWrite!.source).toBe('updateUser');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Call-result variable binding (Phase 9): user := GetUser(); user.Save()
+// ---------------------------------------------------------------------------
+
+describe('Go call-result variable binding (Tier 2b)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'go-call-result-binding'),
+      () => {},
+    );
+  }, 60000);
+
+  it('resolves user.Save() to User#Save via call-result binding', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCall = calls.find(c =>
+      c.target === 'Save' && c.source === 'processUser' && c.targetFilePath.includes('models')
+    );
+    expect(saveCall).toBeDefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Method chain binding (Phase 9C): GetUser() → .Address → .GetCity() → .Save()
+// ---------------------------------------------------------------------------
+
+describe('Go method chain binding via unified fixpoint (Phase 9C)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'go-method-chain-binding'),
+      () => {},
+    );
+  }, 60000);
+
+  it('resolves city.Save() to City#Save via 3-step chain', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCall = calls.find(c =>
+      c.target === 'Save' && c.source === 'processChain' && c.targetFilePath.includes('models')
+    );
+    expect(saveCall).toBeDefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase B: Go inc_statement / dec_statement write access
+// obj.Field++ and obj.Field-- emit ACCESSES write edges
+// ---------------------------------------------------------------------------
+
+describe('Go inc/dec write access tracking (Phase B)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'go-inc-dec-write-access'),
+      () => {},
+    );
+  }, 60000);
+
+  it('emits ACCESSES write edge for Count++ in increment', () => {
+    const accesses = getRelationships(result, 'ACCESSES');
+    const writes = accesses.filter(e => e.rel.reason === 'write');
+    const countInc = writes.find(e => e.target === 'Count' && e.source === 'increment');
+    expect(countInc).toBeDefined();
+  });
+
+  it('emits ACCESSES write edge for Total++ in increment', () => {
+    const accesses = getRelationships(result, 'ACCESSES');
+    const writes = accesses.filter(e => e.rel.reason === 'write');
+    const totalInc = writes.find(e => e.target === 'Total' && e.source === 'increment');
+    expect(totalInc).toBeDefined();
+  });
+
+  it('emits ACCESSES write edge for Count-- in decrement', () => {
+    const accesses = getRelationships(result, 'ACCESSES');
+    const writes = accesses.filter(e => e.rel.reason === 'write');
+    const countDec = writes.find(e => e.target === 'Count' && e.source === 'decrement');
+    expect(countDec).toBeDefined();
+  });
+});

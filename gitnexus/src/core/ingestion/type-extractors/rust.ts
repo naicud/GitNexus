@@ -1,6 +1,6 @@
 import type { SyntaxNode } from '../utils.js';
-import type { LanguageTypeConfig, ParameterExtractor, TypeBindingExtractor, InitializerExtractor, ClassNameLookup, ConstructorBindingScanner, PendingAssignmentExtractor, PatternBindingExtractor, ForLoopExtractor } from './types.js';
-import { extractSimpleTypeName, extractVarName, hasTypeAnnotation, unwrapAwait, extractGenericTypeArgs, resolveIterableElementType, methodToTypeArgPosition, type TypeArgPosition } from './shared.js';
+import type { LanguageTypeConfig, ParameterExtractor, TypeBindingExtractor, InitializerExtractor, ClassNameLookup, ConstructorBindingScanner, PendingAssignmentExtractor, PendingAssignment, PatternBindingExtractor, ForLoopExtractor } from './types.js';
+import { extractSimpleTypeName, extractVarName, hasTypeAnnotation, unwrapAwait, extractGenericTypeArgs, resolveIterableElementType, methodToTypeArgPosition, extractElementTypeFromString, type TypeArgPosition } from './shared.js';
 
 const DECLARATION_NODE_TYPES: ReadonlySet<string> = new Set([
   'let_declaration',
@@ -95,7 +95,7 @@ const extractDeclaration: TypeBindingExtractor = (node: SyntaxNode, env: Map<str
 };
 
 /** Rust: let x = User::new(), let x = User::default(), or let x = User { ... } */
-const extractInitializer: InitializerExtractor = (node: SyntaxNode, env: Map<string, string>, _classNames: ClassNameLookup): void => {
+const extractInitializer: InitializerExtractor = (node: SyntaxNode, env: Map<string, string>, classNames: ClassNameLookup): void => {
   // Skip if there's an explicit type annotation — Tier 0 already handled it
   if (node.childForFieldName('type') !== null) return;
   const pattern = node.childForFieldName('pattern');
@@ -113,6 +113,13 @@ const extractInitializer: InitializerExtractor = (node: SyntaxNode, env: Map<str
     const typeName = rawType === 'Self' ? findEnclosingImplType(node) : rawType;
     const varName = extractVarName(pattern);
     if (varName && typeName) env.set(varName, typeName);
+    return;
+  }
+
+  // Unit struct instantiation: let svc = UserService; (bare identifier, no braces or call)
+  if (value.type === 'identifier' && classNames.has(value.text)) {
+    const varName = extractVarName(pattern);
+    if (varName) env.set(varName, value.text);
     return;
   }
 
@@ -182,15 +189,75 @@ const scanConstructorBinding: ConstructorBindingScanner = (node) => {
   return { varName: patternNode.text, calleeName };
 };
 
-/** Rust: let alias = u; → let_declaration with pattern + value fields */
+/** Rust: let alias = u; → let_declaration with pattern + value fields.
+ *  Also handles struct destructuring: `let Point { x, y } = p` → N fieldAccess items. */
 const extractPendingAssignment: PendingAssignmentExtractor = (node, scopeEnv) => {
   if (node.type !== 'let_declaration') return undefined;
   const pattern = node.childForFieldName('pattern');
   const value = node.childForFieldName('value');
   if (!pattern || !value) return undefined;
+
+  // Struct pattern destructuring: `let Point { x, y } = receiver`
+  // struct_pattern has a type child (struct name) and field_pattern children
+  if (pattern.type === 'struct_pattern' && value.type === 'identifier') {
+    const receiver = value.text;
+    const items: PendingAssignment[] = [];
+    for (let j = 0; j < pattern.namedChildCount; j++) {
+      const field = pattern.namedChild(j);
+      if (!field) continue;
+      if (field.type === 'field_pattern') {
+        // `Point { x: local_x }` → field_pattern with name + pattern children
+        const nameNode = field.childForFieldName('name');
+        const patNode = field.childForFieldName('pattern');
+        if (nameNode && patNode) {
+          const fieldName = nameNode.text;
+          const varName = extractVarName(patNode);
+          if (varName && !scopeEnv.has(varName)) {
+            items.push({ kind: 'fieldAccess', lhs: varName, receiver, field: fieldName });
+          }
+        } else if (nameNode) {
+          // Shorthand: `Point { x }` → field_pattern with only name (varName = fieldName)
+          const varName = nameNode.text;
+          if (!scopeEnv.has(varName)) {
+            items.push({ kind: 'fieldAccess', lhs: varName, receiver, field: varName });
+          }
+        }
+      }
+    }
+    if (items.length > 0) return items;
+    return undefined;
+  }
+
   const lhs = extractVarName(pattern);
   if (!lhs || scopeEnv.has(lhs)) return undefined;
-  if (value.type === 'identifier') return { lhs, rhs: value.text };
+  // Unwrap Rust .await: `let user = get_user().await` → call_expression
+  const unwrapped = unwrapAwait(value) ?? value;
+  if (unwrapped.type === 'identifier') return { kind: 'copy', lhs, rhs: unwrapped.text };
+  // field_expression RHS → fieldAccess (a.field)
+  if (unwrapped.type === 'field_expression') {
+    const obj = unwrapped.firstNamedChild;
+    const field = unwrapped.lastNamedChild;
+    if (obj?.type === 'identifier' && field?.type === 'field_identifier') {
+      return { kind: 'fieldAccess', lhs, receiver: obj.text, field: field.text };
+    }
+  }
+  // call_expression RHS → callResult (simple calls only)
+  if (unwrapped.type === 'call_expression') {
+    const funcNode = unwrapped.childForFieldName('function');
+    if (funcNode?.type === 'identifier') {
+      return { kind: 'callResult', lhs, callee: funcNode.text };
+    }
+  }
+  // method_call_expression RHS → methodCallResult (receiver.method())
+  if (unwrapped.type === 'method_call_expression') {
+    const obj = unwrapped.firstNamedChild;
+    if (obj?.type === 'identifier') {
+      const methodNode = unwrapped.childForFieldName('name') ?? unwrapped.namedChild(1);
+      if (methodNode?.type === 'field_identifier') {
+        return { kind: 'methodCallResult', lhs, receiver: obj.text, method: methodNode.text };
+      }
+    }
+  }
   return undefined;
 };
 
@@ -352,12 +419,7 @@ const findRustParamElementType = (iterableName: string, startNode: SyntaxNode, p
 
 /** Rust: for user in &users where users has a known container type.
  *  Unwraps reference_expression (&users, &mut users) to get the iterable name. */
-const extractForLoopBinding: ForLoopExtractor = (
-  node: SyntaxNode,
-  scopeEnv: Map<string, string>,
-  declarationTypeNodes: ReadonlyMap<string, SyntaxNode>,
-  scope: string,
-): void => {
+const extractForLoopBinding: ForLoopExtractor = (node, { scopeEnv, declarationTypeNodes, scope, returnTypeLookup }): void => {
   if (node.type !== 'for_expression') return;
 
   const patternNode = node.childForFieldName('pattern');
@@ -367,6 +429,7 @@ const extractForLoopBinding: ForLoopExtractor = (
   // Extract iterable name + method — may be &users, users, or users.iter()/keys()/values()
   let iterableName: string | undefined;
   let methodName: string | undefined;
+  let callExprElementType: string | undefined;
   if (valueNode.type === 'reference_expression') {
     const inner = valueNode.lastNamedChild;
     if (inner?.type === 'identifier') iterableName = inner.text;
@@ -376,25 +439,34 @@ const extractForLoopBinding: ForLoopExtractor = (
     const prop = valueNode.lastNamedChild;
     if (prop) iterableName = prop.text;
   } else if (valueNode.type === 'call_expression') {
-    // users.iter() → call_expression > function: field_expression > identifier + field_identifier
-    const fieldExpr = valueNode.childForFieldName('function');
-    if (fieldExpr?.type === 'field_expression') {
-      const obj = fieldExpr.firstNamedChild;
+    const funcExpr = valueNode.childForFieldName('function');
+    if (funcExpr?.type === 'field_expression') {
+      // users.iter() → field_expression > identifier + field_identifier
+      const obj = funcExpr.firstNamedChild;
       if (obj?.type === 'identifier') iterableName = obj.text;
       // Extract method name: iter, keys, values, into_iter, etc.
-      const field = fieldExpr.lastNamedChild;
+      const field = funcExpr.lastNamedChild;
       if (field?.type === 'field_identifier') methodName = field.text;
+    } else if (funcExpr?.type === 'identifier') {
+      // Direct function call: for user in get_users()
+      const rawReturn = returnTypeLookup.lookupRawReturnType(funcExpr.text);
+      if (rawReturn) callExprElementType = extractElementTypeFromString(rawReturn);
     }
   }
-  if (!iterableName) return;
+  if (!iterableName && !callExprElementType) return;
 
-  const containerTypeName = scopeEnv.get(iterableName);
-  const typeArgPos = methodToTypeArgPosition(methodName, containerTypeName);
-  const elementType = resolveIterableElementType(
-    iterableName, node, scopeEnv, declarationTypeNodes, scope,
-    extractRustElementTypeFromTypeNode, findRustParamElementType,
-    typeArgPos,
-  );
+  let elementType: string | undefined;
+  if (callExprElementType) {
+    elementType = callExprElementType;
+  } else {
+    const containerTypeName = scopeEnv.get(iterableName!);
+    const typeArgPos = methodToTypeArgPosition(methodName, containerTypeName);
+    elementType = resolveIterableElementType(
+      iterableName!, node, scopeEnv, declarationTypeNodes, scope,
+      extractRustElementTypeFromTypeNode, findRustParamElementType,
+      typeArgPos,
+    );
+  }
   if (!elementType) return;
 
   const loopVarName = extractVarName(patternNode);

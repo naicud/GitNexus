@@ -62,6 +62,10 @@ const extractParameter: ParameterExtractor = (node: SyntaxNode, env: Map<string,
   } else {
     nameNode = node.childForFieldName('name') ?? node.childForFieldName('pattern');
     typeNode = node.childForFieldName('type');
+    // Python typed_parameter: name is a positional child (identifier), not a named field
+    if (!nameNode && node.type === 'typed_parameter') {
+      nameNode = node.firstNamedChild?.type === 'identifier' ? node.firstNamedChild : null;
+    }
   }
 
   if (!nameNode || !typeNode) return;
@@ -220,6 +224,37 @@ const findPyParamElementType = (iterableName: string, startNode: SyntaxNode, pos
 };
 
 /**
+ * Extracts iterableName and methodName from a call expression like `data.items()`.
+ * Returns undefined if the call doesn't match the expected pattern.
+ */
+const extractMethodCall = (callNode: SyntaxNode): { iterableName: string; methodName?: string } | undefined => {
+  const fn = callNode.childForFieldName('function');
+  if (fn?.type !== 'attribute') return undefined;
+  const obj = fn.firstNamedChild;
+  if (obj?.type !== 'identifier') return undefined;
+  const method = fn.lastNamedChild;
+  const methodName = (method?.type === 'identifier' && method !== obj) ? method.text : undefined;
+  return { iterableName: obj.text, methodName };
+};
+
+/**
+ * Collects all identifier nodes from a pattern, descending into nested tuple_patterns.
+ * For `i, (k, v)` returns [i, k, v]. For `key, value` returns [key, value].
+ */
+const collectPatternIdentifiers = (pattern: SyntaxNode): SyntaxNode[] => {
+  const vars: SyntaxNode[] = [];
+  for (let i = 0; i < pattern.namedChildCount; i++) {
+    const child = pattern.namedChild(i);
+    if (child?.type === 'identifier') {
+      vars.push(child);
+    } else if (child?.type === 'tuple_pattern') {
+      vars.push(...collectPatternIdentifiers(child));
+    }
+  }
+  return vars;
+};
+
+/**
  * Python: for user in users: where users has a known container type annotation.
  *
  * AST node: `for_statement` with `left` (loop variable) and `right` (iterable).
@@ -228,55 +263,73 @@ const findPyParamElementType = (iterableName: string, startNode: SyntaxNode, pos
  *   1. declarationTypeNodes — raw type annotation AST node (covers stored container types)
  *   2. scopeEnv string — extractElementTypeFromString on the stored type
  *   3. AST walk — walks up to the enclosing function's parameters to read List[User] directly
+ *
+ * Also handles `enumerate(iterable)` — unwraps the outer call and skips the integer
+ * index variable so the value variable still resolves to the element type.
  */
-const extractForLoopBinding: ForLoopExtractor = (
-  node: SyntaxNode,
-  scopeEnv: Map<string, string>,
-  declarationTypeNodes: ReadonlyMap<string, SyntaxNode>,
-  scope: string,
-): void => {
+const extractForLoopBinding: ForLoopExtractor = (node, { scopeEnv, declarationTypeNodes, scope, returnTypeLookup }): void => {
   if (node.type !== 'for_statement') return;
 
-  // The iterable is the `right` field — may be identifier or call (data.items()/keys()/values()).
   const rightNode = node.childForFieldName('right');
   let iterableName: string | undefined;
   let methodName: string | undefined;
+  let callExprElementType: string | undefined;
+  let isEnumerate = false;
+
+  // Extract iterable info from the `right` field — may be identifier, attribute, or call.
   if (rightNode?.type === 'identifier') {
     iterableName = rightNode.text;
   } else if (rightNode?.type === 'attribute') {
     const prop = rightNode.lastNamedChild;
     if (prop) iterableName = prop.text;
   } else if (rightNode?.type === 'call') {
-    // data.items() → call > function: attribute > identifier('data') + identifier('items')
     const fn = rightNode.childForFieldName('function');
-    if (fn?.type === 'attribute') {
-      const obj = fn.firstNamedChild;
-      if (obj?.type === 'identifier') iterableName = obj.text;
-      // Extract method name: items, keys, values
-      const method = fn.lastNamedChild;
-      if (method?.type === 'identifier' && method !== obj) methodName = method.text;
+    if (fn?.type === 'identifier' && fn.text === 'enumerate') {
+      // enumerate(iterable) or enumerate(d.items()) — unwrap to inner iterable.
+      isEnumerate = true;
+      const innerArg = rightNode.childForFieldName('arguments')?.firstNamedChild;
+      if (innerArg?.type === 'identifier') {
+        iterableName = innerArg.text;
+      } else if (innerArg?.type === 'call') {
+        const extracted = extractMethodCall(innerArg);
+        if (extracted) ({ iterableName, methodName } = extracted);
+      }
+    } else if (fn?.type === 'attribute') {
+      // data.items() → call > function: attribute > identifier('data') + identifier('items')
+      const extracted = extractMethodCall(rightNode);
+      if (extracted) ({ iterableName, methodName } = extracted);
+    } else if (fn?.type === 'identifier') {
+      // Direct function call: for user in get_users() (Phase 7.3 — return-type path)
+      const rawReturn = returnTypeLookup.lookupRawReturnType(fn.text);
+      if (rawReturn) callExprElementType = extractElementTypeFromString(rawReturn);
     }
   }
-  if (!iterableName) return;
+  if (!iterableName && !callExprElementType) return;
 
-  const containerTypeName = scopeEnv.get(iterableName);
-  const typeArgPos = methodToTypeArgPosition(methodName, containerTypeName);
-  const elementType = resolveIterableElementType(
-    iterableName, node, scopeEnv, declarationTypeNodes, scope,
-    extractPyElementTypeFromAnnotation, findPyParamElementType,
-    typeArgPos,
-  );
+  let elementType: string | undefined;
+  if (callExprElementType) {
+    elementType = callExprElementType;
+  } else {
+    const containerTypeName = scopeEnv.get(iterableName!);
+    const typeArgPos = methodToTypeArgPosition(methodName, containerTypeName);
+    elementType = resolveIterableElementType(
+      iterableName!, node, scopeEnv, declarationTypeNodes, scope,
+      extractPyElementTypeFromAnnotation, findPyParamElementType,
+      typeArgPos,
+    );
+  }
   if (!elementType) return;
 
   // The loop variable is the `left` field — identifier or pattern_list.
   const leftNode = node.childForFieldName('left');
   if (!leftNode) return;
 
-  // Handle tuple unpacking: for key, value in data.items()
-  if (leftNode.type === 'pattern_list') {
-    const lastChild = leftNode.lastNamedChild;
-    if (lastChild?.type === 'identifier') {
-      scopeEnv.set(lastChild.text, elementType);
+  if (leftNode.type === 'pattern_list' || leftNode.type === 'tuple_pattern') {
+    // Tuple unpacking: `key, value` or `i, (k, v)` or `(k, v)` — bind the last identifier to element type.
+    // With enumerate, skip binding if there's only one var (just the index, no value to bind).
+    const vars = collectPatternIdentifiers(leftNode);
+    if (vars.length > 0 && (!isEnumerate || vars.length > 1)) {
+      scopeEnv.set(vars[vars.length - 1].text, elementType);
     }
     return;
   }
@@ -304,7 +357,30 @@ const extractPendingAssignment: PendingAssignmentExtractor = (node, scopeEnv) =>
   if (!left || !right) return undefined;
   const lhs = left.type === 'identifier' ? left.text : undefined;
   if (!lhs || scopeEnv.has(lhs)) return undefined;
-  if (right.type === 'identifier') return { lhs, rhs: right.text };
+  if (right.type === 'identifier') return { kind: 'copy', lhs, rhs: right.text };
+  // attribute RHS → fieldAccess (a.field)
+  if (right.type === 'attribute') {
+    const obj = right.firstNamedChild;
+    const field = right.lastNamedChild;
+    if (obj?.type === 'identifier' && field?.type === 'identifier' && obj !== field) {
+      return { kind: 'fieldAccess', lhs, receiver: obj.text, field: field.text };
+    }
+  }
+  // call RHS
+  if (right.type === 'call') {
+    const funcNode = right.childForFieldName('function');
+    if (funcNode?.type === 'identifier') {
+      return { kind: 'callResult', lhs, callee: funcNode.text };
+    }
+    // method call with receiver: call → function: attribute
+    if (funcNode?.type === 'attribute') {
+      const obj = funcNode.firstNamedChild;
+      const method = funcNode.lastNamedChild;
+      if (obj?.type === 'identifier' && method?.type === 'identifier' && obj !== method) {
+        return { kind: 'methodCallResult', lhs, receiver: obj.text, method: method.text };
+      }
+    }
+  }
   return undefined;
 };
 

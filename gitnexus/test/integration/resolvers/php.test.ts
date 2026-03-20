@@ -138,7 +138,7 @@ describe('PHP heritage & import resolution', () => {
 
   it('emits OVERRIDES edge for User overriding log (inherited from BaseModel)', () => {
     const overrides = getRelationships(result, 'OVERRIDES');
-    expect(overrides.length).toBeGreaterThanOrEqual(1);
+    expect(overrides.length).toBe(1);
     const logOverride = overrides.find(e => e.source === 'User' && e.target === 'log');
     expect(logOverride).toBeDefined();
   });
@@ -1106,5 +1106,325 @@ describe('PHP foreach with $this->property member access', () => {
       c.target === 'save' && c.source === 'processMembers' && c.targetFilePath?.includes('Repo'),
     );
     expect(wrongSave).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// PHP foreach with call_expression iterable: foreach (getUsers() as $user)
+// Phase 7.3: function_call_expression iterable resolution via ReturnTypeLookup
+// ---------------------------------------------------------------------------
+
+describe('PHP foreach call_expression iterable resolution (Phase 7.3)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'php-foreach-call-expr'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects User and Repo classes with competing save methods', () => {
+    expect(getNodesByLabel(result, 'Class')).toContain('User');
+    expect(getNodesByLabel(result, 'Class')).toContain('Repo');
+  });
+
+  it('resolves $user->save() in foreach over getUsers() to User#save', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const userSave = calls.find(c =>
+      c.target === 'save' && c.source === 'processUsers' && c.targetFilePath?.includes('User'),
+    );
+    expect(userSave).toBeDefined();
+  });
+
+  it('resolves $repo->save() in foreach over getRepos() to Repo#save', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const repoSave = calls.find(c =>
+      c.target === 'save' && c.source === 'processRepos' && c.targetFilePath?.includes('Repo'),
+    );
+    expect(repoSave).toBeDefined();
+  });
+
+  it('does NOT resolve $user->save() to Repo#save (negative)', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const wrongSave = calls.find(c =>
+      c.target === 'save' && c.source === 'processUsers' && c.targetFilePath?.includes('Repo'),
+    );
+    expect(wrongSave).toBeUndefined();
+  });
+
+  it('does NOT resolve $repo->save() to User#save (negative)', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const wrongSave = calls.find(c =>
+      c.target === 'save' && c.source === 'processRepos' && c.targetFilePath?.includes('User'),
+    );
+    expect(wrongSave).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 8: Field/property type resolution (1-level)
+// ---------------------------------------------------------------------------
+
+describe('Field type resolution (PHP)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'php-field-types'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects classes: Address, Service, User', () => {
+    expect(getNodesByLabel(result, 'Class')).toEqual(['Address', 'Service', 'User']);
+  });
+
+  it('detects Property nodes for PHP properties', () => {
+    const properties = getNodesByLabel(result, 'Property');
+    expect(properties).toContain('address');
+    expect(properties).toContain('name');
+    expect(properties).toContain('city');
+  });
+
+  it('emits HAS_PROPERTY edges linking properties to classes', () => {
+    const propEdges = getRelationships(result, 'HAS_PROPERTY');
+    expect(propEdges.length).toBe(3);
+  });
+
+  it('resolves $user->address->save() → Address#save via field type', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCalls = calls.filter(e => e.target === 'save');
+    const addressSave = saveCalls.find(
+      e => e.source === 'processUser' && e.targetFilePath.includes('Models'),
+    );
+    expect(addressSave).toBeDefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 8A: Deep field chain resolution (3-level)
+// ---------------------------------------------------------------------------
+
+describe('Deep field chain resolution (PHP)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'php-deep-field-chain'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects classes: Address, City, Service, User', () => {
+    expect(getNodesByLabel(result, 'Class')).toEqual(['Address', 'City', 'Service', 'User']);
+  });
+
+  it('detects Property nodes for PHP properties', () => {
+    const properties = getNodesByLabel(result, 'Property');
+    expect(properties).toContain('address');
+    expect(properties).toContain('city');
+    expect(properties).toContain('zipCode');
+  });
+
+  it('emits HAS_PROPERTY edges for nested type chain', () => {
+    const propEdges = getRelationships(result, 'HAS_PROPERTY');
+    expect(propEdges.length).toBe(5);
+    expect(edgeSet(propEdges)).toContain('User → name');
+    expect(edgeSet(propEdges)).toContain('User → address');
+    expect(edgeSet(propEdges)).toContain('Address → city');
+    expect(edgeSet(propEdges)).toContain('Address → street');
+    expect(edgeSet(propEdges)).toContain('City → zipCode');
+  });
+
+  it('resolves 2-level chain: $user->address->save() → Address#save', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCalls = calls.filter(e => e.target === 'save' && e.source === 'processUser');
+    const addressSave = saveCalls.find(e => e.targetFilePath.includes('Models'));
+    expect(addressSave).toBeDefined();
+  });
+
+  it('resolves 3-level chain: $user->address->city->getName() → City#getName', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const getNameCalls = calls.filter(e => e.target === 'getName' && e.source === 'processUser');
+    const cityGetName = getNameCalls.find(e => e.targetFilePath.includes('Models'));
+    expect(cityGetName).toBeDefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// PHP 8.0+ constructor promotion as property declarations
+// ---------------------------------------------------------------------------
+
+describe('PHP constructor promotion property capture', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'php-constructor-promotion-fields'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects classes: Address, Service, User', () => {
+    expect(getNodesByLabel(result, 'Class')).toEqual(['Address', 'Service', 'User']);
+  });
+
+  it('detects Property nodes for promoted constructor parameters', () => {
+    const properties = getNodesByLabel(result, 'Property');
+    expect(properties).toContain('name');
+    expect(properties).toContain('address');
+  });
+
+  it('emits HAS_PROPERTY edges for promoted parameters', () => {
+    const propEdges = getRelationships(result, 'HAS_PROPERTY');
+    expect(edgeSet(propEdges)).toContain('User → name');
+    expect(edgeSet(propEdges)).toContain('User → address');
+  });
+
+  it('resolves $user->address->save() → Address#save via promoted field type', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCalls = calls.filter(e => e.target === 'save');
+    const addressSave = saveCalls.find(
+      e => e.source === 'processUser' && e.targetFilePath.includes('Models'),
+    );
+    expect(addressSave).toBeDefined();
+  });
+});
+
+// ACCESSES write edges from assignment expressions
+// ---------------------------------------------------------------------------
+
+describe('Write access tracking (PHP)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'php-write-access'),
+      () => {},
+    );
+  }, 60000);
+
+  it('emits ACCESSES write edges for field assignments', () => {
+    const accesses = getRelationships(result, 'ACCESSES');
+    const writes = accesses.filter(e => e.rel.reason === 'write');
+    expect(writes.length).toBe(3);
+    const nameWrite = writes.find(e => e.target === 'name');
+    const addressWrite = writes.find(e => e.target === 'address');
+    const countWrite = writes.find(e => e.target === 'count');
+    expect(nameWrite).toBeDefined();
+    expect(nameWrite!.source).toBe('updateUser');
+    expect(addressWrite).toBeDefined();
+    expect(addressWrite!.source).toBe('updateUser');
+    expect(countWrite).toBeDefined();
+    expect(countWrite!.source).toBe('updateUser');
+  });
+
+  it('emits ACCESSES write edge for static property assignment', () => {
+    const accesses = getRelationships(result, 'ACCESSES');
+    const writes = accesses.filter(e => e.rel.reason === 'write');
+    const countWrite = writes.find(e => e.target === 'count');
+    expect(countWrite).toBeDefined();
+    expect(countWrite!.source).toBe('updateUser');
+  });
+
+  it('write ACCESSES edges have confidence 1.0', () => {
+    const accesses = getRelationships(result, 'ACCESSES');
+    const writes = accesses.filter(e => e.rel.reason === 'write');
+    for (const edge of writes) {
+      expect(edge.rel.confidence).toBe(1.0);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Call-result variable binding (Phase 9): $user = getUser(); $user->save()
+// ---------------------------------------------------------------------------
+
+describe('PHP call-result variable binding (Tier 2b)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'php-call-result-binding'),
+      () => {},
+    );
+  }, 60000);
+
+  it('resolves $user->save() to User#save via call-result binding', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCall = calls.find(c =>
+      c.target === 'save' && c.source === 'processUser' && c.targetFilePath.includes('App')
+    );
+    expect(saveCall).toBeDefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Method chain binding (Phase 9C): getUser() → ->getCity() → ->save()
+// ---------------------------------------------------------------------------
+
+describe('PHP method chain binding via unified fixpoint (Phase 9C)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'php-method-chain-binding'),
+      () => {},
+    );
+  }, 60000);
+
+  it('resolves $city->save() to City#save via method chain', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCall = calls.find(c =>
+      c.target === 'save' && c.source === 'processChain' && c.targetFilePath.includes('App')
+    );
+    expect(saveCall).toBeDefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase B: Deep MRO — walkParentChain() at depth 2 (C→B→A)
+// greet() is defined on A, accessed via C. Tests BFS depth-2 parent traversal.
+// ---------------------------------------------------------------------------
+
+describe('PHP grandparent method resolution via MRO (Phase B)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'php-grandparent-resolution'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects A, B, C, Greeting classes', () => {
+    const classes = getNodesByLabel(result, 'Class');
+    expect(classes).toContain('A');
+    expect(classes).toContain('B');
+    expect(classes).toContain('C');
+    expect(classes).toContain('Greeting');
+  });
+
+  it('emits EXTENDS edges: B→A, C→B', () => {
+    const extends_ = getRelationships(result, 'EXTENDS');
+    expect(edgeSet(extends_)).toContain('B → A');
+    expect(edgeSet(extends_)).toContain('C → B');
+  });
+
+  it('resolves $c->greet()->save() to Greeting#save via depth-2 MRO lookup', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCall = calls.find(c =>
+      c.target === 'save' && c.targetFilePath.includes('Greeting'),
+    );
+    expect(saveCall).toBeDefined();
+  });
+
+  it('resolves $c->greet() to A#greet (method found via MRO walk)', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const greetCall = calls.find(c =>
+      c.target === 'greet' && c.targetFilePath.includes('A.php'),
+    );
+    expect(greetCall).toBeDefined();
   });
 });

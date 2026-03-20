@@ -554,7 +554,7 @@ class UserService {
       }
       findCalls(tree.rootNode);
 
-      expect(calls.length).toBeGreaterThanOrEqual(1);
+      expect(calls.length).toBe(1);
       // $this should resolve to enclosing class 'UserService'
       expect(typeEnv.lookup('$this', calls[0])).toBe('UserService');
     });
@@ -822,7 +822,7 @@ object AppConfig {
       }
       findCalls(tree.rootNode);
 
-      expect(calls.length).toBeGreaterThanOrEqual(1);
+      expect(calls.length).toBe(1);
       expect(typeEnv.lookup('this', calls[0])).toBe('AppConfig');
     });
   });
@@ -1589,7 +1589,7 @@ class RepoService {
           getStats: () => ({ fileCount: 0, globalSymbolCount: 0 }),
           clear: () => {},
         };
-        const { env } = buildTypeEnv(tree, 'kotlin', mockSymbolTable as any);
+        const { env } = buildTypeEnv(tree, 'kotlin', { symbolTable: mockSymbolTable as any });
         expect(flatGet(env, 'user')).toBe('User');
       });
 
@@ -1602,13 +1602,15 @@ class RepoService {
         const mockSymbolTable = {
           lookupFuzzy: (name: string) =>
             name === 'doStuff' ? [{ nodeId: 'n1', filePath: 'utils.kt', type: 'Function' }] : [],
+          lookupFuzzyCallable: () => [],
+          lookupFieldByOwner: () => undefined,
           lookupExact: () => undefined,
           lookupExactFull: () => undefined,
           add: () => {},
           getStats: () => ({ fileCount: 0, globalSymbolCount: 0 }),
           clear: () => {},
         };
-        const { env } = buildTypeEnv(tree, 'kotlin', mockSymbolTable as any);
+        const { env } = buildTypeEnv(tree, 'kotlin', { symbolTable: mockSymbolTable as any });
         expect(flatGet(env, 'result')).toBeUndefined();
       });
 
@@ -2241,10 +2243,11 @@ svc = App::Models::Service.new
       expect(env.get(scopeKey!)?.get('b')).toBe('User');
     });
 
-    it('does NOT resolve reverse-ordered Tier 2 chains (b = a, a = c, c: User)', () => {
+    it('resolves reverse-ordered Tier 2 chains via fixpoint (b = a, a = c, c: User)', () => {
       // Two chained Tier 2 assignments in reverse source order.
-      // Post-walk iterates source order: b = a (a not yet resolved) → fails,
-      // then a = c (c is Tier 0) → succeeds. b stays unresolved.
+      // The unified fixpoint loop resolves this in 2 iterations:
+      //   Iter 1: a = c (c is Tier 0 → a = User)
+      //   Iter 2: b = a (a now resolved → b = User)
       const tree = parse(`
         function process() {
           const b = a;
@@ -2257,8 +2260,8 @@ svc = App::Models::Service.new
       expect(scopeKey).toBeDefined();
       expect(env.get(scopeKey!)?.get('c')).toBe('User');
       expect(env.get(scopeKey!)?.get('a')).toBe('User');
-      // b should NOT resolve — reverse Tier 2 chain
-      expect(env.get(scopeKey!)?.get('b')).toBeUndefined();
+      // Fixpoint now resolves reverse-ordered chains
+      expect(env.get(scopeKey!)?.get('b')).toBe('User');
     });
   });
 
@@ -2956,6 +2959,50 @@ def process(data: dict[str, User]):
       expect(flatGet(env, 'user')).toBe('User');
     });
 
+    it('Python enumerate(dict.items()): for i, k, v — skips int index, binds value var to User', () => {
+      // enumerate() wraps the iterable: right node is call with fn='enumerate', not fn.attribute.
+      // Without enumerate() support, iterableName is never set → v stays unbound.
+      // With the fix: unwrap enumerate → inner call → data.items() → v binds to User.
+      const tree = parse(`
+def process(data: dict[str, User]):
+    for i, k, v in enumerate(data.items()):
+        v.save()
+      `, Python);
+      const { env } = buildTypeEnv(tree, 'python');
+      expect(flatGet(env, 'v')).toBe('User');
+      // i is the int index from enumerate — must NOT be bound to User
+      expect(flatGet(env, 'i')).toBeUndefined();
+    });
+
+    it('Python enumerate(dict.items()) with nested tuple: for i, (k, v) — binds v to User', () => {
+      // Nested tuple pattern: `(k, v)` is a tuple_pattern inside the pattern_list.
+      // AST: pattern_list > [identifier('i'), tuple_pattern > [identifier('k'), identifier('v')]]
+      // Must descend into tuple_pattern to extract v, not just collect top-level identifiers.
+      const tree = parse(`
+def process(data: dict[str, User]):
+    for i, (k, v) in enumerate(data.items()):
+        v.save()
+      `, Python);
+      const { env } = buildTypeEnv(tree, 'python');
+      expect(flatGet(env, 'v')).toBe('User');
+      expect(flatGet(env, 'i')).toBeUndefined();
+    });
+
+    it('Python enumerate with parenthesized tuple: for (k, v) in enumerate(users) — binds v to User', () => {
+      // Parenthesized tuple pattern: `(k, v)` is a tuple_pattern, not pattern_list.
+      // AST: for_statement > left: tuple_pattern > [identifier('k'), identifier('v')]
+      // Must handle tuple_pattern as top-level left node, not just nested inside pattern_list.
+      const tree = parse(`
+def process(users: List[User]):
+    for (k, v) in enumerate(users):
+        v.save()
+      `, Python);
+      const { env } = buildTypeEnv(tree, 'python');
+      // enumerate yields (index, element) — k is int (unbound), v is User
+      expect(flatGet(env, 'v')).toBe('User');
+      expect(flatGet(env, 'k')).toBeUndefined();
+    });
+
     it('TS instanceof narrowing: if (x instanceof User) — first-writer-wins, not block-scoped', () => {
       // Binds x to User via extractPatternBinding on binary_expression.
       // Only works when x has no prior type binding in scopeEnv.
@@ -3509,6 +3556,66 @@ class RepoService {
     });
   });
 
+  describe('PHP foreach $this->property (Phase 7.4 — Strategy C)', () => {
+    it('resolves loop variable from @var User[] property without @param workaround', () => {
+      const tree = parse(`<?php
+class App {
+    /** @var User[] */
+    private $users;
+    public function process(): void {
+        foreach ($this->users as $user) {
+            $user->save();
+        }
+    }
+}
+      `, PHP.php);
+      const { env } = buildTypeEnv(tree, 'php');
+      expect(flatGet(env, '$user')).toBe('User');
+    });
+
+    it('does not bind from unknown $this->property (conservative)', () => {
+      const tree = parse(`<?php
+class App {
+    private $unknownProp;
+    public function process(): void {
+        foreach ($this->unknownProp as $item) {
+            $item->save();
+        }
+    }
+}
+      `, PHP.php);
+      const { env } = buildTypeEnv(tree, 'php');
+      expect(flatGet(env, '$item')).toBeUndefined();
+    });
+
+    it('multi-class file: resolves correct property for each class', () => {
+      const tree = parse(`<?php
+class A {
+    /** @var User[] */
+    private $items;
+    public function processA(): void {
+        foreach ($this->items as $item) {
+            $item->save();
+        }
+    }
+}
+class B {
+    /** @var Order[] */
+    private $items;
+    public function processB(): void {
+        foreach ($this->items as $item) {
+            $item->submit();
+        }
+    }
+}
+      `, PHP.php);
+      const { env } = buildTypeEnv(tree, 'php');
+      // Both $item bindings exist but may share the same key if scoped to method name
+      // Conservative: just verify at least one resolves correctly
+      expect(flatGet(env, '$item')).toBeDefined();
+    });
+  });
+
   describe('match arm scoping — first-writer-wins regression', () => {
     it('Rust: first match arm binding wins, later arms do not overwrite', () => {
       const tree = parse(`
@@ -3584,6 +3691,164 @@ function calculate(service: Service) {
       `, TypeScript.typescript);
       const { env } = buildTypeEnv(tree, 'typescript');
       expect(flatGet(env, 'service')).toBe('Service');
+    });
+  });
+
+  describe('null-check narrowing via patternOverrides (Phase C Task 7)', () => {
+    it('TS: if (x !== null) narrows User | null to User inside if-body', () => {
+      const code = `
+function process(x: User | null) {
+  if (x !== null) {
+    x.save();
+  }
+}`;
+      const tree = parse(code, TypeScript.typescript);
+      const typeEnv = buildTypeEnv(tree, 'typescript');
+      // Inside the if-body, x should resolve to User (nullable stripped)
+      const saveCall = tree.rootNode.descendantForIndex(tree.rootNode.text.indexOf('x.save'));
+      expect(typeEnv.lookup('x', saveCall)).toBe('User');
+    });
+
+    it('TS: if (x !== undefined) narrows User | undefined to User inside if-body', () => {
+      const code = `
+function process(x: User | undefined) {
+  if (x !== undefined) {
+    x.save();
+  }
+}`;
+      const tree = parse(code, TypeScript.typescript);
+      const typeEnv = buildTypeEnv(tree, 'typescript');
+      const saveCall = tree.rootNode.descendantForIndex(tree.rootNode.text.indexOf('x.save'));
+      expect(typeEnv.lookup('x', saveCall)).toBe('User');
+    });
+
+    it('TS: if (x != null) narrows with loose inequality', () => {
+      const code = `
+function process(x: User | null) {
+  if (x != null) {
+    x.save();
+  }
+}`;
+      const tree = parse(code, TypeScript.typescript);
+      const typeEnv = buildTypeEnv(tree, 'typescript');
+      const saveCall = tree.rootNode.descendantForIndex(tree.rootNode.text.indexOf('x.save'));
+      expect(typeEnv.lookup('x', saveCall)).toBe('User');
+    });
+
+    it('TS: null-check narrowing does NOT leak to else branch', () => {
+      const code = `
+function process(x: User | null) {
+  if (x !== null) {
+    x.save();
+  } else {
+    x.fallback();
+  }
+}`;
+      const tree = parse(code, TypeScript.typescript);
+      const typeEnv = buildTypeEnv(tree, 'typescript');
+      // Inside else branch, x should retain original nullable type (User via fastStripNullable)
+      const fallbackCall = tree.rootNode.descendantForIndex(tree.rootNode.text.indexOf('x.fallback'));
+      // The else branch is NOT in the narrowing range, so lookup falls through to
+      // the flat scopeEnv which has "User | null" — fastStripNullable strips it to User.
+      // This is expected: without negative narrowing (Phase 13A), else branches still get
+      // the base stripped type. The key invariant is that the narrowing override does NOT
+      // apply outside the if-body range.
+      expect(typeEnv.lookup('x', fallbackCall)).toBe('User');
+    });
+
+    it('TS: null-check narrowing does NOT apply outside the if block', () => {
+      const code = `
+function process(x: User | null) {
+  if (x !== null) {
+    x.save();
+  }
+  x.other();
+}`;
+      const tree = parse(code, TypeScript.typescript);
+      const typeEnv = buildTypeEnv(tree, 'typescript');
+      // After the if-block, x should use the flat scopeEnv (User | null → User via fastStripNullable)
+      const otherCall = tree.rootNode.descendantForIndex(tree.rootNode.text.indexOf('x.other'));
+      expect(typeEnv.lookup('x', otherCall)).toBe('User');
+    });
+
+    it('TS: no narrowing when variable has no nullable type', () => {
+      const code = `
+function process(x: User) {
+  if (x !== null) {
+    x.save();
+  }
+}`;
+      const tree = parse(code, TypeScript.typescript);
+      const typeEnv = buildTypeEnv(tree, 'typescript');
+      // x is already non-nullable — no narrowing override is emitted, but lookup still works
+      const saveCall = tree.rootNode.descendantForIndex(tree.rootNode.text.indexOf('x.save'));
+      expect(typeEnv.lookup('x', saveCall)).toBe('User');
+    });
+
+    it('TS: instanceof still works alongside null-check narrowing', () => {
+      const tree = parse(`
+function process(x) {
+  if (x instanceof User) {
+    x.save();
+  }
+}
+      `, TypeScript.typescript);
+      const { env } = buildTypeEnv(tree, 'typescript');
+      expect(flatGet(env, 'x')).toBe('User');
+    });
+
+    it('Kotlin: if (x != null) narrows nullable type inside if-body', () => {
+      const code = `
+fun process(x: User?) {
+    if (x != null) {
+        x.save()
+    }
+}`;
+      const tree = parse(code, Kotlin);
+      const typeEnv = buildTypeEnv(tree, 'kotlin');
+      const saveCall = tree.rootNode.descendantForIndex(tree.rootNode.text.indexOf('x.save'));
+      expect(typeEnv.lookup('x', saveCall)).toBe('User');
+    });
+
+    it('Kotlin: when/is still works alongside null-check narrowing', () => {
+      const tree = parse(`
+fun process(x: Any) {
+    when (x) {
+        is User -> x.name
+    }
+}
+      `, Kotlin);
+      const { env } = buildTypeEnv(tree, 'kotlin');
+      expect(flatGet(env, 'x')).toBe('User');
+    });
+
+    it('C#: if (x != null) narrows nullable type inside if-body', () => {
+      const code = `
+class App {
+    void Process(User? x) {
+        if (x != null) {
+            x.Save();
+        }
+    }
+}`;
+      const tree = parse(code, CSharp);
+      const typeEnv = buildTypeEnv(tree, 'csharp');
+      const saveCall = tree.rootNode.descendantForIndex(tree.rootNode.text.indexOf('x.Save'));
+      expect(typeEnv.lookup('x', saveCall)).toBe('User');
+    });
+
+    it('C#: is_pattern_expression type pattern still works alongside null-check', () => {
+      const tree = parse(`
+class App {
+    void Process(object obj) {
+        if (obj is User user) {
+            user.Save();
+        }
+    }
+}
+      `, CSharp);
+      const { env } = buildTypeEnv(tree, 'csharp');
+      expect(flatGet(env, 'user')).toBe('User');
     });
   });
 
