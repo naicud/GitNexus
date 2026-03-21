@@ -206,7 +206,10 @@ export const AppStateProvider = ({ children }: { children: ReactNode }) => {
   // Update the late-binding ref now that chatState is available
   initializeAgentRef.current = chatState.initializeAgent;
 
-  // Compose the full AppState value
+  // NOTE: This composed value re-creates when ANY sub-hook state changes, so all
+  // useAppState() consumers re-render together. For render-critical components,
+  // import the specific sub-hook directly (e.g., useGraphState, useFilterState)
+  // to subscribe only to the state slice you need.
   const value: AppState = useMemo(() => ({
     // From graphState
     viewMode: graphState.viewMode,
