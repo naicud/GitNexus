@@ -53,16 +53,22 @@ export interface EmbeddingProgress {
  * Configuration for the embedding pipeline
  */
 export interface EmbeddingConfig {
-  /** Model identifier for transformers.js */
+  /** Embedding provider type */
+  provider: 'ollama' | 'cohere' | 'openai' | 'local';
+  /** Model identifier */
   modelId: string;
   /** Number of nodes to embed in each batch */
   batchSize: number;
   /** Embedding vector dimensions */
   dimensions: number;
-  /** Device to use for inference: 'auto' tries GPU first (DirectML on Windows, CUDA on Linux), falls back to CPU */
+  /** Device to use for local inference: 'auto' tries GPU first */
   device: 'auto' | 'dml' | 'cuda' | 'cpu' | 'wasm';
   /** Maximum characters of code snippet to include */
   maxSnippetLength: number;
+  /** API endpoint URL for remote providers */
+  endpoint?: string;
+  /** API key for cloud providers */
+  apiKey?: string;
 }
 
 /**
@@ -71,6 +77,7 @@ export interface EmbeddingConfig {
  * Tries WebGPU first (fast), user can choose WASM fallback if unavailable
  */
 export const DEFAULT_EMBEDDING_CONFIG: EmbeddingConfig = {
+  provider: 'local',
   modelId: 'Snowflake/snowflake-arctic-embed-xs',
   batchSize: 16,
   dimensions: 384,

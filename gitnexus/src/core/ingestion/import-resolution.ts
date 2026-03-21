@@ -359,6 +359,33 @@ export const importResolvers = {
   [SupportedLanguages.PHP]: (raw, fp, ctx) => resolvePhpImportDispatch(raw, fp, ctx),
   [SupportedLanguages.Kotlin]: (raw, fp, ctx) => resolveKotlinImport(raw, fp, ctx),
   [SupportedLanguages.Swift]: (raw, fp, ctx) => resolveSwiftImportDispatch(raw, fp, ctx),
+  [SupportedLanguages.COBOL]: (raw, _fp, ctx) => {
+    // COBOL import resolution: name-based COPY/CALL resolution via suffix index
+    let name = raw;
+    if ((name.startsWith('"') && name.endsWith('"')) || (name.startsWith("'") && name.endsWith("'"))) {
+      name = name.slice(1, -1);
+    }
+    name = name.trim();
+    if (!name) return null;
+    const cacheKey = `cobol::${name}`;
+    if (ctx.resolveCache.has(cacheKey)) {
+      const cached = ctx.resolveCache.get(cacheKey);
+      return cached ? { kind: 'files', files: [cached] } : null;
+    }
+    const cache = (result: string | null) => { ctx.resolveCache.set(cacheKey, result); return result; };
+    const exact = ctx.index.get(name) || ctx.index.getInsensitive(name);
+    if (exact) { cache(exact); return { kind: 'files', files: [exact] }; }
+    for (const ext of ['.cpy', '.copy', '.cbl', '.cob', '.cobol']) {
+      const r = ctx.index.get(name + ext) || ctx.index.getInsensitive(name + ext);
+      if (r) { cache(r); return { kind: 'files', files: [r] }; }
+    }
+    for (const variant of [name.toUpperCase(), name.toLowerCase()]) {
+      const r = ctx.index.get(variant) || ctx.index.getInsensitive(variant);
+      if (r) { cache(r); return { kind: 'files', files: [r] }; }
+    }
+    cache(null);
+    return null;
+  },
 } satisfies Record<SupportedLanguages, ImportResolverFn>;
 
 /**
@@ -380,4 +407,5 @@ export const namedBindingExtractors = {
   [SupportedLanguages.PHP]: extractPhpNamedBindings,
   [SupportedLanguages.Kotlin]: extractKotlinNamedBindings,
   [SupportedLanguages.Swift]: undefined,
+  [SupportedLanguages.COBOL]: undefined,
 } satisfies Record<SupportedLanguages, NamedBindingExtractorFn | undefined>;

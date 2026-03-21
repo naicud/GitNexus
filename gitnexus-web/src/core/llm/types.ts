@@ -8,7 +8,7 @@
 /**
  * Supported LLM providers
  */
-export type LLMProvider = 'openai' | 'azure-openai' | 'gemini' | 'anthropic' | 'ollama' | 'openrouter' | 'minimax';
+export type LLMProvider = 'openai' | 'azure-openai' | 'gemini' | 'anthropic' | 'ollama' | 'openrouter' | 'minimax' | 'custom' | 'bedrock';
 
 /**
  * Base configuration shared by all providers
@@ -88,9 +88,32 @@ export interface MiniMaxConfig extends BaseProviderConfig {
 }
 
 /**
+ * Custom OpenAI-compatible provider configuration
+ */
+export interface CustomConfig extends BaseProviderConfig {
+  provider: 'custom';
+  baseUrl: string;   // required — any OpenAI-compatible base URL
+  apiKey?: string;   // optional — not needed for local servers
+  model: string;
+}
+
+/**
+ * AWS Bedrock configuration
+ */
+export interface AWSBedrockConfig extends BaseProviderConfig {
+  provider: 'bedrock';
+  accessKeyId: string;
+  secretAccessKey: string;
+  sessionToken?: string;  // for temporary STS credentials
+  region: string;
+  model: string;
+  proxyBaseUrl?: string;  // when set, routes API calls through backend to bypass CORS
+}
+
+/**
  * Union type for all provider configurations
  */
-export type ProviderConfig = OpenAIConfig | AzureOpenAIConfig | GeminiConfig | AnthropicConfig | OllamaConfig | OpenRouterConfig | MiniMaxConfig;
+export type ProviderConfig = OpenAIConfig | AzureOpenAIConfig | GeminiConfig | AnthropicConfig | OllamaConfig | OpenRouterConfig | MiniMaxConfig | CustomConfig | AWSBedrockConfig;
 
 /**
  * Stored settings (what goes to localStorage)
@@ -108,12 +131,22 @@ export interface LLMSettings {
   ollama?: Partial<Omit<OllamaConfig, 'provider'>>;
   openrouter?: Partial<Omit<OpenRouterConfig, 'provider'>>;
   minimax?: Partial<Omit<MiniMaxConfig, 'provider'>>;
+  custom?: Partial<Omit<CustomConfig, 'provider'>>;
+  bedrock?: Partial<Omit<AWSBedrockConfig, 'provider'>>;
 
   // Intelligent Clustering Settings
   intelligentClustering: boolean;
   hasSeenClusteringPrompt: boolean;
   useSameModelForClustering: boolean;
   clusteringProvider?: Partial<ProviderConfig>; // Optional specific config for clustering
+
+  // Database backend settings
+  database?: {
+    type: 'lbug' | 'neptune';
+    neptuneEndpoint?: string;
+    neptuneRegion?: string;
+    neptunePort?: number;
+  };
 }
 
 /**
@@ -161,6 +194,18 @@ export const DEFAULT_LLM_SETTINGS: LLMSettings = {
   minimax: {
     apiKey: '',
     model: 'MiniMax-M2.5',
+  },
+  custom: {
+    baseUrl: '',
+    model: '',
+    apiKey: '',
+    temperature: 0.1,
+  },
+  bedrock: {
+    accessKeyId: '',
+    secretAccessKey: '',
+    region: 'us-east-1',
+    model: 'anthropic.claude-3-5-sonnet-20241022-v2:0',
     temperature: 0.1,
   },
 };

@@ -185,6 +185,23 @@ const ENTRY_POINT_PATTERNS = {
     /^makeBody$/,                     // SwiftUI ViewModifier
   ],
 
+  // COBOL
+  'cobol': [
+    /^MAIN$/i,                 // Common main paragraph name
+    /^MAIN-PARAGRAPH$/i,
+    /^MAIN-SECTION$/i,
+    /^MAIN-LOGIC$/i,
+    /^MAIN-PROCESS$/i,
+    /^PROCESS-/i,              // Processing paragraphs
+    /^A\d{3}-/,                // Common COBOL naming: A000-MAIN, B100-PROCESS
+    /^[A-Z]\d{3}-MAIN/i,      // X000-MAIN pattern
+    /^0{3,4}-/,                // 000-MAIN, 0000-MAIN patterns
+    /^PERFORM-MAIN$/i,
+    /^START-/i,                // Start processing paragraphs
+    /^INIT-/i,                 // Initialization paragraphs
+    /-MAIN$/i,                 // Paragraphs ending with -MAIN
+  ],
+
   // PHP / Laravel
   [SupportedLanguages.PHP]: [
     /Controller$/,            // UserController (class name convention)

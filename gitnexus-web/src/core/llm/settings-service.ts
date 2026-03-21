@@ -16,6 +16,8 @@ import {
   OllamaConfig,
   OpenRouterConfig,
   MiniMaxConfig,
+  CustomConfig,
+  AWSBedrockConfig,
   ProviderConfig,
 } from './types';
 
@@ -65,6 +67,14 @@ export const loadSettings = (): LLMSettings => {
         ...DEFAULT_LLM_SETTINGS.minimax,
         ...parsed.minimax,
       },
+      custom: {
+        ...DEFAULT_LLM_SETTINGS.custom,
+        ...parsed.custom,
+      },
+      bedrock: {
+        ...DEFAULT_LLM_SETTINGS.bedrock,
+        ...parsed.bedrock,
+      },
     };
   } catch (error) {
     console.warn('Failed to load LLM settings:', error);
@@ -95,6 +105,8 @@ export const updateProviderSettings = <T extends LLMProvider>(
     T extends 'anthropic' ? Partial<Omit<AnthropicConfig, 'provider'>> :
     T extends 'ollama' ? Partial<Omit<OllamaConfig, 'provider'>> :
     T extends 'minimax' ? Partial<Omit<MiniMaxConfig, 'provider'>> :
+    T extends 'custom' ? Partial<Omit<CustomConfig, 'provider'>> :
+    T extends 'bedrock' ? Partial<Omit<AWSBedrockConfig, 'provider'>> :
     never
   >
 ): LLMSettings => {
@@ -174,6 +186,28 @@ export const updateProviderSettings = <T extends LLMProvider>(
         minimax: {
           ...(current.minimax ?? {}),
           ...(updates as Partial<Omit<MiniMaxConfig, 'provider'>>),
+        },
+      };
+      saveSettings(updated);
+      return updated;
+    }
+    case 'custom': {
+      const updated: LLMSettings = {
+        ...current,
+        custom: {
+          ...(current.custom ?? {}),
+          ...(updates as Partial<Omit<CustomConfig, 'provider'>>),
+        },
+      };
+      saveSettings(updated);
+      return updated;
+    }
+    case 'bedrock': {
+      const updated: LLMSettings = {
+        ...current,
+        bedrock: {
+          ...(current.bedrock ?? {}),
+          ...(updates as Partial<Omit<AWSBedrockConfig, 'provider'>>),
         },
       };
       saveSettings(updated);
@@ -271,6 +305,24 @@ export const getActiveProviderConfig = (): ProviderConfig | null => {
         provider: 'minimax',
         ...settings.minimax,
       } as MiniMaxConfig;
+      
+    case 'custom':
+      if (!settings.custom?.baseUrl?.trim() || !settings.custom?.model?.trim()) {
+        return null;
+      }
+      return {
+        provider: 'custom',
+        ...settings.custom,
+      } as CustomConfig;
+
+    case 'bedrock':
+      if (!settings.bedrock?.accessKeyId || !settings.bedrock?.secretAccessKey) {
+        return null;
+      }
+      return {
+        provider: 'bedrock',
+        ...settings.bedrock,
+      } as AWSBedrockConfig;
 
     default:
       return null;
@@ -310,6 +362,10 @@ export const getProviderDisplayName = (provider: LLMProvider): string => {
       return 'OpenRouter';
     case 'minimax':
       return 'MiniMax';
+    case 'custom':
+      return 'Custom (OpenAI-compatible)';
+    case 'bedrock':
+      return 'AWS Bedrock';
     default:
       return provider;
   }
@@ -333,6 +389,18 @@ export const getAvailableModels = (provider: LLMProvider): string[] => {
       return ['llama3.2', 'llama3.1', 'mistral', 'codellama', 'deepseek-coder'];
     case 'minimax':
       return ['MiniMax-M2.5', 'MiniMax-M2.5-highspeed'];
+    case 'custom':
+      return [];
+    case 'bedrock':
+      return [
+        'anthropic.claude-sonnet-4-20250514-v1:0',
+        'anthropic.claude-opus-4-20250514-v1:0',
+        'anthropic.claude-3-5-sonnet-20241022-v2:0',
+        'anthropic.claude-3-5-haiku-20241022-v1:0',
+        'anthropic.claude-3-opus-20240229-v1:0',
+        'meta.llama3-70b-instruct-v1:0',
+        'mistral.mistral-large-2402-v1:0',
+      ];
     default:
       return [];
   }

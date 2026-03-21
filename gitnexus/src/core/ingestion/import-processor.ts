@@ -5,8 +5,10 @@ import { isLanguageAvailable, loadParser, loadLanguage } from '../tree-sitter/pa
 import { LANGUAGE_QUERIES } from './tree-sitter-queries.js';
 import { generateId } from '../../lib/utils.js';
 import { getLanguageFromFilename, isVerboseIngestionEnabled, yieldToEventLoop } from './utils.js';
+import { SupportedLanguages } from '../../config/supported-languages.js';
 import type { ExtractedImport } from './workers/parse-worker.js';
 import { getTreeSitterBufferSize } from './constants.js';
+import { preprocessCobolSource } from './cobol-preprocessor.js';
 import { loadImportConfigs } from './language-config.js';
 import { buildSuffixIndex } from './resolvers/index.js';
 import { callRouters } from './call-routing.js';
@@ -233,8 +235,11 @@ export const processImports = async (
     let wasReparsed = false;
 
     if (!tree) {
+      const parseContent = language === SupportedLanguages.COBOL
+        ? preprocessCobolSource(file.content)
+        : file.content;
       try {
-        tree = parser.parse(file.content, undefined, { bufferSize: getTreeSitterBufferSize(file.content.length) });
+        tree = parser.parse(parseContent, undefined, { bufferSize: getTreeSitterBufferSize(parseContent.length) });
       } catch (parseError) {
         continue;
       }

@@ -921,6 +921,49 @@ export const SWIFT_QUERIES = `
 
 `;
 
+// COBOL queries - works with tree-sitter-cobol
+// Validated against real AST output from tree-sitter-cobol@0.0.1
+export const COBOL_QUERIES = `
+; ── Program definition ─────────────────────────────────────────────────
+(identification_division
+  (program_name) @name) @definition.module
+
+; ── Sections in PROCEDURE DIVISION ─────────────────────────────────────
+(section_header
+  name: (WORD) @name) @definition.namespace
+
+; ── Paragraphs (the primary callable units in COBOL) ───────────────────
+(paragraph_header
+  name: (WORD) @name) @definition.function
+
+; ── CALL statements (external program invocation) ──────────────────────
+(call_statement
+  x: (string) @call.name) @call
+
+; ── PERFORM statements (internal procedure invocation) ─────────────────
+(perform_statement_call_proc
+  procedure: (perform_procedure
+    (label
+      (qualified_word) @call.name))) @call
+
+; ── COPY statements — unquoted (WORD nodes, the majority) ──────────────
+(copy_statement
+  book: (WORD) @import.source) @import
+
+; ── COPY statements — quoted (string nodes) ────────────────────────────
+(copy_statement
+  book: (string) @import.source) @import
+
+; ── Data descriptions (entry_name captures variable names) ─────────────
+(data_description
+  (entry_name) @name) @definition.property
+
+; ── File descriptions (FD/SD entries) ──────────────────────────────────
+(file_description
+  (file_description_entry
+    (WORD) @name)) @definition.type
+`;
+
 export const LANGUAGE_QUERIES: Record<SupportedLanguages, string> = {
   [SupportedLanguages.TypeScript]: TYPESCRIPT_QUERIES,
   [SupportedLanguages.JavaScript]: JAVASCRIPT_QUERIES,
@@ -935,5 +978,6 @@ export const LANGUAGE_QUERIES: Record<SupportedLanguages, string> = {
   [SupportedLanguages.PHP]: PHP_QUERIES,
   [SupportedLanguages.Kotlin]: KOTLIN_QUERIES,
   [SupportedLanguages.Swift]: SWIFT_QUERIES,
+  [SupportedLanguages.COBOL]: COBOL_QUERIES,
 };
  

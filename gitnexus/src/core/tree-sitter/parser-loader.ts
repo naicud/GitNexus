@@ -13,10 +13,12 @@ import Ruby from 'tree-sitter-ruby';
 import { createRequire } from 'node:module';
 import { SupportedLanguages } from '../../config/supported-languages.js';
 
-// tree-sitter-swift is an optionalDependency — may not be installed
+// tree-sitter-swift and tree-sitter-cobol are optionalDependencies — may not be installed
 const _require = createRequire(import.meta.url);
 let Swift: any = null;
 try { Swift = _require('tree-sitter-swift'); } catch {}
+let COBOL: any = null;
+try { COBOL = _require('tree-sitter-cobol'); } catch {}
 
 // tree-sitter-kotlin is an optionalDependency — may not be installed
 let Kotlin: any = null;
@@ -39,6 +41,7 @@ const languageMap: Record<string, any> = {
   [SupportedLanguages.PHP]: PHP.php_only,
   [SupportedLanguages.Ruby]: Ruby,
   ...(Swift ? { [SupportedLanguages.Swift]: Swift } : {}),
+  ...(COBOL ? { [SupportedLanguages.COBOL]: COBOL } : {}),
 };
 
 export const isLanguageAvailable = (language: SupportedLanguages): boolean =>

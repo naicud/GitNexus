@@ -23,6 +23,7 @@ import { generateId } from '../../lib/utils.js';
 import { getLanguageFromFilename, isVerboseIngestionEnabled, yieldToEventLoop } from './utils.js';
 import { SupportedLanguages } from '../../config/supported-languages.js';
 import { getTreeSitterBufferSize } from './constants.js';
+import { preprocessCobolSource } from './cobol-preprocessor.js';
 import type { ExtractedHeritage } from './workers/parse-worker.js';
 import type { ResolutionContext } from './resolution-context.js';
 
@@ -120,8 +121,11 @@ export const processHeritage = async (
     let tree = astCache.get(file.path);
     if (!tree) {
       // Use larger bufferSize for files > 32KB
+      const parseContent = language === SupportedLanguages.COBOL
+        ? preprocessCobolSource(file.content)
+        : file.content;
       try {
-        tree = parser.parse(file.content, undefined, { bufferSize: getTreeSitterBufferSize(file.content.length) });
+        tree = parser.parse(parseContent, undefined, { bufferSize: getTreeSitterBufferSize(parseContent.length) });
       } catch (parseError) {
         // Skip files that can't be parsed
         continue;

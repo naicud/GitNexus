@@ -10,6 +10,7 @@ import {
   SCHEMA_QUERIES,
   EMBEDDING_TABLE_NAME,
   NodeTableName,
+  getEmbeddingSchema,
 } from './schema.js';
 import { streamAllCSVsToDisk } from './csv-generator.js';
 
@@ -104,18 +105,41 @@ const doInitLbug = async (dbPath: string) => {
   const parentDir = path.dirname(dbPath);
   await fs.mkdir(parentDir, { recursive: true });
 
-  db = new lbug.Database(dbPath);
-  conn = new lbug.Connection(db);
+  const openAndCreateSchema = async () => {
+    db = new lbug.Database(dbPath);
+    conn = new lbug.Connection(db);
 
-  for (const schemaQuery of SCHEMA_QUERIES) {
-    try {
-      await conn.query(schemaQuery);
-    } catch (err) {
-      // Only ignore "already exists" errors - log everything else
-      const msg = err instanceof Error ? err.message : String(err);
-      if (!msg.includes('already exists')) {
-        console.warn(`⚠️ Schema creation warning: ${msg.slice(0, 120)}`);
+    for (const schemaQuery of SCHEMA_QUERIES) {
+      try {
+        await conn.query(schemaQuery);
+      } catch (err) {
+        // Only ignore "already exists" errors - log everything else
+        const msg = err instanceof Error ? err.message : String(err);
+        if (!msg.includes('already exists')) {
+          console.warn(`⚠️ Schema creation warning: ${msg.slice(0, 120)}`);
+        }
       }
+    }
+  };
+
+  try {
+    await openAndCreateSchema();
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (msg.toLowerCase().includes('wal')) {
+      // Corrupted WAL — close broken handles, delete WAL, retry once
+      console.warn(`⚠️ Corrupted WAL detected for ${dbPath} — deleting WAL and retrying`);
+      try { if (conn) await conn.close(); } catch {}
+      try { if (db) await db.close(); } catch {}
+      conn = null;
+      db = null;
+
+      const walPath = `${dbPath}.wal`;
+      try { await fs.unlink(walPath); } catch {}
+
+      await openAndCreateSchema();
+    } else {
+      throw err;
     }
   }
 
@@ -715,6 +739,26 @@ export const deleteNodesForFile = async (filePath: string, dbPath?: string): Pro
 };
 
 export const getEmbeddingTableName = (): string => EMBEDDING_TABLE_NAME;
+
+/**
+ * Create the CodeEmbedding table with the correct vector dimension.
+ * Must be called before running the embedding pipeline — NOT during initLbug,
+ * because the dimension depends on the configured model (e.g. 384 vs 1024).
+ * Safe to call multiple times: "already exists" errors are silently ignored.
+ */
+export const ensureEmbeddingTable = async (dims: number): Promise<void> => {
+  if (!conn) {
+    throw new Error('LadybugDB not initialized. Call initLbug first.');
+  }
+  try {
+    await conn.query(getEmbeddingSchema(dims));
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (!msg.includes('already exists')) {
+      throw err;
+    }
+  }
+};
 
 // ============================================================================
 // Full-Text Search (FTS) Functions

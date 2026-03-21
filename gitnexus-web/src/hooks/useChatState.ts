@@ -109,6 +109,11 @@ export function useChatState(deps: ChatStateDeps): ChatState {
 
     const effectiveBackendUrl = (overrideBackendUrl ?? serverBaseUrl ?? '').replace(/\/api$/, '') || undefined;
 
+    if (config.provider === 'bedrock') {
+      const proxyUrl = effectiveBackendUrl ?? getBackendUrl();
+      (config as import('../core/llm/types').AWSBedrockConfig).proxyBaseUrl = proxyUrl.replace(/\/api$/, '');
+    }
+
     setIsAgentInitializing(true);
     setAgentError(null);
 

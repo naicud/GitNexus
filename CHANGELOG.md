@@ -31,6 +31,7 @@ All notable changes to GitNexus will be documented in this file.
 - **Call expression matching** in tree-sitter queries (#234 via #237) — @ex-nihilo-jg
 - **DeepSeek model configurations** (#217) — @JasonOA888
 - 282+ new unit tests, 178 integration resolver tests across 9 languages, 53 test files, 1146 total tests passing
+- **AWS Neptune graph database backend** — optional managed cloud alternative to KuzuDB. CLI flags `--db neptune --neptune-endpoint <host> --neptune-region <region>`, env vars (`GITNEXUS_DB_TYPE`, `GITNEXUS_NEPTUNE_ENDPOINT`, `GITNEXUS_NEPTUNE_REGION`), IAM SigV4 authentication via AWS SDK credential chain, UNWIND batch ingestion (batch size 500), `/api/db/test` connection test endpoint, Web UI database settings panel, transparent MCP tool dispatch. v1 limitations: no FTS indexes (falls back to CONTAINS predicate), no embeddings support, one Neptune cluster per repository. See [docs/neptune-setup.md](docs/neptune-setup.md) — @naicud
 
 ### Fixed
 
@@ -45,6 +46,39 @@ All notable changes to GitNexus will be documented in this file.
 - `import-processor.ts` reduced from 1412 → 711 lines (50% reduction) via resolver and config extraction (#238) — @magyargergo
 - `type-env.ts` reduced from 635 → ~125 lines via type-extractor extraction (#238) — @magyargergo
 - CI/CD workflows hardened with security fixes and fork PR support (#222, #225) — @magyargergo
+
+## [1.3.13] - 2026-03-13
+
+### Added
+
+- **AWS Bedrock backend proxy**: Bedrock API calls now route through the local Express server (`/api/bedrock/converse`, `/api/bedrock/converse-stream`) to bypass browser CORS/COEP restrictions that blocked direct browser-to-AWS calls — @naicud
+- **Bedrock health check**: "Test Connection" button in Settings validates credentials, region, and model access in one click — shows detailed error messages on failure — @naicud
+- **Claude 4 model support**: Added `anthropic.claude-sonnet-4-20250514-v1:0` and `anthropic.claude-opus-4-20250514-v1:0` to the Bedrock model list — @naicud
+
+### Changed
+
+- **Bedrock dual-mode routing**: `ChatBedrockBrowser` supports both direct browser calls (standalone) and backend proxy (server-connected) — proxy is auto-selected when backend is available — @naicud
+
+## [1.3.12] - 2026-03-12
+
+### Added
+
+- **COBOL language support**: Full indexing pipeline for GnuCOBOL codebases — PROGRAM-ID, paragraphs, sections, CALL/PERFORM/COPY edges extracted via regex-only processing (no tree-sitter) for reliable performance on large repos (#1) — @naicud
+- **COBOL regex-only worker path**: Replaces tree-sitter-cobol entirely in both worker pool and sequential fallback to avoid external-scanner hangs on ~5% of files; sub-batch size auto-set to 200 for COBOL repos (#1) — @naicud
+- **AWS Bedrock & custom OpenAI-compatible providers**: Embeddings and LLM calls can now target AWS Bedrock endpoints and any OpenAI-compatible API in addition to OpenAI
+- **Enhanced `analyze` progress display**: Optional `--detail` flag surfaces per-file parse stats; removed the large-file skip logic from the filesystem walker so all files are considered for indexing
+- **Web UI — model text input**: Settings panel model selector replaced with a free-text input, removing hard-coded dropdown options for improved flexibility
+
+### Fixed
+
+- **C/C++/C#/Rust language support**: Consolidated 6 overlapping PRs into unified `shared/utils.ts`; deduplicated `call-processor.ts`, `parse-worker.ts`, and `parsing-processor.ts`; fixed per-call `new Set()` allocation in `export-detection.ts`; added 72 tests (#237)
+- **Swift parser availability**: Sequential ingestion now skips unavailable native Swift parsers gracefully and emits a warning in verbose mode (#188)
+- **README**: Corrected backend and frontend directory paths in setup instructions
+
+### Changed
+
+- **CI — fork PR support**: PR report moved to `workflow_run` event and Claude Code Review workflow updated to handle fork-originated pull requests (#225, #222)
+- **CI — security hardening**: Workflow permissions tightened and reliability improvements applied across CI/CD pipeline (#222)
 
 ## [1.3.11] - 2026-03-08
 

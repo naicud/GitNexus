@@ -31,6 +31,11 @@ export const typeConfigs = {
   [SupportedLanguages.CPlusPlus]: cCppConfig,
   [SupportedLanguages.PHP]: phpConfig,
   [SupportedLanguages.Ruby]: rubyConfig,
+  [SupportedLanguages.COBOL]: {
+    declarationNodeTypes: new Set<string>(),
+    extractDeclaration: () => {},
+    extractParameter: () => {},
+  } as LanguageTypeConfig,
 } satisfies Record<SupportedLanguages, LanguageTypeConfig>;
 
 export type {

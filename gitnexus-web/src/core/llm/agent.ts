@@ -11,6 +11,7 @@ import { ChatOpenAI, AzureChatOpenAI } from '@langchain/openai';
 import { ChatGoogleGenerativeAI } from '@langchain/google-genai';
 import { ChatAnthropic } from '@langchain/anthropic';
 import { ChatOllama } from '@langchain/ollama';
+import { ChatBedrockBrowser } from './bedrock-browser';
 import type { BaseChatModel } from '@langchain/core/language_models/chat_models';
 import { createGraphRAGTools } from './tools';
 import type {
@@ -22,6 +23,8 @@ import type {
   OllamaConfig,
   OpenRouterConfig,
   MiniMaxConfig,
+  CustomConfig,
+  AWSBedrockConfig,
   AgentStreamChunk,
 } from './types';
 import { 
@@ -244,6 +247,41 @@ export const createChatModel = (config: ProviderConfig): BaseChatModel => {
           baseURL: 'https://api.minimax.io/anthropic',
         },
       });
+    }
+    
+    case 'custom': {
+      const customConfig = config as CustomConfig;
+      if (!customConfig.baseUrl?.trim()) {
+        throw new Error('Custom provider requires a Base URL');
+      }
+      return new ChatOpenAI({
+        apiKey: customConfig.apiKey || 'not-required',
+        modelName: customConfig.model,
+        temperature: customConfig.temperature ?? 0.1,
+        maxTokens: customConfig.maxTokens,
+        configuration: {
+          apiKey: customConfig.apiKey || 'not-required',
+          baseURL: customConfig.baseUrl,
+        },
+        streaming: true,
+      });
+    }
+
+    case 'bedrock': {
+      const bedrockConfig = config as AWSBedrockConfig;
+      return new ChatBedrockBrowser({
+        region: bedrockConfig.region,
+        credentials: {
+          accessKeyId: bedrockConfig.accessKeyId,
+          secretAccessKey: bedrockConfig.secretAccessKey,
+          sessionToken: bedrockConfig.sessionToken,
+        },
+        model: bedrockConfig.model,
+        temperature: bedrockConfig.temperature ?? 0.1,
+        maxTokens: bedrockConfig.maxTokens,
+        streaming: true,
+        proxyBaseUrl: bedrockConfig.proxyBaseUrl,
+      }) as BaseChatModel;
     }
 
     default:

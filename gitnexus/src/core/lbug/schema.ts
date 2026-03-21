@@ -403,6 +403,26 @@ CREATE REL TABLE ${REL_TABLE_NAME} (
   FROM \`Annotation\` TO Process,
   FROM \`Template\` TO Process,
   FROM CodeElement TO Process,
+  FROM \`Record\` TO \`Record\`,
+  FROM \`Record\` TO \`Const\`,
+  FROM \`Property\` TO \`Property\`,
+  FROM \`Property\` TO \`Const\`,
+  FROM \`Property\` TO CodeElement,
+  FROM \`Module\` TO \`Record\`,
+  FROM \`Module\` TO \`Property\`,
+  FROM \`Module\` TO CodeElement,
+  FROM \`Module\` TO \`Const\`,
+  FROM \`Namespace\` TO \`Property\`,
+  FROM \`Namespace\` TO \`Record\`,
+  FROM CodeElement TO \`Record\`,
+  FROM CodeElement TO \`Property\`,
+  FROM \`Const\` TO \`Property\`,
+  FROM Function TO CodeElement,
+  FROM \`Namespace\` TO CodeElement,
+  FROM CodeElement TO CodeElement,
+  FROM CodeElement TO \`Module\`,
+  FROM CodeElement TO File,
+  FROM \`Module\` TO \`Constructor\`,
   type STRING,
   confidence DOUBLE,
   reason STRING,
@@ -414,12 +434,14 @@ CREATE REL TABLE ${REL_TABLE_NAME} (
 // Separate table for vector storage to avoid copy-on-write overhead
 // ============================================================================
 
-export const EMBEDDING_SCHEMA = `
+export const getEmbeddingSchema = (dims: number = 384): string => `
 CREATE NODE TABLE ${EMBEDDING_TABLE_NAME} (
   nodeId STRING,
-  embedding FLOAT[384],
+  embedding FLOAT[${dims}],
   PRIMARY KEY (nodeId)
 )`;
+
+export const EMBEDDING_SCHEMA = getEmbeddingSchema(384);
 
 /**
  * Create vector index for semantic search
@@ -474,5 +496,6 @@ export const REL_SCHEMA_QUERIES = [
 export const SCHEMA_QUERIES = [
   ...NODE_SCHEMA_QUERIES,
   ...REL_SCHEMA_QUERIES,
-  EMBEDDING_SCHEMA,
+  // NOTE: EMBEDDING_SCHEMA is intentionally excluded — embedding table dims depend on
+  // the configured model and must be created dynamically via ensureEmbeddingTable(dims).
 ];
