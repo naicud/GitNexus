@@ -50,9 +50,10 @@ const buildGraph = async (limit?: number): Promise<{ nodes: GraphNode[]; relatio
   for (const table of NODE_TABLES) {
     if (remaining <= 0) break;
     try {
+      const prevRemaining = remaining;
       let query = '';
       if (table === 'File') {
-        query = `MATCH (n:File) RETURN n.id AS id, n.name AS name, n.filePath AS filePath, n.content AS content LIMIT ${remaining}`;
+        query = `MATCH (n:File) RETURN n.id AS id, n.name AS name, n.filePath AS filePath LIMIT ${remaining}`;
       } else if (table === 'Folder') {
         query = `MATCH (n:Folder) RETURN n.id AS id, n.name AS name, n.filePath AS filePath LIMIT ${remaining}`;
       } else if (table === 'Community') {
@@ -60,7 +61,7 @@ const buildGraph = async (limit?: number): Promise<{ nodes: GraphNode[]; relatio
       } else if (table === 'Process') {
         query = `MATCH (n:Process) RETURN n.id AS id, n.label AS label, n.heuristicLabel AS heuristicLabel, n.processType AS processType, n.stepCount AS stepCount, n.communities AS communities, n.entryPointId AS entryPointId, n.terminalId AS terminalId LIMIT ${remaining}`;
       } else {
-        query = `MATCH (n:${table}) RETURN n.id AS id, n.name AS name, n.filePath AS filePath, n.startLine AS startLine, n.endLine AS endLine, n.content AS content LIMIT ${remaining}`;
+        query = `MATCH (n:${table}) RETURN n.id AS id, n.name AS name, n.filePath AS filePath, n.startLine AS startLine, n.endLine AS endLine LIMIT ${remaining}`;
       }
 
       const rows = await executeQuery(query);
@@ -73,7 +74,6 @@ const buildGraph = async (limit?: number): Promise<{ nodes: GraphNode[]; relatio
             filePath: row.filePath ?? row[2],
             startLine: row.startLine,
             endLine: row.endLine,
-            content: row.content,
             heuristicLabel: row.heuristicLabel,
             cohesion: row.cohesion,
             symbolCount: row.symbolCount,
@@ -87,11 +87,15 @@ const buildGraph = async (limit?: number): Promise<{ nodes: GraphNode[]; relatio
       }
       remaining -= rows.length;
 
-      // Count total available for this table
-      try {
-        const countRows = await executeQuery(`MATCH (n:${table}) RETURN count(n) AS cnt`);
-        totalAvailable += countRows[0]?.cnt ?? rows.length;
-      } catch {
+      // Only run count query when we hit the LIMIT (table may have more rows)
+      if (rows.length >= prevRemaining) {
+        try {
+          const countRows = await executeQuery(`MATCH (n:${table}) RETURN count(n) AS cnt`);
+          totalAvailable += countRows[0]?.cnt ?? rows.length;
+        } catch {
+          totalAvailable += rows.length;
+        }
+      } else {
         totalAvailable += rows.length;
       }
     } catch {
@@ -401,7 +405,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
         hasSummary = Array.isArray(parsed.clusterGroups) && parsed.clusterGroups.length > 0;
       } catch { /* no summary file or invalid */ }
 
-      const mode = (totalNodes > 100000) ? 'hierarchy' : (totalNodes > 50000) ? 'summary' : 'full';
+      const mode = (totalNodes > 50000) ? 'hierarchy' : (totalNodes > NODE_HARD_CAP) ? 'summary' : 'full';
       res.json({ totalNodes, totalEdges, hasSummary, mode, hierarchyAvailable: totalNodes > 100000 });
     } catch (err: any) {
       res.status(500).json({ error: err.message || 'Failed to get graph info' });
@@ -574,15 +578,22 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
           for (const table of STRUCTURAL_NODE_LABELS) {
             if (remaining <= 0) break;
             try {
-              const condition = prefix
-                ? `n.filePath STARTS WITH '${prefix.replace(/'/g, "\\'")}'`
-                : `(n.filePath IS NULL OR NOT contains(n.filePath, '/'))`;
-              const rows = await queryFn(`
-                MATCH (n:${table}) WHERE ${condition}
-                RETURN n.id AS id, n.name AS name, n.filePath AS filePath,
-                       n.startLine AS startLine, n.endLine AS endLine
-                LIMIT ${remaining}
-              `);
+              let rows: any[];
+              if (prefix) {
+                rows = await paramQueryFn(`
+                  MATCH (n:${table}) WHERE n.filePath STARTS WITH $prefix
+                  RETURN n.id AS id, n.name AS name, n.filePath AS filePath,
+                         n.startLine AS startLine, n.endLine AS endLine
+                  LIMIT ${remaining}
+                `, { prefix });
+              } else {
+                rows = await queryFn(`
+                  MATCH (n:${table}) WHERE (n.filePath IS NULL OR NOT contains(n.filePath, '/'))
+                  RETURN n.id AS id, n.name AS name, n.filePath AS filePath,
+                         n.startLine AS startLine, n.endLine AS endLine
+                  LIMIT ${remaining}
+                `);
+              }
               for (const row of rows) {
                 nodes.push({
                   id: row.id,
@@ -661,14 +672,14 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
 
       const lbugPath = path.join(entry.storagePath, 'lbug');
       const result = await withLbugDb(lbugPath, async () => {
-        const nodeRows = await executeQuery(`
+        const nodeRows = await executeParameterizedQuery(`
           MATCH (n)-[:CodeRelation {type: 'MEMBER_OF'}]->(c:Community)
-          WHERE c.heuristicLabel = '${groupLabel.replace(/'/g, "\\'")}'
+          WHERE c.heuristicLabel = $groupLabel
           RETURN n.id AS id, n.name AS name, n.filePath AS filePath,
                  n.startLine AS startLine, n.endLine AS endLine,
                  labels(n)[0] AS nodeLabel
           LIMIT ${limit}
-        `);
+        `, { groupLabel });
 
         const nodes: GraphNode[] = nodeRows.map(row => ({
           id: row.id,
@@ -683,15 +694,15 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
 
         const nodeIdSet = new Set(nodes.map(n => n.id));
 
-        const relRows = await executeQuery(`
+        const relRows = await executeParameterizedQuery(`
           MATCH (a)-[r:CodeRelation]->(b),
                 (a)-[:CodeRelation {type: 'MEMBER_OF'}]->(ca:Community),
                 (b)-[:CodeRelation {type: 'MEMBER_OF'}]->(cb:Community)
-          WHERE ca.heuristicLabel = '${groupLabel.replace(/'/g, "\\'")}'
-            AND cb.heuristicLabel = '${groupLabel.replace(/'/g, "\\'")}'
+          WHERE ca.heuristicLabel = $groupLabel
+            AND cb.heuristicLabel = $groupLabel
             AND r.type <> 'MEMBER_OF' AND r.type <> 'STEP_IN_PROCESS'
           RETURN a.id AS sourceId, b.id AS targetId, r.type AS type, r.confidence AS confidence
-        `);
+        `, { groupLabel });
 
         const relationships: GraphRelationship[] = relRows
           .filter(row => nodeIdSet.has(row.sourceId) && nodeIdSet.has(row.targetId))
@@ -704,16 +715,16 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
             reason: '',
           }));
 
-        const crossRows = await executeQuery(`
+        const crossRows = await executeParameterizedQuery(`
           MATCH (a)-[r:CodeRelation]->(b),
                 (a)-[:CodeRelation {type: 'MEMBER_OF'}]->(ca:Community),
                 (b)-[:CodeRelation {type: 'MEMBER_OF'}]->(cb:Community)
-          WHERE ca.heuristicLabel = '${groupLabel.replace(/'/g, "\\'")}'
-            AND cb.heuristicLabel <> '${groupLabel.replace(/'/g, "\\'")}'
+          WHERE ca.heuristicLabel = $groupLabel
+            AND cb.heuristicLabel <> $groupLabel
             AND r.type <> 'MEMBER_OF' AND r.type <> 'STEP_IN_PROCESS'
           RETURN a.id AS sourceId, b.id AS targetId, r.type AS type, cb.heuristicLabel AS targetGroup
           LIMIT 500
-        `);
+        `, { groupLabel });
 
         const crossEdges = crossRows
           .filter(row => nodeIdSet.has(row.sourceId))
@@ -726,11 +737,11 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
 
         let totalAvailable = nodes.length;
         try {
-          const countRows = await executeQuery(`
+          const countRows = await executeParameterizedQuery(`
             MATCH (n)-[:CodeRelation {type: 'MEMBER_OF'}]->(c:Community)
-            WHERE c.heuristicLabel = '${groupLabel.replace(/'/g, "\\'")}'
+            WHERE c.heuristicLabel = $groupLabel
             RETURN count(n) AS cnt
-          `);
+          `, { groupLabel });
           totalAvailable = countRows[0]?.cnt ?? nodes.length;
         } catch { /* use nodes.length as fallback */ }
 
@@ -1140,22 +1151,23 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
         }
 
         // Specific parent: first get total count
-        const safeParentId = parentId.replace(/'/g, "\\'");
-        const countRows = await executeQuery(
+        const countRows = await executeParameterizedQuery(
           `MATCH (parent)-[r:CodeRelation]->(child)
-           WHERE parent.id = '${safeParentId}' AND r.type IN ['CONTAINS', 'DEFINES']
-           RETURN count(child) AS total`
+           WHERE parent.id = $parentId AND r.type IN ['CONTAINS', 'DEFINES']
+           RETURN count(child) AS total`,
+          { parentId },
         );
         const totalChildren = countRows[0]?.total ?? 0;
 
         // If too many children and no prefix filter, return virtual groups
         if (totalChildren > 500 && !namePrefix) {
-          const groupRows = await executeQuery(
+          const groupRows = await executeParameterizedQuery(
             `MATCH (parent)-[r:CodeRelation]->(child)
-             WHERE parent.id = '${safeParentId}' AND r.type IN ['CONTAINS', 'DEFINES']
+             WHERE parent.id = $parentId AND r.type IN ['CONTAINS', 'DEFINES']
              RETURN left(child.name, 2) AS prefix, count(*) AS cnt,
                     collect(child.name)[0..3] AS sampleNames
-             ORDER BY prefix`
+             ORDER BY prefix`,
+            { parentId },
           );
           const virtualGroups = groupRows.map((row: any) => ({
             prefix: row.prefix as string,
@@ -1164,8 +1176,9 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
           }));
 
           // Get parent type
-          const parentRows = await executeQuery(
-            `MATCH (p) WHERE p.id = '${safeParentId}' RETURN labels(p)[0] AS type`
+          const parentRows = await executeParameterizedQuery(
+            `MATCH (p) WHERE p.id = $parentId RETURN labels(p)[0] AS type`,
+            { parentId },
           );
           const parentType = parentRows[0]?.type ?? null;
           return {
@@ -1179,19 +1192,22 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
         }
 
         // Return children with child counts
-        const safePrefixFilter = namePrefix
-          ? ` AND child.name STARTS WITH '${namePrefix.replace(/'/g, "\\'")}'`
+        const prefixFilter = namePrefix
+          ? ` AND child.name STARTS WITH $namePrefix`
           : '';
+        const params: Record<string, any> = { parentId };
+        if (namePrefix) params.namePrefix = namePrefix;
 
-        const childRows = await executeQuery(
+        const childRows = await executeParameterizedQuery(
           `MATCH (parent)-[r:CodeRelation]->(child)
-           WHERE parent.id = '${safeParentId}' AND r.type IN ['CONTAINS', 'DEFINES']${safePrefixFilter}
+           WHERE parent.id = $parentId AND r.type IN ['CONTAINS', 'DEFINES']${prefixFilter}
            WITH child, labels(child)[0] AS type
            OPTIONAL MATCH (child)-[r2:CodeRelation]->(gc) WHERE r2.type IN ['CONTAINS', 'DEFINES']
-           WITH child, type, count(gc) AS childCount
+           With child, type, count(gc) AS childCount
            RETURN child.id AS id, child.name AS name, type, child.filePath AS filePath, childCount
            ORDER BY child.name
-           SKIP ${offset} LIMIT ${limit}`
+           SKIP ${offset} LIMIT ${limit}`,
+          params,
         );
 
         const children = childRows.map((row: any) => ({
@@ -1205,18 +1221,20 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
         }));
 
         // Get parent type
-        const parentRows = await executeQuery(
-          `MATCH (p) WHERE p.id = '${safeParentId}' RETURN labels(p)[0] AS type`
+        const parentRows = await executeParameterizedQuery(
+          `MATCH (p) WHERE p.id = $parentId RETURN labels(p)[0] AS type`,
+          { parentId },
         );
         const parentType = parentRows[0]?.type ?? null;
 
         // Recount with prefix filter if applicable
         let filteredTotal = totalChildren;
         if (namePrefix) {
-          const filteredCountRows = await executeQuery(
+          const filteredCountRows = await executeParameterizedQuery(
             `MATCH (parent)-[r:CodeRelation]->(child)
-             WHERE parent.id = '${safeParentId}' AND r.type IN ['CONTAINS', 'DEFINES']${safePrefixFilter}
-             RETURN count(child) AS total`
+             WHERE parent.id = $parentId AND r.type IN ['CONTAINS', 'DEFINES'] AND child.name STARTS WITH $namePrefix
+             RETURN count(child) AS total`,
+            { parentId, namePrefix },
           );
           filteredTotal = filteredCountRows[0]?.total ?? 0;
         }
@@ -1320,14 +1338,14 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
       // LadybugDB path
       const lbugPath = path.join(entry.storagePath, 'lbug');
       const result = await withLbugDb(lbugPath, async () => {
-        const safeNodeId = nodeId.replace(/'/g, "\\'");
         // Get the target node
-        const targetRows = await executeQuery(
-          `MATCH (target) WHERE target.id = '${safeNodeId}'
+        const targetRows = await executeParameterizedQuery(
+          `MATCH (target) WHERE target.id = $nodeId
            OPTIONAL MATCH (target)-[r:CodeRelation]->(gc) WHERE r.type IN ['CONTAINS', 'DEFINES']
            WITH target, count(gc) AS childCount
            RETURN target.id AS id, target.name AS name, labels(target)[0] AS type,
-                  target.filePath AS filePath, childCount`
+                  target.filePath AS filePath, childCount`,
+          { nodeId },
         );
         if (targetRows.length === 0) {
           return { error: 'Node not found' };
@@ -1347,15 +1365,15 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
         const ancestors: typeof node[] = [];
         let currentId = nodeId;
         for (let i = 0; i < 10; i++) {
-          const safeCurrentId = currentId.replace(/'/g, "\\'");
-          const parentRows = await executeQuery(
+          const parentRows = await executeParameterizedQuery(
             `MATCH (parent)-[r:CodeRelation]->(child)
-             WHERE child.id = '${safeCurrentId}' AND r.type IN ['CONTAINS', 'DEFINES']
+             WHERE child.id = $currentId AND r.type IN ['CONTAINS', 'DEFINES']
              OPTIONAL MATCH (parent)-[r2:CodeRelation]->(gc) WHERE r2.type IN ['CONTAINS', 'DEFINES']
-             WITH parent, count(gc) AS childCount
+             With parent, count(gc) AS childCount
              RETURN parent.id AS id, parent.name AS name, labels(parent)[0] AS type,
                     parent.filePath AS filePath, childCount
-             LIMIT 1`
+             LIMIT 1`,
+            { currentId },
           );
           if (parentRows.length === 0) break;
           const pr = parentRows[0] as any;
@@ -1518,7 +1536,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
             try {
               let query = '';
               if (table === 'File') {
-                query = `MATCH (n:File) RETURN n.id AS id, n.name AS name, n.filePath AS filePath, n.content AS content LIMIT ${remaining}`;
+                query = `MATCH (n:File) RETURN n.id AS id, n.name AS name, n.filePath AS filePath LIMIT ${remaining}`;
               } else if (table === 'Folder') {
                 query = `MATCH (n:Folder) RETURN n.id AS id, n.name AS name, n.filePath AS filePath LIMIT ${remaining}`;
               } else if (table === 'Community') {
@@ -1526,7 +1544,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
               } else if (table === 'Process') {
                 query = `MATCH (n:Process) RETURN n.id AS id, n.label AS label, n.heuristicLabel AS heuristicLabel, n.processType AS processType, n.stepCount AS stepCount, n.communities AS communities, n.entryPointId AS entryPointId, n.terminalId AS terminalId LIMIT ${remaining}`;
               } else {
-                query = `MATCH (n:\`${table}\`) RETURN n.id AS id, n.name AS name, n.filePath AS filePath, n.startLine AS startLine, n.endLine AS endLine, n.content AS content LIMIT ${remaining}`;
+                query = `MATCH (n:\`${table}\`) RETURN n.id AS id, n.name AS name, n.filePath AS filePath, n.startLine AS startLine, n.endLine AS endLine LIMIT ${remaining}`;
               }
               const rows = await adapter.executeQuery(query);
               for (const row of rows) {
@@ -1538,7 +1556,6 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
                     filePath: row.filePath ?? row[2],
                     startLine: row.startLine,
                     endLine: row.endLine,
-                    content: row.content,
                     heuristicLabel: row.heuristicLabel,
                     cohesion: row.cohesion,
                     symbolCount: row.symbolCount,
