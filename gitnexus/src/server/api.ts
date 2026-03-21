@@ -1203,7 +1203,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
            WHERE parent.id = $parentId AND r.type IN ['CONTAINS', 'DEFINES']${prefixFilter}
            WITH child, labels(child)[0] AS type
            OPTIONAL MATCH (child)-[r2:CodeRelation]->(gc) WHERE r2.type IN ['CONTAINS', 'DEFINES']
-           With child, type, count(gc) AS childCount
+           WITH child, type, count(gc) AS childCount
            RETURN child.id AS id, child.name AS name, type, child.filePath AS filePath, childCount
            ORDER BY child.name
            SKIP ${offset} LIMIT ${limit}`,
@@ -1369,7 +1369,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
             `MATCH (parent)-[r:CodeRelation]->(child)
              WHERE child.id = $currentId AND r.type IN ['CONTAINS', 'DEFINES']
              OPTIONAL MATCH (parent)-[r2:CodeRelation]->(gc) WHERE r2.type IN ['CONTAINS', 'DEFINES']
-             With parent, count(gc) AS childCount
+             WITH parent, count(gc) AS childCount
              RETURN parent.id AS id, parent.name AS name, labels(parent)[0] AS type,
                     parent.filePath AS filePath, childCount
              LIMIT 1`,
