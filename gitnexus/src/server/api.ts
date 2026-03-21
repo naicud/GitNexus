@@ -53,7 +53,7 @@ const buildGraph = async (limit?: number): Promise<{ nodes: GraphNode[]; relatio
       const prevRemaining = remaining;
       let query = '';
       if (table === 'File') {
-        query = `MATCH (n:File) RETURN n.id AS id, n.name AS name, n.filePath AS filePath LIMIT ${remaining}`;
+        query = `MATCH (n:File) RETURN n.id AS id, n.name AS name, n.filePath AS filePath, n.content AS content LIMIT ${remaining}`;
       } else if (table === 'Folder') {
         query = `MATCH (n:Folder) RETURN n.id AS id, n.name AS name, n.filePath AS filePath LIMIT ${remaining}`;
       } else if (table === 'Community') {
@@ -74,6 +74,7 @@ const buildGraph = async (limit?: number): Promise<{ nodes: GraphNode[]; relatio
             filePath: row.filePath ?? row[2],
             startLine: row.startLine,
             endLine: row.endLine,
+            content: row.content,
             heuristicLabel: row.heuristicLabel,
             cohesion: row.cohesion,
             symbolCount: row.symbolCount,
@@ -1536,7 +1537,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
             try {
               let query = '';
               if (table === 'File') {
-                query = `MATCH (n:File) RETURN n.id AS id, n.name AS name, n.filePath AS filePath LIMIT ${remaining}`;
+                query = `MATCH (n:File) RETURN n.id AS id, n.name AS name, n.filePath AS filePath, n.content AS content LIMIT ${remaining}`;
               } else if (table === 'Folder') {
                 query = `MATCH (n:Folder) RETURN n.id AS id, n.name AS name, n.filePath AS filePath LIMIT ${remaining}`;
               } else if (table === 'Community') {
@@ -1556,6 +1557,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
                     filePath: row.filePath ?? row[2],
                     startLine: row.startLine,
                     endLine: row.endLine,
+                    content: row.content,
                     heuristicLabel: row.heuristicLabel,
                     cohesion: row.cohesion,
                     symbolCount: row.symbolCount,
