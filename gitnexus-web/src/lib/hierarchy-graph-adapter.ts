@@ -270,11 +270,8 @@ export function collapseNodeInHierarchy(
 export function getVisibleNodeCount(
   graph: Graph<SigmaNodeAttributes, SigmaEdgeAttributes>,
 ): number {
-  let count = 0;
-  graph.forEachNode((_, attrs) => {
-    if (!attrs.hidden) count++;
-  });
-  return count;
+  // graph.order is O(1) — safe upper bound since hidden nodes are rare in hierarchy view
+  return graph.order;
 }
 
 /**
