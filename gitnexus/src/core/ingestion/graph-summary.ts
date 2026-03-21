@@ -40,6 +40,60 @@ export interface GraphSummary {
 }
 
 /**
+ * Aggregates inter-group edges from the graph.
+ *
+ * Performs a single pass over all relationships (excluding MEMBER_OF and STEP_IN_PROCESS),
+ * counting edges between different groups and tracking edge types.
+ *
+ * @param graph - The knowledge graph to process
+ * @param nodeToGroup - Map from node IDs to their group keys
+ * @param resolveGroupId - Optional function to resolve group keys to group IDs (for structural summary)
+ * @returns Array of inter-group edge aggregations, sorted by count descending
+ */
+function aggregateInterGroupEdges(
+  graph: { forEachRelationship: (cb: (rel: { type: string; sourceId: string; targetId: string }) => void) => void },
+  nodeToGroup: Map<string, string>,
+  resolveGroupId?: (groupKey: string) => string | undefined,
+): InterGroupEdge[] {
+  const edgeKey = (src: string, tgt: string) => `${src}|||${tgt}`;
+  const interGroupMap = new Map<string, { count: number; types: Record<string, number> }>();
+
+  graph.forEachRelationship(rel => {
+    if (rel.type === 'MEMBER_OF' || rel.type === 'STEP_IN_PROCESS') return;
+
+    const srcGroupKey = nodeToGroup.get(rel.sourceId);
+    const tgtGroupKey = nodeToGroup.get(rel.targetId);
+    if (!srcGroupKey || !tgtGroupKey || srcGroupKey === tgtGroupKey) return;
+
+    const srcGroupId = resolveGroupId ? resolveGroupId(srcGroupKey) : srcGroupKey;
+    const tgtGroupId = resolveGroupId ? resolveGroupId(tgtGroupKey) : tgtGroupKey;
+    if (!srcGroupId || !tgtGroupId) return;
+
+    const key = edgeKey(srcGroupId, tgtGroupId);
+    const existing = interGroupMap.get(key);
+    if (existing) {
+      existing.count++;
+      existing.types[rel.type] = (existing.types[rel.type] || 0) + 1;
+    } else {
+      interGroupMap.set(key, { count: 1, types: { [rel.type]: 1 } });
+    }
+  });
+
+  const edges: InterGroupEdge[] = [];
+  for (const [key, data] of interGroupMap) {
+    const [src, tgt] = key.split('|||');
+    edges.push({
+      sourceGroupId: src,
+      targetGroupId: tgt,
+      count: data.count,
+      types: data.types,
+    });
+  }
+  edges.sort((a, b) => b.count - a.count);
+  return edges;
+}
+
+/**
  * Generate a graph summary from pipeline results and write it to disk.
  *
  * 1. Groups communities by heuristicLabel (reuses aggregateClusters pattern)
@@ -110,39 +164,7 @@ export async function generateGraphSummary(
   }
 
   // Step 3: Single pass over edges to count inter-group connections
-  const edgeKey = (src: string, tgt: string) => `${src}|||${tgt}`;
-  const interGroupMap = new Map<string, { count: number; types: Record<string, number> }>();
-
-  graph.forEachRelationship(rel => {
-    if (rel.type === 'MEMBER_OF' || rel.type === 'STEP_IN_PROCESS') return;
-
-    const srcGroup = nodeToGroup.get(rel.sourceId);
-    const tgtGroup = nodeToGroup.get(rel.targetId);
-    if (!srcGroup || !tgtGroup || srcGroup === tgtGroup) return;
-
-    const key = edgeKey(srcGroup, tgtGroup);
-    const existing = interGroupMap.get(key);
-    if (existing) {
-      existing.count++;
-      existing.types[rel.type] = (existing.types[rel.type] || 0) + 1;
-    } else {
-      interGroupMap.set(key, { count: 1, types: { [rel.type]: 1 } });
-    }
-  });
-
-  const interGroupEdges: InterGroupEdge[] = [];
-  for (const [key, data] of interGroupMap) {
-    const [src, tgt] = key.split('|||');
-    interGroupEdges.push({
-      sourceGroupId: src,
-      targetGroupId: tgt,
-      count: data.count,
-      types: data.types,
-    });
-  }
-
-  // Sort by count descending for consistent ordering
-  interGroupEdges.sort((a, b) => b.count - a.count);
+  const interGroupEdges = aggregateInterGroupEdges(graph, nodeToGroup);
 
   const summary: GraphSummary = {
     version: 1,
@@ -254,41 +276,11 @@ export async function generateStructuralSummary(
   }
 
   // Step 4: Single pass over relationships to count inter-group edges
-  const edgeKey = (src: string, tgt: string) => `${src}|||${tgt}`;
-  const interGroupMap = new Map<string, { count: number; types: Record<string, number> }>();
-
-  graph.forEachRelationship(rel => {
-    if (rel.type === 'MEMBER_OF' || rel.type === 'STEP_IN_PROCESS') return;
-
-    const srcGroupKey = nodeToGroup.get(rel.sourceId);
-    const tgtGroupKey = nodeToGroup.get(rel.targetId);
-    if (!srcGroupKey || !tgtGroupKey || srcGroupKey === tgtGroupKey) return;
-
-    const srcGroupId = groupKeyToId.get(srcGroupKey);
-    const tgtGroupId = groupKeyToId.get(tgtGroupKey);
-    if (!srcGroupId || !tgtGroupId) return;
-
-    const key = edgeKey(srcGroupId, tgtGroupId);
-    const existing = interGroupMap.get(key);
-    if (existing) {
-      existing.count++;
-      existing.types[rel.type] = (existing.types[rel.type] || 0) + 1;
-    } else {
-      interGroupMap.set(key, { count: 1, types: { [rel.type]: 1 } });
-    }
-  });
-
-  const interGroupEdges: InterGroupEdge[] = [];
-  for (const [key, data] of interGroupMap) {
-    const [src, tgt] = key.split('|||');
-    interGroupEdges.push({
-      sourceGroupId: src,
-      targetGroupId: tgt,
-      count: data.count,
-      types: data.types,
-    });
-  }
-  interGroupEdges.sort((a, b) => b.count - a.count);
+  const interGroupEdges = aggregateInterGroupEdges(
+    graph,
+    nodeToGroup,
+    (groupKey) => groupKeyToId.get(groupKey),
+  );
 
   const summary: GraphSummary = {
     version: 1,
