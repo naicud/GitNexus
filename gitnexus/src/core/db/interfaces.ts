@@ -29,6 +29,8 @@ export type DbConfig = LbugDbConfig | NeptuneDbConfig;
  * Used by the HTTP serve path and MCP tools for read queries.
  */
 export interface IDbQueryAdapter {
+  /** Stable identifier for this adapter instance (e.g. "lbug:repoName" or "endpoint:port") */
+  readonly id: string;
   executeQuery(cypher: string): Promise<Record<string, unknown>[]>;
   executeParameterized(cypher: string, params: Record<string, unknown>): Promise<Record<string, unknown>[]>;
   close(): Promise<void>;
