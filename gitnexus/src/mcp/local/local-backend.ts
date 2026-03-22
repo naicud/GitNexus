@@ -18,14 +18,13 @@ import {
   cleanupOldKuzuFiles,
   type RegistryEntry,
 } from '../../storage/repo-manager.js';
-import type { DbConfig, NeptuneDbConfig } from '../../core/db/interfaces.js';
+import type { DbConfig, NeptuneDbConfig, IDbQueryAdapter } from '../../core/db/interfaces.js';
+import { LbugQueryAdapter } from '../../core/db/lbug-query-adapter.js';
 import { NeptuneAdapter } from '../../core/db/neptune/neptune-adapter.js';
 import { invalidateNeptuneEmbeddingCache } from '../../core/db/neptune/neptune-vector-search.js';
 // AI context generation is CLI-only (gitnexus analyze)
 // import { generateAIContextFiles } from '../../cli/ai-context.js';
 
-/** Per-repo Neptune adapters (HTTP is stateless — no pool needed) */
-const neptuneAdapters = new Map<string, NeptuneAdapter>();
 
 /**
  * Quick test-file detection for filtering impact results.
@@ -98,6 +97,8 @@ export class LocalBackend {
   private repos: Map<string, RepoHandle> = new Map();
   private contextCache: Map<string, CodebaseContext> = new Map();
   private initializedRepos: Set<string> = new Set();
+  /** Per-repo query adapters (LbugQueryAdapter or NeptuneAdapter) */
+  private adapters = new Map<string, IDbQueryAdapter>();
   private reinitPromises: Map<string, Promise<void>> = new Map();
   private lastStalenessCheck: Map<string, number> = new Map();
 
@@ -172,10 +173,10 @@ export class LocalBackend {
         this.repos.delete(id);
         this.contextCache.delete(id);
         this.initializedRepos.delete(id);
-        const neptune = neptuneAdapters.get(id);
-        if (neptune) {
-          neptune.close().catch(() => {});
-          neptuneAdapters.delete(id);
+        const adapter = this.adapters.get(id);
+        if (adapter) {
+          adapter.close().catch(() => {});
+          this.adapters.delete(id);
         }
       }
     }
@@ -265,6 +266,40 @@ export class LocalBackend {
     return null; // Multiple repos, no param — ambiguous
   }
 
+  // ─── Adapter Factory ────────────────────────────────────────────────
+
+  /**
+   * Get or create the query adapter for a repo.
+   * Must be called after ensureInitialized().
+   */
+  private getAdapter(repoId: string): IDbQueryAdapter {
+    const cached = this.adapters.get(repoId);
+    if (cached) return cached;
+
+    const handle = this.repos.get(repoId);
+    if (!handle) throw new Error(`Unknown repo: ${repoId}`);
+
+    let adapter: IDbQueryAdapter;
+    if (handle.db?.type === 'neptune') {
+      adapter = new NeptuneAdapter(handle.db as NeptuneDbConfig);
+    } else {
+      adapter = new LbugQueryAdapter(
+        repoId,
+        (cypher) => executeQuery(repoId, cypher),
+        (cypher, params) => executeParameterized(repoId, cypher, params),
+      );
+    }
+
+    this.adapters.set(repoId, adapter);
+    return adapter;
+  }
+
+  /** Check if a repo uses Neptune backend */
+  private isNeptune(repoId: string): boolean {
+    const handle = this.repos.get(repoId);
+    return handle?.db?.type === 'neptune';
+  }
+
   // ─── Lazy LadybugDB Init ────────────────────────────────────────────
 
   private async ensureInitialized(repoId: string): Promise<void> {
@@ -278,8 +313,8 @@ export class LocalBackend {
 
     // Neptune path: create adapter if not yet registered (HTTP stateless — no init needed)
     if (handle.db?.type === 'neptune') {
-      if (!neptuneAdapters.has(repoId)) {
-        neptuneAdapters.set(repoId, new NeptuneAdapter(handle.db as NeptuneDbConfig));
+      if (!this.adapters.has(repoId)) {
+        this.getAdapter(repoId); // lazily creates and caches
       }
       this.initializedRepos.add(repoId);
       return;
@@ -432,7 +467,7 @@ export class LocalBackend {
     
     // Step 1: Run hybrid search to get matching symbols
     const searchLimit = processLimit * maxSymbolsPerProcess; // fetch enough raw results
-    const isNeptune = neptuneAdapters.has(repo.id);
+    const isNeptune = this.isNeptune(repo.id);
 
     let bm25Results: any[];
     let semanticResults: any[];
@@ -701,7 +736,7 @@ export class LocalBackend {
         const { embedQuery } = await import('../core/embedder.js');
         const queryVec = await embedQuery(query);
         const { neptuneSemanticSearch } = await import('../../core/db/neptune/neptune-vector-search.js');
-        const adapter = neptuneAdapters.get(repo.id);
+        const adapter = this.adapters.get(repo.id) as NeptuneAdapter | undefined;
         if (!adapter) return [];
         const rawResults = await neptuneSemanticSearch(adapter, queryVec, limit);
 
@@ -806,7 +841,7 @@ export class LocalBackend {
   private async cypher(repo: RepoHandle, params: { query: string }): Promise<any> {
     await this.ensureInitialized(repo.id);
 
-    const isNeptuneRepo = neptuneAdapters.has(repo.id);
+    const isNeptuneRepo = this.isNeptune(repo.id);
     if (!isNeptuneRepo && !isLbugReady(repo.id)) {
       return { error: 'LadybugDB not ready. Index may be corrupted.' };
     }
@@ -1810,35 +1845,29 @@ export class LocalBackend {
     };
   }
 
-  // ─── Neptune-aware query dispatch ───────────────────────────────
+  // ─── Adapter-based query dispatch ──────────────────────────────
 
   /**
    * Execute a Cypher query against the correct backend for a given repo.
    */
   private async runQuery(repoId: string, cypher: string): Promise<any[]> {
-    if (neptuneAdapters.has(repoId)) {
-      return neptuneAdapters.get(repoId)!.executeQuery(cypher);
-    }
-    return executeQuery(repoId, cypher);
+    return this.getAdapter(repoId).executeQuery(cypher);
   }
 
   /**
    * Execute a parameterized Cypher query against the correct backend.
    */
   private async runParameterized(repoId: string, cypher: string, params: Record<string, unknown>): Promise<any[]> {
-    if (neptuneAdapters.has(repoId)) {
-      return neptuneAdapters.get(repoId)!.executeParameterized(cypher, params);
-    }
-    return executeParameterized(repoId, cypher, params);
+    return this.getAdapter(repoId).executeParameterized(cypher, params);
   }
 
   async disconnect(): Promise<void> {
-    // Close all Neptune adapters
-    for (const [, adapter] of neptuneAdapters) {
+    // Close all adapters (Neptune adapters close HTTP; LbugQueryAdapter is a noop)
+    for (const [, adapter] of this.adapters) {
       adapter.close().catch(() => {});
     }
-    neptuneAdapters.clear();
-    await closeLbug(); // close all connections
+    this.adapters.clear();
+    await closeLbug(); // close all LadybugDB connections
     // Note: we intentionally do NOT call disposeEmbedder() here.
     // ONNX Runtime's native cleanup segfaults on macOS and some Linux configs,
     // and importing the embedder module on Node v24+ crashes if onnxruntime
