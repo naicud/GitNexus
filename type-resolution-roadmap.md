@@ -51,170 +51,140 @@ The goal is not to build a compiler. The goal is to support high-value static an
 - Fixpoint iterates until stable (max 10 iterations), enabling chains like `getUser() → .address → .getCity() → city.save()`
 - Reverse-order copy chains now resolve (`const b = a; const a: User = x` → both resolve)
 
+### Milestone D — Completeness ✅
+
+**Shipped in** `feat/type-resolution-milestone-d` (PR #387). Consolidated original Phases 10–13 into 3 balanced phases.
+
+#### Phase A: Fixpoint Completeness ✅
+
+- Post-fixpoint for-loop replay (ex-9B): `pendingForLoops` collection + replay after fixpoint resolves iterable types
+- Object destructuring via `fieldAccess` items (TS/JS `object_pattern`, Rust `struct_pattern`) — no new `destructure` PendingAssignment variant needed
+- Extracted `resolveFixpointBindings()` helper with exhaustive switch + `classDefCache` memoization
+
+#### Phase B: Inheritance & Receivers ✅
+
+- `BuildTypeEnvOptions` interface replacing positional params for `buildTypeEnv`
+- Heritage pre-pass constructing `parentMap` from tree-sitter query matches (not graph edges — heritage-processor runs in parallel)
+- MRO-aware `walkParentChain()` (depth 5, cycle-safe BFS) for `resolveFieldType` and `resolveMethodReturnType`
+- `this`/`self`/`$this`/`Me` receiver substitution via `substituteThisReceiver` hook
+- Go `inc_statement`/`dec_statement` write-access queries
+
+#### Phase C: Branch-Sensitive Narrowing ✅
+
+- Null-check narrowing (`!= null`, `!== undefined`, `is not null`) via position-indexed `patternOverrides`
+- Supported for TS, Kotlin, C# — renamed `PATTERN_BRANCH_TYPES` → `NARROWING_BRANCH_TYPES`
+- Bug fix: Kotlin narrowing required 3 fixes in `jvm.ts` (AST node type `equality_expression`, anonymous `null` node, `nullable_type` parameter fallback)
+
+#### Deferred from Milestone D
+
+- **Type predicates (13A):** Cross-function analysis for niche TS `x is User` feature — deferred
+- **Swift parity (11D):** tree-sitter-swift Node 22 issues — all Swift work consolidated to Phase S
+- **Positional destructuring (12C):** Python/Kotlin/C#/C++ tuple-position-to-field mapping — deferred
+- **Discriminated union narrowing (13C):** Needs tagged union metadata not in SymbolTable — deferred
+
+#### Integration Test Coverage
+
+17 fixture directories, 23 describe blocks, 705 lines of test code covering all 11 languages:
+- Grandparent MRO (depth-2 C→B→A): TS, JS, Kotlin, C#, C++, Java, PHP, Python, Ruby
+- Object destructuring: TS, JS
+- Struct destructuring: Rust
+- Post-fixpoint for-loop replay: TS, JS
+- Go inc/dec write access
+- Null-check narrowing: TS, C#, Kotlin
+
 ---
 
 ## Open Phases
 
-### Phase 10: Loop-Fixpoint Bridge
+### Phase P: Polymorphism & Overloading
 
-**Supersedes Phase 9B.** For-loop element bindings run during `walk()` before the fixpoint. Variables typed by the fixpoint are invisible to for-loop extraction.
+**Plan:** `docs/plans/2026-03-19-feat-polymorphism-overloading-type-resolution-plan.md`
 
-**Problem:**
-```typescript
-const users = getUsers();       // fixpoint: users → User[]
-for (const u of users) {        // walk-time: users untyped → u unresolved
-  u.save();                     // missed CALLS edge
-}
-```
+Four incremental phases:
+1. **Parameter type metadata** — extend `SymbolDefinition` with `parameterTypes: string[]` extracted during parsing — **DELIVERED**
+2. **Overload disambiguation** — filter overloaded methods by argument literal types at call sites — **DELIVERED** (Java, Kotlin, C#, C++, TypeScript)
+3. **Constructor-visible virtual dispatch** — `Base b = new Derived(); b.method()` resolves to `Derived#method` when constructor type is a known subclass — **DELIVERED** (Java, C#, TS, C++, Kotlin via `detectConstructorType` hook, C++ smart pointers via `make_shared`/`make_unique`)
+4. **Optional parameter arity resolution** — calls with omitted optional/default args now resolve via `requiredParameterCount` range check — **DELIVERED** (TS, Python, Kotlin, C#, C++, PHP, Ruby)
+5. **Covariant return type awareness** — prefer child's return type over inherited definition
 
-**Approach:** Post-fixpoint for-loop replay. During `walk()`, store for-loop AST nodes whose iterable is unresolved. After fixpoint completes, replay `extractForLoopBinding` on those nodes using the now-resolved iterable types.
+Languages benefiting: Java, Kotlin, C#, C++, TypeScript (overloading). All OOP languages (virtual dispatch).
 
-**Scope:**
-- Infrastructure: `pendingForLoops` collection + replay (~20 lines in `type-env.ts`)
-- No extractor changes — reuses existing `extractForLoopBinding`
-- Swift: add for-loop element binding (currently missing)
-- Nested for-loops with field-dependent iterables are NOT replayed (handled by call-processor chain resolution)
-
-**Risks:** AST node lifetime (safe — nodes valid within `buildTypeEnv` lifetime).
-
-**Impact: High | Effort: Low-Medium**
+**Impact: High | Effort: High** (P.1–P.4 delivered; P.5 covariant return types remains open)
 
 ---
 
-### Phase 11: Inheritance & this/self
+### Phase S: Swift Parity
 
-Four items sharing infrastructure.
+**Blocked on** tree-sitter-swift Node 22 compatibility.
 
-#### 11A: MRO-aware field and method lookups
-
-**Problem:** `lookupFieldByOwner` only finds direct fields. Inherited fields (`Admin extends User`, field on `User`) don't resolve.
-
-**Approach:** Pre-compute `parentMap: Map<nodeId, nodeId[]>` from EXTENDS + IMPLEMENTS edges. Pass to `buildTypeEnv`. Update `resolveFieldType` and `resolveMethodReturnType` to walk parent chain on miss (max depth 5, cycle-safe, first-match-wins for diamond inheritance).
-
-Includes IMPLEMENTS edges so interface-declared fields/methods resolve (Java, Kotlin, C#).
-
-#### 11B: this/self in fixpoint
-
-**Problem:** `this.field` and `this.method()` emit pending items with `receiver: 'this'`, but `scopeEnv.get('this')` returns `undefined`.
-
-**Approach:** At collection time during `walk()`, resolve the enclosing class name immediately via `findEnclosingClassName()` and substitute it as the receiver. Covers both `fieldAccess` and `methodCallResult`. No fixpoint changes needed. 5-10 lines per extractor.
-
-#### 11C: Go inc/dec write access
-
-**Problem:** `obj.field++`/`obj.field--` produce `inc_statement`/`dec_statement` — write-access tracking doesn't see them.
-
-**Approach:** Add these node types to call-processor write detection (~5 lines).
-
-#### 11D: Swift assignment chains
-
-**Problem:** Swift has no `extractPendingAssignment` — copy/callResult/fieldAccess/methodCallResult don't work.
-
-**Approach:** Implement `extractPendingAssignment` for Swift covering all 4 binding kinds.
-
-**Risks:** Performance of parent chain walking in fixpoint (bounded by `n_pending × depth × iterations`). Interface method ambiguity (mitigated by checking direct class first, parents on miss).
-
-**Impact: Medium-High | Effort: Medium**
-
----
-
-### Phase 12: Destructuring
-
-**Problem:** `const { address, name } = user` produces no bindings — LHS is a pattern node, not an identifier.
-
-**Approach:** Add `{ kind: 'destructure', source, bindings: [{ varName, fieldName }] }` to `PendingAssignment`. In the fixpoint, when source's type resolves, look up each field via `lookupFieldByOwner` and bind each variable.
-
-Works without Phase 11A (direct fields only). Phase 11A MRO enhances it to resolve inherited fields too.
-
-**Phased delivery:**
-
-| Sub-phase | Scope | Languages |
-|-----------|-------|-----------|
-| **12A** | Object destructuring | TS/JS (`object_pattern`) |
-| **12B** | Struct pattern destructuring | Rust (`struct_pattern`) |
-| **12C** (deferred) | Positional destructuring | Python, Kotlin, C#, C++ — needs tuple-position-to-field mapping |
-
-Skip: computed properties, rest elements, nested destructuring (`{ address: { city } }` — deferred).
-
-**Risks:** Nested destructuring requires recursive resolution (explicitly deferred).
+- For-loop element binding (from Phase 10)
+- Assignment chains: copy, callResult, fieldAccess, methodCallResult (from Phase 11D)
+- `guard let` narrowing (from Phase 13B) — uses scopeEnv path, not `patternOverrides`
 
 **Impact: Medium | Effort: Medium**
 
 ---
 
-### Phase 13: Branch-Sensitive Narrowing
+### Phase 14: Cross-File Binding Propagation ✅
 
-**Design principle:** Targeted narrowing, not general control-flow analysis. Skip anything that requires a control-flow graph.
+**Shipped in** `feat/phase14-cross-file-binding-propagation`.
 
-**Phased delivery:**
+Three enrichment mechanisms:
+- **E1:** `seedCrossFileReceiverTypes` — pre-seeds `receiverTypeName` for single-hop imported receivers (zero re-parse)
+- **E2:** `ExportedTypeMap` seeded into `importedBindings` for re-resolution pass
+- **E3:** `buildImportedReturnTypes` — cross-file return types for imported callables (local-first, SymbolTable takes precedence)
 
-#### 13A: Type predicate functions (TS only)
+Architecture:
+- Topological import ordering via Kahn's BFS (`topologicalLevelSort`, returns `{ levels, cycleCount }`)
+- Cycle-safe: files in cycles grouped in final level, no cross-cycle propagation
+- `runCrossFileBindingPropagation()` extracted as standalone pipeline phase
+- `synthesizeWildcardImportBindings()` expands whole-module imports (Go/Ruby/C/C++/Swift) into per-symbol namedImportMap entries from graph-exported symbols — runs before Phase 14
+- Worker path: `buildExportedTypeMapFromGraph` collects Tier 0 (annotated) exports only
+- Sequential path: `collectExportedBindings` captures full fixpoint-inferred exports
 
-`function isUser(x: unknown): x is User` — detect `type_predicate` return type. When called in an `if` condition, emit pattern binding for the narrowed parameter.
+**Per-language Phase 14 coverage:**
+| Language | namedImportMap | ExportedTypeMap (E1/E2) | E3 (importedReturnTypes) | Benefit |
+|----------|:-:|:-:|:-:|---|
+| TypeScript | Full (named imports) | File-scope vars | Full | **High** |
+| JavaScript | Full (named imports) | File-scope vars | Full | **High** |
+| Python | from-imports | File-scope vars | Full | **High** |
+| Kotlin | Top-level fns | Top-level props | Full | **High** |
+| Rust | use clauses | Limited | Full | **High** |
+| Go | Synthesized¹ | Exported symbols | Full | **Medium** |
+| Ruby | Synthesized¹ | Exported symbols | Full | **Medium** |
+| C/C++ | Synthesized¹ | Exported symbols | Full | **Medium** |
+| Swift | Synthesized¹ | Exported symbols | Full | **Low** (Phase S blocked) |
+| PHP | use classes | Inert (class-scope) | Inert (no fn imports) | **Marginal** |
+| Java | Classes + static methods | Inert (no file-scope) | Via SymbolTable | **Medium** |
+| C# | Alias + `using static` | Inert (no file-scope) | Via SymbolTable | **Medium** |
 
-#### 13B: Nullability narrowing (TS/Kotlin/C#/Swift)
+¹ Whole-module import languages: namedImportMap entries synthesized from graph-exported symbols via `synthesizeWildcardImportBindings()` (capped at 1000 per file)
 
-`if (x != null)` → strip nullable wrapper in truthy branch. Uses existing `patternOverrides` mechanism (position-indexed, scope-aware). Swift `guard let` uses standard scopeEnv (narrowing persists for rest of function). Swift work requires Phase 11D (assignment chains) first.
+**Named binding extraction details:**
+- Java: `import static X.Y.method` now captured (static modifier detection). Ambiguous static imports (same method from multiple classes) fall through to Tier 2a for arity narrowing.
+- C#: `using static NS.Type;` now captured (last segment as class binding). Non-alias `using NS;` remains unsupported (namespace import requires type inference).
 
-#### 13C: Discriminated union narrowing (deferred)
+**Resolved limitations (this PR):**
+- ~~Worker path vs sequential path quality split~~ — workers now return file-scope TypeEnv bindings; main thread merges fixpoint-inferred exports into ExportedTypeMap (filtered by graph `isExported`)
+- ~~`lookupRawReturnType` no cross-file fallback~~ — separate `importedRawReturnTypes` map stores raw declared types (e.g., `User[]`) for for-loop element extraction via `extractElementTypeFromString`
+- ~~C++ header method declarations~~ — tree-sitter query fix: `field_identifier` added to declaration pattern alongside `identifier`, plus pointer/reference return type variants
 
-`if (shape.kind === 'circle')` → needs tagged union metadata not in SymbolTable. Defer.
-
-**What we skip entirely:** Full control-flow graph, arbitrary conditional narrowing, `typeof` guards, exhaustiveness checking.
-
-**Risks:** Scope leakage (mitigated by `patternOverrides` position indexing). Swift `guard let` needs scopeEnv path (different from `patternOverrides`).
-
-**Impact: Medium | Effort: Medium-High**
-
----
-
-### Phase 14: Cross-File Binding Propagation
-
-**Problem:** `buildTypeEnv` is per-file. Inferred types don't cross file boundaries.
-
-```typescript
-// file-a.ts — fixpoint resolves: config → Config
-export const config = getConfig();
-
-// file-b.ts — config has no type
-import { config } from './file-a';
-config.validate();  // missed
-```
-
-**Approach: Export-type index.** After each file's fixpoint, export resolved bindings for exported symbols into `ExportedBindings: Map<filePath, Map<symbolName, typeName>>`. Subsequent files seed scopeEnv from this index for imported symbols.
-
-**Details:**
-- Process files in topological import order (import-processor already builds the dependency graph)
-- Re-exports: follow import chain transitively in `ExportedBindings`
-- Barrel files (`index.ts`): chain of re-exports — same mechanism
-- Default exports: keyed as `"default"` in the map, mapped to local name at import site
-- Dynamic imports (`import()`, conditional `require()`): excluded — runtime-only edges
-- Circular imports: files in a cycle processed in arbitrary order within the cycle; cross-cycle bindings don't propagate (conservative)
-- Parallelism preserved within topological levels
-
-**Why this is last:** Every earlier phase makes the per-file fixpoint stronger, reducing cases where cross-file propagation is needed. This is also the highest-risk architectural change.
-
-**Risks:** Topological ordering correctness (mitigated by reusing import-processor's existing graph). Re-export chain depth (bounded by import depth, typically 2-3). Memory for `ExportedBindings` (~100K entries for 10K-file monorepo — negligible).
-
-**Impact: High | Effort: High**
+**Impact: High | Effort: High** — delivered
 
 ---
 
 ## Dependency Graph
 
 ```
-Phase 10 (loops) ──────────────────────┐
-                                       │
-Phase 11 (MRO + this + Go + Swift) ───┤
-                                       ├──→ Phase 14 (cross-file)
-Phase 12 (destructuring) ─────────────┤
-                                       │
-Phase 13 (branch narrowing) ───────────┘
+Milestone D (Phases A, B, C) ✅ ──┐
+                                   ├──→ Phase 14 (cross-file) ✅
+Phase P (polymorphism) ───────────┤
+                                   │
+Phase S (Swift parity) ───────────┘
 
-Phases 10–13 are independent of each other.
-  Exception: Phase 13B Swift (guard let) requires Phase 11D (Swift assignment chains).
-  Exception: Phase 12 benefits from Phase 11A (MRO) but works without it.
-Phase 14 depends on all of 10–13 being stable.
-Swift parity threaded through Phases 10–13 incrementally.
+Phase P.1–P.4 are delivered. P.5 (covariant return types) remains open.
+Phase P and Phase S are independent of each other and Phase 14.
+Phase 14 is delivered. Remaining open: Phase P.5, Phase S.
 ```
 
 ---
@@ -222,20 +192,15 @@ Swift parity threaded through Phases 10–13 incrementally.
 ## Language-Specific Gaps (remaining)
 
 ### Swift
-- For-loop element binding → Phase 10
-- Assignment chains (copy, callResult, fieldAccess, methodCallResult) → Phase 11D
-- Pattern binding → Phase 13B (`guard let`)
+- For-loop element binding → Phase S
+- Assignment chains (copy, callResult, fieldAccess, methodCallResult) → Phase S
+- `guard let` narrowing → Phase S
 
-### Go
-- `obj.field++`/`obj.field--` write ACCESSES → Phase 11C
-
-### Rust
-- Struct-pattern field destructuring → Phase 12B
+### Kotlin
+- ~~Virtual dispatch: `Dog()` uses `call_expression` (no `new` keyword)~~ — **RESOLVED** via `detectConstructorType` hook
 
 ### All languages
-- Inherited field/method resolution → Phase 11A
-- `this`/`self` in fixpoint → Phase 11B
-- Cross-file binding propagation → Phase 14
+- ~~Cross-file binding propagation → Phase 14~~ — **DELIVERED** for all 13 languages via two mechanisms: (1) named import extraction (TS/JS/Python/Kotlin/Rust/PHP/Java/C#), (2) wildcard import synthesis from graph-exported symbols (Go/Ruby/C/C++/Swift). Remaining gap: C# non-alias `using NS;` (namespace import, requires type inference).
 
 ---
 
@@ -253,13 +218,21 @@ Field/property maps, deep chains, mixed chains, stdlib passthroughs.
 
 Unified fixpoint loop, call-result binding, field access binding, method-call-result binding, arbitrary-depth chain propagation.
 
-### Milestone D — Completeness ← **next** (Phases 10–13)
+### Milestone D — Completeness ✅ (Phases A, B, C)
 
-Loop-fixpoint bridge, inheritance walking, `this`/`self` resolution, destructuring, branch narrowing, Swift parity.
+Consolidated Phases 10–13 into 3 balanced phases. Loop-fixpoint bridge, MRO-aware inheritance walking, `this`/`self` resolution, object/struct destructuring, null-check narrowing. Kotlin null-check bug fix. Full 11-language integration test coverage.
 
-### Milestone E — Cross-Boundary (Phase 14)
+### Milestone E — Cross-Boundary ✅ (Phase 14)
 
-Export-type index, cross-file binding propagation.
+Export-type index, cross-file binding propagation. Full coverage for TS/JS/Python/Kotlin. Marginal for PHP. Inert for Java/C#/Go/Ruby/C/C++ (relies on Phase 9 SymbolTable).
+
+### Milestone P — Polymorphism & Overloading (Phase P)
+
+Parameter type metadata, overload disambiguation, constructor-visible virtual dispatch (including Kotlin `detectConstructorType` and C++ smart pointer factories), optional parameter arity resolution, covariant return types (open).
+
+### Milestone S — Swift Parity (Phase S)
+
+For-loop binding, assignment chains, `guard let` narrowing. Blocked on tree-sitter-swift Node 22.
 
 ---
 
@@ -294,8 +267,6 @@ That supports: better call graphs, more accurate impact analysis, stronger AI co
 
 ## Summary
 
-**Complete:** Phases 7, 8, 9, 9C — explicit types, constructor inference, loop inference, field/property resolution, deep chains, mixed chains, stdlib passthroughs, comment-based types, unified fixpoint with 4 binding kinds, arbitrary-depth chain propagation across 11 languages.
+**Complete:** Phases 7, 8, 9, 9C, Milestone D (A, B, C) — explicit types, constructor inference, loop inference, field/property resolution, deep chains, mixed chains, stdlib passthroughs, comment-based types, unified fixpoint with 4 binding kinds, arbitrary-depth chain propagation, MRO-aware inheritance walking, this/self resolution, object/struct destructuring, null-check narrowing — across 11 languages with full integration test coverage.
 
-**Next:** Phase 10 (loop-fixpoint bridge) → Phase 11 (MRO + this/self + Go + Swift) → Phase 12 (destructuring) → Phase 13 (branch narrowing) → Phase 14 (cross-file propagation).
-
-Each phase is independently deliverable (except Phase 14 which depends on 10–13 being stable). Swift parity is threaded incrementally through Phases 10–13.
+**Next:** Phase 14 (cross-file binding propagation) — the architectural capstone. Phase S (Swift parity) is independent and unblocked once tree-sitter-swift Node 22 is resolved.

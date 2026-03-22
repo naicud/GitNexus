@@ -19,6 +19,10 @@ export const TYPESCRIPT_QUERIES = `
 (function_declaration
   name: (identifier) @name) @definition.function
 
+; TypeScript overload signatures (function_signature is a separate node type from function_declaration)
+(function_signature
+  name: (identifier) @name) @definition.function
+
 (method_definition
   name: (property_identifier) @name) @definition.method
 
@@ -350,6 +354,16 @@ export const GO_QUERIES = `
       operand: (_) @assignment.receiver
       field: (field_identifier) @assignment.property))
   right: (_)) @assignment
+
+; Write access: obj.field++ / obj.field--
+(inc_statement
+  (selector_expression
+    operand: (_) @assignment.receiver
+    field: (field_identifier) @assignment.property)) @assignment
+(dec_statement
+  (selector_expression
+    operand: (_) @assignment.receiver
+    field: (field_identifier) @assignment.property)) @assignment
 `;
 
 // C++ queries - works with tree-sitter-cpp
@@ -406,14 +420,35 @@ export const CPP_QUERIES = `
   declarator: (reference_declarator
     (field_identifier) @name)) @definition.property
 
-; Inline class method declarations (inside class body, no body: void Foo();)
-(field_declaration declarator: (function_declarator declarator: (identifier) @name)) @definition.method
+; Inline class method declarations (inside class body, no body: void save();)
+; tree-sitter-cpp uses field_identifier (not identifier) for names inside class bodies
+(field_declaration declarator: (function_declarator declarator: [(field_identifier) (identifier)] @name)) @definition.method
+
+; Inline class method declarations returning a pointer (User* lookup();)
+(field_declaration declarator: (pointer_declarator declarator: (function_declarator declarator: [(field_identifier) (identifier)] @name))) @definition.method
+
+; Inline class method declarations returning a reference (User& lookup();)
+(field_declaration declarator: (reference_declarator (function_declarator declarator: [(field_identifier) (identifier)] @name))) @definition.method
 
 ; Inline class method definitions (inside class body, with body: void Foo() { ... })
 (field_declaration_list
   (function_definition
     declarator: (function_declarator
       declarator: [(field_identifier) (identifier) (operator_name) (destructor_name)] @name)) @definition.method)
+
+; Inline class methods returning a pointer type (User* lookup(int id) { ... })
+(field_declaration_list
+  (function_definition
+    declarator: (pointer_declarator
+      declarator: (function_declarator
+        declarator: [(field_identifier) (identifier) (operator_name)] @name))) @definition.method)
+
+; Inline class methods returning a reference type (User& lookup(int id) { ... })
+(field_declaration_list
+  (function_definition
+    declarator: (reference_declarator
+      (function_declarator
+        declarator: [(field_identifier) (identifier) (operator_name)] @name))) @definition.method)
 
 ; Templates
 (template_declaration (class_specifier name: (type_identifier) @name)) @definition.template

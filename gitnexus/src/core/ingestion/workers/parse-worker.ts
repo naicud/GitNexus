@@ -31,6 +31,7 @@ import {
   isBuiltInOrNoise,
   getDefinitionNodeFromCaptures,
   findEnclosingClassId,
+  getLabelFromCaptures,
   extractMethodSignature,
   countCallArguments,
   inferCallForm,
@@ -45,8 +46,8 @@ import { isNodeExported } from '../export-detection.js';
 import { detectFrameworkFromAST } from '../framework-detection.js';
 import { typeConfigs } from '../type-extractors/index.js';
 import { generateId } from '../../../lib/utils.js';
-import { extractNamedBindings } from '../named-binding-extraction.js';
-import { appendKotlinWildcard } from '../resolvers/index.js';
+import { namedBindingExtractors, preprocessImportPath } from '../import-resolution.js';
+import type { NamedBinding } from '../import-resolution.js';
 import { callRouters } from '../call-routing.js';
 import { extractPropertyDeclaredType } from '../type-extractors/shared.js';
 import type { NodeLabel } from '../../graph/types.js';
@@ -69,6 +70,7 @@ interface ParsedNode {
     astFrameworkReason?: string;
     description?: string;
     parameterCount?: number;
+    requiredParameterCount?: number;
     returnType?: string;
   };
 }
@@ -88,6 +90,8 @@ interface ParsedSymbol {
   nodeId: string;
   type: NodeLabel;
   parameterCount?: number;
+  requiredParameterCount?: number;
+  parameterTypes?: string[];
   returnType?: string;
   declaredType?: string;
   ownerId?: string;
@@ -98,7 +102,7 @@ export interface ExtractedImport {
   rawImportPath: string;
   language: SupportedLanguages;
   /** Named bindings from the import (e.g., import {User as U} → [{local:'U', exported:'User'}]) */
-  namedBindings?: { local: string; exported: string }[];
+  namedBindings?: NamedBinding[];
 }
 
 export interface ExtractedCall {
@@ -161,6 +165,13 @@ export interface FileConstructorBindings {
   bindings: ConstructorBinding[];
 }
 
+/** File-scope type bindings from TypeEnv fixpoint — used for cross-file ExportedTypeMap. */
+export interface FileTypeEnvBindings {
+  filePath: string;
+  /** [varName, typeName] pairs from file scope (scope = '') */
+  bindings: [string, string][];
+}
+
 export interface ParseWorkerResult {
   nodes: ParsedNode[];
   relationships: ParsedRelationship[];
@@ -171,6 +182,8 @@ export interface ParseWorkerResult {
   heritage: ExtractedHeritage[];
   routes: ExtractedRoute[];
   constructorBindings: FileConstructorBindings[];
+  /** File-scope type bindings from TypeEnv fixpoint for exported symbol collection. */
+  typeEnvBindings: FileTypeEnvBindings[];
   skippedLanguages: Record<string, number>;
   fileCount: number;
 }
@@ -246,39 +259,7 @@ const findEnclosingFunctionId = (node: any, filePath: string): string | null => 
   return null;
 };
 
-// ============================================================================
-// Label detection from capture map
-// ============================================================================
-
-const getLabelFromCaptures = (captureMap: Record<string, any>): NodeLabel | null => {
-  // Skip imports (handled separately) and calls
-  if (captureMap['import'] || captureMap['call']) return null;
-  if (!captureMap['name']) return null;
-
-  if (captureMap['definition.function']) return 'Function';
-  if (captureMap['definition.class']) return 'Class';
-  if (captureMap['definition.interface']) return 'Interface';
-  if (captureMap['definition.method']) return 'Method';
-  if (captureMap['definition.struct']) return 'Struct';
-  if (captureMap['definition.enum']) return 'Enum';
-  if (captureMap['definition.namespace']) return 'Namespace';
-  if (captureMap['definition.module']) return 'Module';
-  if (captureMap['definition.trait']) return 'Trait';
-  if (captureMap['definition.impl']) return 'Impl';
-  if (captureMap['definition.type']) return 'TypeAlias';
-  if (captureMap['definition.const']) return 'Const';
-  if (captureMap['definition.static']) return 'Static';
-  if (captureMap['definition.typedef']) return 'Typedef';
-  if (captureMap['definition.macro']) return 'Macro';
-  if (captureMap['definition.union']) return 'Union';
-  if (captureMap['definition.property']) return 'Property';
-  if (captureMap['definition.record']) return 'Record';
-  if (captureMap['definition.delegate']) return 'Delegate';
-  if (captureMap['definition.annotation']) return 'Annotation';
-  if (captureMap['definition.constructor']) return 'Constructor';
-  if (captureMap['definition.template']) return 'Template';
-  return 'CodeElement';
-};
+// Label detection moved to shared getLabelFromCaptures in utils.ts
 
 // DEFINITION_CAPTURE_KEYS and getDefinitionNodeFromCaptures imported from ../utils.js
 
@@ -298,6 +279,7 @@ const processBatch = (files: ParseWorkerInput[], onProgress?: (filesProcessed: n
     heritage: [],
     routes: [],
     constructorBindings: [],
+    typeEnvBindings: [],
     skippedLanguages: {},
     fileCount: 0,
   };
@@ -890,21 +872,55 @@ const processFileGroup = (
     result.fileCount++;
     onFileProcessed?.();
 
-    // Build per-file type environment + constructor bindings in a single AST walk.
-    // Constructor bindings are verified against the SymbolTable in processCallsFromExtracted.
-    const typeEnv = buildTypeEnv(tree, language);
-    const callRouter = callRouters[language];
-
-    if (typeEnv.constructorBindings.length > 0) {
-      result.constructorBindings.push({ filePath: file.path, bindings: [...typeEnv.constructorBindings] });
-    }
-
     let matches;
     try {
       matches = query.matches(tree.rootNode);
     } catch (err) {
       console.warn(`Query execution failed for ${file.path}: ${err instanceof Error ? err.message : String(err)}`);
       continue;
+    }
+
+    // Pre-pass: extract heritage from query matches to build parentMap for buildTypeEnv.
+    // Heritage edges (EXTENDS/IMPLEMENTS) are created by heritage-processor which runs
+    // in PARALLEL with call-processor, so the graph edges don't exist when buildTypeEnv
+    // runs. This pre-pass makes parent class information available for type resolution.
+    const fileParentMap = new Map<string, string[]>();
+    for (const match of matches) {
+      const captureMap: Record<string, any> = {};
+      for (const c of match.captures) {
+        captureMap[c.name] = c.node;
+      }
+      if (captureMap['heritage.class'] && captureMap['heritage.extends']) {
+        const className: string = captureMap['heritage.class'].text;
+        const parentName: string = captureMap['heritage.extends'].text;
+        // Skip Go named fields (only anonymous fields are struct embedding)
+        const extendsNode = captureMap['heritage.extends'];
+        const fieldDecl = extendsNode.parent;
+        if (fieldDecl?.type === 'field_declaration' && fieldDecl.childForFieldName('name')) continue;
+        let parents = fileParentMap.get(className);
+        if (!parents) { parents = []; fileParentMap.set(className, parents); }
+        if (!parents.includes(parentName)) parents.push(parentName);
+      }
+    }
+
+    // Build per-file type environment + constructor bindings in a single AST walk.
+    // Constructor bindings are verified against the SymbolTable in processCallsFromExtracted.
+    const parentMap: ReadonlyMap<string, readonly string[]> = fileParentMap;
+    const typeEnv = buildTypeEnv(tree, language, { parentMap });
+    const callRouter = callRouters[language];
+
+    if (typeEnv.constructorBindings.length > 0) {
+      result.constructorBindings.push({ filePath: file.path, bindings: [...typeEnv.constructorBindings] });
+    }
+
+    // Extract file-scope bindings for ExportedTypeMap (closes worker/sequential quality gap).
+    // Sequential path uses collectExportedBindings(typeEnv) directly; worker path serializes
+    // these bindings so the main thread can merge them into ExportedTypeMap.
+    const fileScope = typeEnv.env.get('');
+    if (fileScope && fileScope.size > 0) {
+      const bindings: [string, string][] = [];
+      for (const [name, type] of fileScope) bindings.push([name, type]);
+      result.typeEnvBindings.push({ filePath: file.path, bindings });
     }
 
     for (const match of matches) {
@@ -915,10 +931,10 @@ const processFileGroup = (
 
       // Extract import paths before skipping
       if (captureMap['import'] && captureMap['import.source']) {
-        const rawImportPath = language === SupportedLanguages.Kotlin
-          ? appendKotlinWildcard(captureMap['import.source'].text.replace(/['"<>]/g, ''), captureMap['import'])
-          : captureMap['import.source'].text.replace(/['"<>]/g, '');
-        const namedBindings = extractNamedBindings(captureMap['import'], language);
+        const rawImportPath = preprocessImportPath(captureMap['import.source'].text, captureMap['import'], language);
+        if (!rawImportPath) continue;
+        const extractor = namedBindingExtractors[language];
+        const namedBindings = extractor ? extractor(captureMap['import']) : undefined;
         result.imports.push({
           filePath: file.path,
           rawImportPath,
@@ -1117,25 +1133,8 @@ const processFileGroup = (
         }
       }
 
-      const nodeLabel = getLabelFromCaptures(captureMap);
+      const nodeLabel = getLabelFromCaptures(captureMap, language);
       if (!nodeLabel) continue;
-
-      // C/C++: @definition.function is broad and also matches inline class methods (inside
-      // a class/struct body). Those are already captured by @definition.method, so skip
-      // the duplicate Function entry to prevent double-indexing in globalIndex.
-      if (
-        (language === SupportedLanguages.CPlusPlus || language === SupportedLanguages.C) &&
-        nodeLabel === 'Function'
-      ) {
-        let ancestor = captureMap['definition.function']?.parent;
-        while (ancestor) {
-          if (ancestor.type === 'class_specifier' || ancestor.type === 'struct_specifier') {
-            break; // inside a class body — duplicate of @definition.method
-          }
-          ancestor = ancestor.parent;
-        }
-        if (ancestor) continue; // found a class/struct ancestor → skip
-      }
 
       const nameNode = captureMap['name'];
       // Synthesize name for constructors without explicit @name capture (e.g. Swift init)
@@ -1159,11 +1158,15 @@ const processFileGroup = (
         : null;
 
       let parameterCount: number | undefined;
+      let requiredParameterCount: number | undefined;
+      let parameterTypes: string[] | undefined;
       let returnType: string | undefined;
       let declaredType: string | undefined;
       if (nodeLabel === 'Function' || nodeLabel === 'Method' || nodeLabel === 'Constructor') {
         const sig = extractMethodSignature(definitionNode);
         parameterCount = sig.parameterCount;
+        requiredParameterCount = sig.requiredParameterCount;
+        parameterTypes = sig.parameterTypes;
         returnType = sig.returnType;
 
         // Language-specific return type fallback (e.g. Ruby YARD @return [Type])
@@ -1197,6 +1200,8 @@ const processFileGroup = (
           } : {}),
           ...(description !== undefined ? { description } : {}),
           ...(parameterCount !== undefined ? { parameterCount } : {}),
+          ...(requiredParameterCount !== undefined ? { requiredParameterCount } : {}),
+          ...(parameterTypes !== undefined ? { parameterTypes } : {}),
           ...(returnType !== undefined ? { returnType } : {}),
         },
       });
@@ -1212,6 +1217,8 @@ const processFileGroup = (
         nodeId,
         type: nodeLabel,
         ...(parameterCount !== undefined ? { parameterCount } : {}),
+        ...(requiredParameterCount !== undefined ? { requiredParameterCount } : {}),
+        ...(parameterTypes !== undefined ? { parameterTypes } : {}),
         ...(returnType !== undefined ? { returnType } : {}),
         ...(declaredType !== undefined ? { declaredType } : {}),
         ...(enclosingClassId ? { ownerId: enclosingClassId } : {}),
@@ -1257,7 +1264,7 @@ const processFileGroup = (
 /** Accumulated result across sub-batches */
 let accumulated: ParseWorkerResult = {
   nodes: [], relationships: [], symbols: [],
-  imports: [], calls: [], assignments: [], heritage: [], routes: [], constructorBindings: [], skippedLanguages: {}, fileCount: 0,
+  imports: [], calls: [], assignments: [], heritage: [], routes: [], constructorBindings: [], typeEnvBindings: [], skippedLanguages: {}, fileCount: 0,
 };
 let cumulativeProcessed = 0;
 
@@ -1271,6 +1278,7 @@ const mergeResult = (target: ParseWorkerResult, src: ParseWorkerResult) => {
   target.heritage.push(...src.heritage);
   target.routes.push(...src.routes);
   target.constructorBindings.push(...src.constructorBindings);
+  target.typeEnvBindings.push(...src.typeEnvBindings);
   for (const [lang, count] of Object.entries(src.skippedLanguages)) {
     target.skippedLanguages[lang] = (target.skippedLanguages[lang] || 0) + count;
   }
@@ -1295,7 +1303,7 @@ parentPort!.on('message', (msg: any) => {
     if (msg && msg.type === 'flush') {
       parentPort!.postMessage({ type: 'result', data: accumulated });
       // Reset for potential reuse
-      accumulated = { nodes: [], relationships: [], symbols: [], imports: [], calls: [], assignments: [], heritage: [], routes: [], constructorBindings: [], skippedLanguages: {}, fileCount: 0 };
+      accumulated = { nodes: [], relationships: [], symbols: [], imports: [], calls: [], assignments: [], heritage: [], routes: [], constructorBindings: [], typeEnvBindings: [], skippedLanguages: {}, fileCount: 0 };
       cumulativeProcessed = 0;
       return;
     }
