@@ -1528,6 +1528,9 @@ const mergeResult = (target: ParseWorkerResult, src: ParseWorkerResult) => {
   target.fileCount += src.fileCount;
 };
 
+// Signal readiness to worker pool after all module-level init (tree-sitter grammars loaded)
+parentPort!.postMessage({ type: 'ready' });
+
 parentPort!.on('message', (msg: any) => {
   try {
     // Sub-batch mode: { type: 'sub-batch', files: [...] }

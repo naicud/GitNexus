@@ -41,10 +41,10 @@ export function renderStatus(info: StatusInfo): void {
 }
 
 export function renderNotIndexed(): void {
-  process.stderr.write('\n  Repository not indexed.\n');
-  process.stderr.write('  Run: gitnexus analyze\n\n');
+  process.stdout.write('\n  Repository not indexed.\n');
+  process.stdout.write('  Run: gitnexus analyze\n\n');
 }
 
 export function renderNotGitRepo(): void {
-  process.stderr.write('\n  Not a git repository.\n\n');
+  process.stdout.write('\n  Not a git repository.\n\n');
 }
