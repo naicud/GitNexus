@@ -20,6 +20,7 @@
     "knowledge-graph",
     "cursor",
     "claude",
+    "codex",
     "ai-agent",
     "gitnexus",
     "static-analysis",
@@ -52,6 +53,7 @@
     "@aws-sdk/client-neptunedata": "^3.0.0",
     "@clack/prompts": "^0.10.0",
     "@huggingface/transformers": "^3.0.0",
+    "onnxruntime-node": "^1.24.0",
     "@modelcontextprotocol/sdk": "^1.0.0",
     "aws4fetch": "^1.0.18",
     "cli-progress": "^3.12.0",
@@ -98,6 +100,11 @@
     "tsx": "^4.0.0",
     "typescript": "^5.4.5",
     "vitest": "^4.0.18"
+  },
+  "overrides": {
+    "@huggingface/transformers": {
+      "onnxruntime-node": "$onnxruntime-node"
+    }
   },
   "engines": {
     "node": ">=18.0.0"

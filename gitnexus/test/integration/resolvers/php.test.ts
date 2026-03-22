@@ -4,7 +4,7 @@
 import { describe, it, expect, beforeAll } from 'vitest';
 import path from 'path';
 import {
-  FIXTURES, getRelationships, getNodesByLabel, edgeSet,
+  FIXTURES, CROSS_FILE_FIXTURES, getRelationships, getNodesByLabel, edgeSet,
   runPipelineFromRepo, type PipelineResult,
 } from './helpers.js';
 
@@ -1292,6 +1292,27 @@ describe('PHP constructor promotion property capture', () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// PHP default parameter arity resolution
+// ---------------------------------------------------------------------------
+
+describe('PHP default parameter arity resolution', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'php-default-params'),
+      () => {},
+    );
+  }, 60000);
+
+  it('resolves greet("Alice") with 1 arg to greet with 2 params (1 default)', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const greetCalls = calls.filter(c => c.source === 'process' && c.target === 'greet');
+    expect(greetCalls.length).toBe(1);
+  });
+});
+
 // ACCESSES write edges from assignment expressions
 // ---------------------------------------------------------------------------
 
@@ -1426,5 +1447,121 @@ describe('PHP grandparent method resolution via MRO (Phase B)', () => {
       c.target === 'greet' && c.targetFilePath.includes('A.php'),
     );
     expect(greetCall).toBeDefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 14: Cross-file binding propagation
+// Models/UserFactory.php exports function getUser(): User
+// Main.php imports getUser via use function, calls $u = getUser(); $u->save()
+// → $u is typed User via cross-file return type propagation
+// ---------------------------------------------------------------------------
+
+describe('PHP cross-file binding propagation', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(CROSS_FILE_FIXTURES, 'php-cross-file'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects User class with save and getName methods', () => {
+    expect(getNodesByLabel(result, 'Class')).toContain('User');
+    expect(getNodesByLabel(result, 'Method')).toContain('save');
+    expect(getNodesByLabel(result, 'Method')).toContain('getName');
+  });
+
+  it('detects getUser function and Main class with run method', () => {
+    expect(getNodesByLabel(result, 'Function')).toContain('getUser');
+    expect(getNodesByLabel(result, 'Class')).toContain('Main');
+    expect(getNodesByLabel(result, 'Method')).toContain('run');
+  });
+
+  it('emits IMPORTS edge from Main.php to UserFactory.php', () => {
+    const imports = getRelationships(result, 'IMPORTS');
+    const edge = imports.find(e =>
+      e.sourceFilePath.includes('Main') && e.targetFilePath.includes('UserFactory'),
+    );
+    expect(edge).toBeDefined();
+  });
+
+  it('resolves $u->save() in run() to User#save via cross-file return type propagation', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCall = calls.find(c =>
+      c.target === 'save' &&
+      c.source === 'run' &&
+      c.targetFilePath.includes('User.php'),
+    );
+    expect(saveCall).toBeDefined();
+  });
+
+  it('resolves $u->getName() in run() to User#getName via cross-file return type propagation', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const getNameCall = calls.find(c =>
+      c.target === 'getName' &&
+      c.source === 'run' &&
+      c.targetFilePath.includes('User.php'),
+    );
+    expect(getNameCall).toBeDefined();
+  });
+
+  it('emits HAS_METHOD edges linking save and getName to User', () => {
+    const hasMethod = getRelationships(result, 'HAS_METHOD');
+    const saveEdge = hasMethod.find(e => e.source === 'User' && e.target === 'save');
+    const getNameEdge = hasMethod.find(e => e.source === 'User' && e.target === 'getName');
+    expect(saveEdge).toBeDefined();
+    expect(getNameEdge).toBeDefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// PHP use function / use const filtering (P0-3 fix)
+// Verifies that `use function` and `use const` declarations do NOT produce
+// class-type namedImportMap entries, while regular `use` class imports still work.
+// ---------------------------------------------------------------------------
+
+describe('PHP use function / use const filtering', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'php-use-function-const'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects User class with save and getName methods', () => {
+    expect(getNodesByLabel(result, 'Class')).toContain('User');
+    expect(getNodesByLabel(result, 'Method')).toContain('save');
+    expect(getNodesByLabel(result, 'Method')).toContain('getName');
+  });
+
+  it('detects Calculator class with process method', () => {
+    expect(getNodesByLabel(result, 'Class')).toContain('Calculator');
+    expect(getNodesByLabel(result, 'Method')).toContain('process');
+  });
+
+  it('detects formatName as a standalone function (not a class)', () => {
+    expect(getNodesByLabel(result, 'Function')).toContain('formatName');
+    // formatName should NOT appear as a Class
+    expect(getNodesByLabel(result, 'Class')).not.toContain('formatName');
+  });
+
+  it('emits IMPORTS edge from Calculator.php to User.php (class import)', () => {
+    const imports = getRelationships(result, 'IMPORTS');
+    const edge = imports.find(e =>
+      e.sourceFilePath.includes('Calculator') && e.targetFilePath.includes('User'),
+    );
+    expect(edge).toBeDefined();
+  });
+
+  it('resolves $user->save() to User#save via class import binding', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCall = calls.find(c =>
+      c.target === 'save' && c.source === 'process' && c.targetFilePath.includes('User'),
+    );
+    expect(saveCall).toBeDefined();
   });
 });

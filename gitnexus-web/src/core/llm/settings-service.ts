@@ -15,6 +15,7 @@ import {
   AnthropicConfig,
   OllamaConfig,
   OpenRouterConfig,
+  MiniMaxConfig,
   CustomConfig,
   AWSBedrockConfig,
   ProviderConfig,
@@ -62,6 +63,10 @@ export const loadSettings = (): LLMSettings => {
         ...DEFAULT_LLM_SETTINGS.openrouter,
         ...parsed.openrouter,
       },
+      minimax: {
+        ...DEFAULT_LLM_SETTINGS.minimax,
+        ...parsed.minimax,
+      },
       custom: {
         ...DEFAULT_LLM_SETTINGS.custom,
         ...parsed.custom,
@@ -99,6 +104,8 @@ export const updateProviderSettings = <T extends LLMProvider>(
     T extends 'gemini' ? Partial<Omit<GeminiConfig, 'provider'>> :
     T extends 'anthropic' ? Partial<Omit<AnthropicConfig, 'provider'>> :
     T extends 'ollama' ? Partial<Omit<OllamaConfig, 'provider'>> :
+    T extends 'openrouter' ? Partial<Omit<OpenRouterConfig, 'provider'>> :
+    T extends 'minimax' ? Partial<Omit<MiniMaxConfig, 'provider'>> :
     T extends 'custom' ? Partial<Omit<CustomConfig, 'provider'>> :
     T extends 'bedrock' ? Partial<Omit<AWSBedrockConfig, 'provider'>> :
     never
@@ -169,6 +176,17 @@ export const updateProviderSettings = <T extends LLMProvider>(
         openrouter: {
           ...(current.openrouter ?? {}),
           ...(updates as Partial<Omit<OpenRouterConfig, 'provider'>>),
+        },
+      };
+      saveSettings(updated);
+      return updated;
+    }
+    case 'minimax': {
+      const updated: LLMSettings = {
+        ...current,
+        minimax: {
+          ...(current.minimax ?? {}),
+          ...(updates as Partial<Omit<MiniMaxConfig, 'provider'>>),
         },
       };
       saveSettings(updated);
@@ -279,7 +297,16 @@ export const getActiveProviderConfig = (): ProviderConfig | null => {
         temperature: settings.openrouter.temperature,
         maxTokens: settings.openrouter.maxTokens,
       } as OpenRouterConfig;
-      
+
+    case 'minimax':
+      if (!settings.minimax?.apiKey) {
+        return null;
+      }
+      return {
+        provider: 'minimax',
+        ...settings.minimax,
+      } as MiniMaxConfig;
+
     case 'custom':
       if (!settings.custom?.baseUrl?.trim() || !settings.custom?.model?.trim()) {
         return null;
@@ -334,6 +361,8 @@ export const getProviderDisplayName = (provider: LLMProvider): string => {
       return 'Ollama (Local)';
     case 'openrouter':
       return 'OpenRouter';
+    case 'minimax':
+      return 'MiniMax';
     case 'custom':
       return 'Custom (OpenAI-compatible)';
     case 'bedrock':
@@ -359,6 +388,8 @@ export const getAvailableModels = (provider: LLMProvider): string[] => {
       return ['claude-sonnet-4-20250514', 'claude-3-5-sonnet-20241022', 'claude-3-5-haiku-20241022', 'claude-3-opus-20240229'];
     case 'ollama':
       return ['llama3.2', 'llama3.1', 'mistral', 'codellama', 'deepseek-coder'];
+    case 'minimax':
+      return ['MiniMax-M2.5', 'MiniMax-M2.5-highspeed'];
     case 'custom':
       return [];
     case 'bedrock':

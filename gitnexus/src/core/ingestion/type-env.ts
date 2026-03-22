@@ -1,5 +1,5 @@
 import type { SyntaxNode } from './utils.js';
-import { FUNCTION_NODE_TYPES, extractFunctionName, CLASS_CONTAINER_TYPES, isBuiltInOrNoise } from './utils.js';
+import { FUNCTION_NODE_TYPES, extractFunctionName, CLASS_CONTAINER_TYPES, CALL_EXPRESSION_TYPES, isBuiltInOrNoise } from './utils.js';
 import { SupportedLanguages } from '../../config/supported-languages.js';
 import { typeConfigs, TYPED_PARAMETER_TYPES } from './type-extractors/index.js';
 import type { ClassNameLookup, ReturnTypeLookup, ForLoopExtractorContext, PendingAssignment } from './type-extractors/types.js';
@@ -46,6 +46,10 @@ export interface TypeEnvironment {
   readonly constructorBindings: readonly ConstructorBinding[];
   /** Raw per-scope type bindings — for testing and debugging. */
   readonly env: TypeEnv;
+  /** Maps `scope\0varName` → constructor type for virtual dispatch override.
+   *  Populated when a variable has BOTH a declared base type AND a more specific
+   *  constructor type (e.g., `Animal a = new Dog()` → key maps to 'Dog'). */
+  readonly constructorTypeMap: ReadonlyMap<string, string>;
 }
 
 /**
@@ -405,8 +409,70 @@ const createClassDefCache = (symbolTable?: SymbolTable) => {
   };
 };
 
+/** AST node types representing constructor expressions across languages.
+ *  Note: C# also has `implicit_object_creation_expression` (`new()` with type
+ *  inference) which is NOT captured — the type is inferred, not explicit.
+ *  Kotlin constructors use `call_expression` (no `new` keyword) — not detected. */
+const CONSTRUCTOR_EXPR_TYPES = new Set([
+  'new_expression',               // TS/JS/C++: new Dog()
+  'object_creation_expression',   // Java/C#: new Dog()
+]);
+
+/** Extract the constructor class name from a declaration node's initializer.
+ *  Searches for new_expression / object_creation_expression in the node's subtree.
+ *  Returns the class name or undefined if no constructor is found.
+ *  Depth-limited to 5 to avoid expensive traversals. */
+const extractConstructorTypeName = (node: SyntaxNode, depth = 0): string | undefined => {
+  if (depth > 5) return undefined;
+  if (CONSTRUCTOR_EXPR_TYPES.has(node.type)) {
+    // Java/C#: object_creation_expression has 'type' field
+    const typeField = node.childForFieldName('type');
+    if (typeField) return extractSimpleTypeName(typeField);
+    // TS/JS: new_expression has 'constructor' field (but tree-sitter often just has identifier child)
+    const ctorField = node.childForFieldName('constructor');
+    if (ctorField) return extractSimpleTypeName(ctorField);
+    // Fallback: first named child is often the class identifier
+    if (node.firstNamedChild) return extractSimpleTypeName(node.firstNamedChild);
+  }
+  for (let i = 0; i < node.namedChildCount; i++) {
+    const child = node.namedChild(i);
+    if (!child) continue;
+    // Don't descend into nested functions/classes or call expressions (prevents
+    // finding constructor args inside method calls, e.g. processAll(new Dog()))
+    if (FUNCTION_NODE_TYPES.has(child.type) || CLASS_CONTAINER_TYPES.has(child.type)
+      || CALL_EXPRESSION_TYPES.has(child.type)) continue;
+    const result = extractConstructorTypeName(child, depth + 1);
+    if (result) return result;
+  }
+  return undefined;
+};
+
 /** Max depth for MRO parent chain walking. Real-world inheritance rarely exceeds 3-4 levels. */
 const MAX_MRO_DEPTH = 5;
+
+/** Check if `child` is a subclass of `parent` using the parentMap.
+ *  BFS up from child, depth-limited (5), cycle-safe. */
+export const isSubclassOf = (
+  child: string, parent: string,
+  parentMap: ReadonlyMap<string, readonly string[]> | undefined,
+): boolean => {
+  if (!parentMap || child === parent) return false;
+  const visited = new Set<string>([child]);
+  let current = [child];
+  for (let depth = 0; depth < MAX_MRO_DEPTH && current.length > 0; depth++) {
+    const next: string[] = [];
+    for (const cls of current) {
+      const parents = parentMap.get(cls);
+      if (!parents) continue;
+      for (const p of parents) {
+        if (p === parent) return true;
+        if (!visited.has(p)) { visited.add(p); next.push(p); }
+      }
+    }
+    current = next;
+  }
+  return false;
+};
 
 /** Walk up the parent class chain to find a field or method on an ancestor.
  *  BFS-like traversal with depth limit and cycle detection. First match wins.
@@ -581,6 +647,34 @@ const resolveFixpointBindings = (
 export interface BuildTypeEnvOptions {
   symbolTable?: SymbolTable;
   parentMap?: ReadonlyMap<string, readonly string[]>;
+  /** Pre-resolved bindings from upstream files (Phase 14).
+   *  Seeded into FILE_SCOPE after walk() for names with no local binding.
+   *  Local declarations always take precedence (first-writer-wins). */
+  importedBindings?: ReadonlyMap<string, string>;
+  /** Cross-file return type fallback for imported callables (Phase 14 E3).
+   *  Consulted ONLY when SymbolTable has no unambiguous match.
+   *  Local definitions always take precedence (local-first principle). */
+  importedReturnTypes?: ReadonlyMap<string, string>;
+  /** Cross-file RAW return types for imported callables (Phase 14 E3).
+   *  Stores raw declared return type strings (e.g., 'User[]', 'List<User>').
+   *  Used by lookupRawReturnType for for-loop element extraction. */
+  importedRawReturnTypes?: ReadonlyMap<string, string>;
+}
+
+/** Seed cross-file type bindings into the file scope.
+ *  MUST be called AFTER walk() completes so that local declarations
+ *  (Tier 0/1) always take precedence over imported bindings (first-writer-wins). */
+function seedImportedBindings(
+  env: TypeEnv,
+  importedBindings: ReadonlyMap<string, string>,
+): void {
+  let fileEnv = env.get(FILE_SCOPE);
+  if (!fileEnv) { fileEnv = new Map(); env.set(FILE_SCOPE, fileEnv); }
+  for (const [name, type] of importedBindings) {
+    if (!fileEnv.has(name)) {
+      fileEnv.set(name, type);
+    }
+  }
 }
 
 export const buildTypeEnv = (
@@ -592,29 +686,45 @@ export const buildTypeEnv = (
   const parentMap = options?.parentMap;
   const env: TypeEnv = new Map();
   const patternOverrides: PatternOverrides = new Map();
+  // Phase P: maps `scope\0varName` → constructor type when a declaration has BOTH
+  // a base type annotation AND a more specific constructor initializer.
+  // e.g., `Animal a = new Dog()` → constructorTypeMap.set('func@42\0a', 'Dog')
+  const constructorTypeMap = new Map<string, string>();
   const localClassNames = new Set<string>();
   const classNames = createClassNameLookup(localClassNames, symbolTable);
   const config = typeConfigs[language];
   const bindings: ConstructorBinding[] = [];
 
-  // Build ReturnTypeLookup from optional SymbolTable.
-  // Conservative: returns undefined when callee is ambiguous (0 or 2+ matches).
+  // Build ReturnTypeLookup: SymbolTable is authoritative when it has an unambiguous match.
+  // Cross-file importedReturnTypes are consulted ONLY when SymbolTable has 0 matches.
+  // Ambiguous (2+) → undefined, no cross-file fallback (conservative, local-first principle).
   const returnTypeLookup: ReturnTypeLookup = {
     lookupReturnType(callee: string): string | undefined {
-      if (!symbolTable) return undefined;
-      if (isBuiltInOrNoise(callee)) return undefined;
-      const callables = symbolTable.lookupFuzzyCallable(callee);
-      if (callables.length !== 1) return undefined;
-      const rawReturn = callables[0].returnType;
-      if (!rawReturn) return undefined;
-      return extractReturnTypeName(rawReturn);
+      // SymbolTable is authoritative when it has an unambiguous match
+      if (symbolTable) {
+        if (isBuiltInOrNoise(callee)) return undefined;
+        const callables = symbolTable.lookupFuzzyCallable(callee);
+        if (callables.length === 1) {
+          const rawReturn = callables[0].returnType;
+          if (rawReturn) return extractReturnTypeName(rawReturn);
+        }
+        // Ambiguous (2+) → return undefined (conservative, no cross-file fallback)
+        if (callables.length > 1) return undefined;
+      }
+      // No match (0 results or no symbolTable) → fall back to cross-file
+      return options?.importedReturnTypes?.get(callee);
     },
     lookupRawReturnType(callee: string): string | undefined {
-      if (!symbolTable) return undefined;
-      if (isBuiltInOrNoise(callee)) return undefined;
-      const callables = symbolTable.lookupFuzzyCallable(callee);
-      if (callables.length !== 1) return undefined;
-      return callables[0].returnType;
+      if (symbolTable) {
+        if (isBuiltInOrNoise(callee)) return undefined;
+        const callables = symbolTable.lookupFuzzyCallable(callee);
+        if (callables.length === 1) return callables[0].returnType;
+        // Ambiguous (2+) → return undefined (conservative, no cross-file fallback)
+        if (callables.length > 1) return undefined;
+      }
+      // Cross-file fallback uses importedRawReturnTypes (raw declared types, e.g., 'User[]')
+      // NOT importedReturnTypes (which contains processed/simple types via extractReturnTypeName)
+      return options?.importedRawReturnTypes?.get(callee);
     }
   };
 
@@ -730,7 +840,20 @@ export const buildTypeEnv = (
             if (c?.type === 'variable_declaration') { wrapped = c; break; }
           }
         }
-        if (wrapped) typeNode = wrapped.childForFieldName('type');
+        if (wrapped) {
+          typeNode = wrapped.childForFieldName('type');
+          // Kotlin: variable_declaration stores the type as user_type / nullable_type
+          // child rather than a named 'type' field.
+          if (!typeNode) {
+            for (let i = 0; i < wrapped.namedChildCount; i++) {
+              const c = wrapped.namedChild(i);
+              if (c && (c.type === 'user_type' || c.type === 'nullable_type')) {
+                typeNode = c;
+                break;
+              }
+            }
+          }
+        }
       }
       if (typeNode) {
         const nameNode = node.childForFieldName('name')
@@ -744,13 +867,17 @@ export const buildTypeEnv = (
         }
       }
       // Run the language-specific declaration extractor (may or may not add to scopeEnv).
-      const keysBefore = typeNode ? new Set(scopeEnv.keys()) : undefined;
+      const sizeBefore = typeNode ? scopeEnv.size : -1;
       config.extractDeclaration(node, scopeEnv);
       // Fallback: for multi-declarator languages (TS, C#, Java) where the type field
-      // is on variable_declarator children, capture via keysBefore/keysAfter diff.
-      if (typeNode && keysBefore) {
+      // is on variable_declarator children, capture newly-added keys.
+      // Map preserves insertion order, so new keys are always at the end —
+      // skip the first sizeBefore entries to find only newly-added variables.
+      if (sizeBefore >= 0 && scopeEnv.size > sizeBefore) {
+        let skip = sizeBefore;
         for (const varName of scopeEnv.keys()) {
-          if (!keysBefore.has(varName) && !declarationTypeNodes.has(`${scope}\0${varName}`)) {
+          if (skip > 0) { skip--; continue; }
+          if (!declarationTypeNodes.has(`${scope}\0${varName}`)) {
             declarationTypeNodes.set(`${scope}\0${varName}`, typeNode);
           }
         }
@@ -761,6 +888,31 @@ export const buildTypeEnv = (
       // so this handles mixed cases like `const a: A = x, b = new B()`.
       if (config.extractInitializer) {
         config.extractInitializer(node, scopeEnv, classNames);
+      }
+
+      // Phase P: detect constructor-visible virtual dispatch.
+      // When a declaration has BOTH a type annotation AND a constructor initializer,
+      // record the constructor type for receiver override at call resolution time.
+      // e.g., `Animal a = new Dog()` → constructorTypeMap.set('scope\0a', 'Dog')
+      if (sizeBefore >= 0 && scopeEnv.size > sizeBefore) {
+        let ctorSkip = sizeBefore;
+        for (const varName of scopeEnv.keys()) {
+          if (ctorSkip > 0) { ctorSkip--; continue; }
+          const declaredType = scopeEnv.get(varName);
+          if (!declaredType) continue;
+          const ctorType = extractConstructorTypeName(node)
+            ?? config.detectConstructorType?.(node, classNames);
+          if (!ctorType || ctorType === declaredType) continue;
+          // Unwrap wrapper types (e.g., C++ shared_ptr<Animal> → Animal) for an
+          // accurate isSubclassOf comparison. Language-specific via config hook.
+          const declTypeNode = declarationTypeNodes.get(`${scope}\0${varName}`);
+          const effectiveDeclaredType = (declTypeNode && config.unwrapDeclaredType)
+            ? (config.unwrapDeclaredType(declaredType, declTypeNode) ?? declaredType)
+            : declaredType;
+          if (ctorType !== effectiveDeclaredType) {
+            constructorTypeMap.set(`${scope}\0${varName}`, ctorType);
+          }
+        }
       }
     }
   };
@@ -884,6 +1036,12 @@ export const buildTypeEnv = (
 
   walk(tree.rootNode, FILE_SCOPE);
 
+  // Phase 14: Seed cross-file bindings from upstream files AFTER walk
+  // (local declarations from walk() take precedence — first-writer-wins)
+  if (options?.importedBindings && options.importedBindings.size > 0) {
+    seedImportedBindings(env, options.importedBindings);
+  }
+
   resolveFixpointBindings(pendingItems, env, returnTypeLookup, symbolTable, parentMap);
 
   // Post-fixpoint for-loop replay (Phase 10 / ex-9B loop-fixpoint bridge):
@@ -914,6 +1072,7 @@ export const buildTypeEnv = (
     lookup: (varName, callNode) => lookupInEnv(env, varName, callNode, patternOverrides),
     constructorBindings: bindings,
     env,
+    constructorTypeMap,
   };
 };
 

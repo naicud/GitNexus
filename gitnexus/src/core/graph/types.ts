@@ -33,6 +33,7 @@ export type NodeLabel =
   | 'Annotation'
   | 'Constructor'
   | 'Template'
+  | 'Section'
   // Frontend-only (not stored in LadybugDB)
   | 'ClusterGroup';
 
@@ -67,6 +68,8 @@ export type NodeProperties = {
   entryPointReason?: string,
   // Method signature (for MRO disambiguation)
   parameterCount?: number,
+  // Section-specific (markdown heading level, 1-6)
+  level?: number,
   returnType?: string,
 }
 

@@ -36,6 +36,7 @@ const AppContent = () => {
     refreshLLMSettings,
     initializeAgent,
     startEmbeddings,
+    hydrateWorkerFromServer,
     embeddingStatus,
     codeReferences,
     selectedNode,
@@ -169,22 +170,26 @@ const AppContent = () => {
     // Transition directly to exploring view
     setViewMode('exploring');
 
-    // Initialize agent if LLM is configured.
-    // Pass backendUrl and fileMap explicitly: React state (serverBaseUrl, fileContents)
-    // may not have updated yet when this callback runs.
-    if (getActiveProviderConfig()) {
-      initializeAgent(projectName, backendUrl, fileMap);
-    }
-
-    // Auto-start embeddings
-    startEmbeddings().catch((err) => {
-      if (err?.name === 'WebGPUNotAvailableError' || err?.message?.includes('WebGPU')) {
-        startEmbeddings('wasm').catch(console.warn);
-      } else {
-        console.warn('Embeddings auto-start failed:', err);
-      }
-    });
-  }, [setViewMode, setGraph, setFileContents, setProjectName, setGraphTruncated, initializeAgent, startEmbeddings]);
+    // Hydrate worker DB then initialize agent (non-blocking for graph UI)
+    setProgress(null);
+    hydrateWorkerFromServer(result.nodes, result.relationships, result.fileContents)
+      .then(() => {
+        if (getActiveProviderConfig()) {
+          initializeAgent(projectName, backendUrl, fileMap);
+        }
+        startEmbeddings().catch((err) => {
+          if (err?.name === 'WebGPUNotAvailableError' || err?.message?.includes('WebGPU')) {
+            startEmbeddings('wasm').catch(console.warn);
+          } else {
+            console.warn('Embeddings auto-start failed:', err);
+          }
+        });
+      })
+      .catch((err) => {
+        console.warn('Worker hydration failed (non-fatal):', err);
+        if (getActiveProviderConfig()) initializeAgent(projectName, backendUrl, fileMap);
+      });
+  }, [setViewMode, setGraph, setFileContents, setProjectName, setGraphTruncated, initializeAgent, startEmbeddings, hydrateWorkerFromServer, setProgress]);
 
   // Smart connect: checks LOD mode first, routes to hierarchy/summary/full as appropriate
   const smartConnect = useCallback(async (serverUrl: string, repoName?: string) => {

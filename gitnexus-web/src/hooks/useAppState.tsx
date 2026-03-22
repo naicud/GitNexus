@@ -1,5 +1,5 @@
 import { createContext, useContext, useMemo, useRef, useEffect, ReactNode } from 'react';
-import { KnowledgeGraph, GraphNode, NodeLabel } from '../core/graph/types';
+import { KnowledgeGraph, GraphNode, GraphRelationship, NodeLabel } from '../core/graph/types';
 import { PipelineProgress, PipelineResult } from '../types/pipeline';
 import type { FileEntry } from '../services/zip';
 import type { EmbeddingProgress, SemanticSearchResult } from '../core/embeddings/types';
@@ -120,6 +120,9 @@ interface AppState {
 
   // Debug/test methods
   testArrayParams: () => Promise<{ success: boolean; error?: string }>;
+
+  // Server hydration
+  hydrateWorkerFromServer: (nodes: GraphNode[], relationships: GraphRelationship[], fileContents: Record<string, string>) => Promise<void>;
 
   // LLM/Agent state
   llmSettings: LLMSettings;
@@ -290,6 +293,7 @@ export const AppStateProvider = ({ children }: { children: ReactNode }) => {
     semanticSearchWithContext: workerState.semanticSearchWithContext,
     isEmbeddingReady: workerState.isEmbeddingReady,
     testArrayParams: workerState.testArrayParams,
+    hydrateWorkerFromServer: workerState.hydrateWorkerFromServer,
 
     // From chatState
     llmSettings: chatState.llmSettings,

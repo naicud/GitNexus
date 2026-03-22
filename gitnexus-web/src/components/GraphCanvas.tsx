@@ -4,6 +4,7 @@ import { useSigma } from '../hooks/useSigma';
 import { useAppState } from '../hooks/useAppState';
 import { useKeyboardShortcuts } from '../hooks/useKeyboardShortcuts';
 import { knowledgeGraphToGraphology, filterGraphByDepth, SigmaNodeAttributes, SigmaEdgeAttributes } from '../lib/graph-adapter';
+import type { GraphNode } from '../core/graph/types';
 import { summaryToGraphology, expandGroupInGraph, collapseGroupInGraph, addNeighborsToGraph } from '../lib/summary-graph-adapter';
 import { buildHierarchyRoot, expandNodeInHierarchy, addVirtualGroups, collapseNodeInHierarchy, wouldExceedBudget } from '../lib/hierarchy-graph-adapter';
 import { fetchGroupExpansion, fetchNeighbors, fetchHierarchyChildren, fetchAncestorPath } from '../services/graph-lod';
@@ -61,7 +62,7 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle>((_, ref) => {
 
   // O(1) node lookup map — replaces O(n) graph.nodes.find() calls throughout the component
   const nodeMap = useMemo(() => {
-    if (!graph) return new Map<string, typeof graph.nodes[0]>();
+    if (!graph) return new Map<string, GraphNode>();
     return new Map(graph.nodes.map(n => [n.id, n]));
   }, [graph]);
 

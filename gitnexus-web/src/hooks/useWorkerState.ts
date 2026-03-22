@@ -6,6 +6,7 @@ import type { IngestionWorkerApi } from '../workers/ingestion.worker';
 import type { FileEntry } from '../services/zip';
 import type { EmbeddingProgress, SemanticSearchResult } from '../core/embeddings/types';
 import type { ProviderConfig } from '../core/llm/types';
+import type { GraphNode, GraphRelationship } from '../core/graph/types';
 
 export type EmbeddingStatus = 'idle' | 'loading' | 'embedding' | 'indexing' | 'ready' | 'error';
 
@@ -33,6 +34,9 @@ export interface WorkerState {
 
   // Debug/test methods
   testArrayParams: () => Promise<{ success: boolean; error?: string }>;
+
+  // Server hydration (populate worker-side DB from server-loaded data)
+  hydrateWorkerFromServer: (nodes: GraphNode[], relationships: GraphRelationship[], fileContents: Record<string, string>) => Promise<void>;
 }
 
 export function useWorkerState(): WorkerState {
@@ -173,6 +177,16 @@ export function useWorkerState(): WorkerState {
     return api.testArrayParams();
   }, []);
 
+  const hydrateWorkerFromServer = useCallback(async (
+    nodes: GraphNode[],
+    relationships: GraphRelationship[],
+    fileContents: Record<string, string>
+  ): Promise<void> => {
+    const api = apiRef.current;
+    if (!api) throw new Error('Worker not initialized');
+    await api.hydrateFromServerData(nodes, relationships, fileContents);
+  }, []);
+
   return {
     progress,
     setProgress,
@@ -188,5 +202,6 @@ export function useWorkerState(): WorkerState {
     semanticSearchWithContext,
     isEmbeddingReady: embeddingStatus === 'ready',
     testArrayParams,
+    hydrateWorkerFromServer,
   };
 }

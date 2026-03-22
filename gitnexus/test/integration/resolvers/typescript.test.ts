@@ -4,7 +4,7 @@
 import { describe, it, expect, beforeAll } from 'vitest';
 import path from 'path';
 import {
-  FIXTURES, getRelationships, getNodesByLabel, edgeSet,
+  FIXTURES, getRelationships, getNodesByLabel, getNodesByLabelFull, edgeSet,
   runPipelineFromRepo, type PipelineResult,
 } from './helpers.js';
 
@@ -2220,5 +2220,98 @@ describe('TypeScript null-check narrowing resolution (Phase C)', () => {
       c.target === 'save' && c.source === 'processFuncExpr' && c.targetFilePath.includes('models'),
     );
     expect(saveCall).toBeDefined();
+  });
+});
+
+// ── Phase P: Virtual Dispatch via Constructor Type ───────────────────────
+
+describe('TypeScript virtual dispatch via constructor type (same-file)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'ts-virtual-dispatch'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects Animal and Dog classes with same-file heritage', () => {
+    const classes = getNodesByLabel(result, 'Class');
+    expect(classes).toContain('Animal');
+    expect(classes).toContain('Dog');
+    const extends_ = getRelationships(result, 'EXTENDS');
+    const dogExtends = extends_.find(e => e.source === 'Dog' && e.target === 'Animal');
+    expect(dogExtends).toBeDefined();
+  });
+
+  it('detects fetchBall() as Dog-only method', () => {
+    const methods = getNodesByLabel(result, 'Method');
+    expect(methods).toContain('fetchBall');
+  });
+
+  it('resolves fetchBall() calls from run() — proves virtual dispatch override', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const fetchCalls = calls.filter(c => c.source === 'run' && c.target === 'fetchBall');
+    // animal.fetchBall() only resolves if constructorTypeMap overrides
+    // receiver from Animal → Dog. dog.fetchBall() resolves directly.
+    // Both target same nodeId → 1 CALLS edge after dedup.
+    expect(fetchCalls.length).toBe(1);
+  });
+});
+
+// ── Phase P: Overload Disambiguation via inferLiteralType ────────────────
+
+describe('TypeScript overload disambiguation via inferLiteralType', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'ts-overload-disambiguation'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects lookup function with parameterTypes on graph node', () => {
+    const functions = getNodesByLabelFull(result, 'Function');
+    const lookupNodes = functions.filter(f => f.name === 'lookup');
+    // generateId collision → 1 graph node, first overload's parameterTypes wins
+    expect(lookupNodes.length).toBeGreaterThanOrEqual(1);
+    // At least one lookup node has parameterTypes set
+    const withParamTypes = lookupNodes.filter(n => n.properties.parameterTypes);
+    expect(withParamTypes.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it('emits CALLS edges from process() → lookup() via overload disambiguation', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const lookupCalls = calls.filter(c => c.source === 'process' && c.target === 'lookup');
+    // Phase 0 (fileIndex stores both overloads) + Phase 2 (literal type matching)
+    // enables resolution where previously 2 same-arity candidates → null.
+    // Both calls resolve to same nodeId (ID collision) → 1 CALLS edge after dedup.
+    expect(lookupCalls.length).toBe(1);
+  });
+});
+
+// ── Phase P: Optional / Default Parameter Arity Resolution ───────────────
+
+describe('TypeScript optional parameter arity resolution', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'ts-optional-params'),
+      () => {},
+    );
+  }, 60000);
+
+  it('resolves greet("Alice") with 1 arg to greet with 2 params (1 optional)', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const greetCalls = calls.filter(c => c.source === 'process' && c.target === 'greet');
+    expect(greetCalls.length).toBe(1);
+  });
+
+  it('resolves search("test") with 1 arg to search with 2 params (1 optional)', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const searchCalls = calls.filter(c => c.source === 'process' && c.target === 'search');
+    expect(searchCalls.length).toBe(1);
   });
 });

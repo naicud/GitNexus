@@ -48,7 +48,7 @@ export const VALID_NODE_LABELS = new Set([
   'File', 'Folder', 'Function', 'Class', 'Interface', 'Method', 'CodeElement',
   'Community', 'Process', 'Struct', 'Enum', 'Macro', 'Typedef', 'Union',
   'Namespace', 'Trait', 'Impl', 'TypeAlias', 'Const', 'Static', 'Property',
-  'Record', 'Delegate', 'Annotation', 'Constructor', 'Template', 'Module',
+  'Record', 'Delegate', 'Annotation', 'Constructor', 'Template', 'Module', 'Section',
 ]);
 
 /** Valid relation types for impact analysis filtering */
@@ -97,6 +97,8 @@ export class LocalBackend {
   private repos: Map<string, RepoHandle> = new Map();
   private contextCache: Map<string, CodebaseContext> = new Map();
   private initializedRepos: Set<string> = new Set();
+  private reinitPromises: Map<string, Promise<void>> = new Map();
+  private lastStalenessCheck: Map<string, number> = new Map();
 
   // ─── Initialization ──────────────────────────────────────────────
 
@@ -262,8 +264,9 @@ export class LocalBackend {
   // ─── Lazy LadybugDB Init ────────────────────────────────────────────
 
   private async ensureInitialized(repoId: string): Promise<void> {
-    // Always check the actual pool — the idle timer may have evicted the connection
-    if (this.initializedRepos.has(repoId) && isLbugReady(repoId)) return;
+    // If a reinit is already in progress for this repo, wait for it
+    const pending = this.reinitPromises.get(repoId);
+    if (pending) return pending;
 
 
     const handle = this.repos.get(repoId);
@@ -276,6 +279,41 @@ export class LocalBackend {
       }
       this.initializedRepos.add(repoId);
       return;
+    }
+
+    // Check if the index was rebuilt since we opened the connection (#297).
+    // Throttle staleness checks to at most once per 5 seconds per repo to
+    // avoid an fs.readFile round-trip on every tool invocation.
+    if (this.initializedRepos.has(repoId) && isLbugReady(repoId)) {
+      const now = Date.now();
+      const lastCheck = this.lastStalenessCheck.get(repoId) ?? 0;
+      if (now - lastCheck < 5000) return; // Checked recently — skip
+
+      this.lastStalenessCheck.set(repoId, now);
+      try {
+        const metaPath = path.join(handle.storagePath, 'meta.json');
+        const metaRaw = await fs.readFile(metaPath, 'utf-8');
+        const meta = JSON.parse(metaRaw);
+        if (meta.indexedAt && meta.indexedAt !== handle.indexedAt) {
+          const reinit = (async () => {
+            try {
+              await closeLbug(repoId);
+              this.initializedRepos.delete(repoId);
+              handle.indexedAt = meta.indexedAt;
+              await initLbug(repoId, handle.lbugPath);
+              this.initializedRepos.add(repoId);
+            } finally {
+              this.reinitPromises.delete(repoId);
+            }
+          })();
+          this.reinitPromises.set(repoId, reinit);
+          return reinit;
+        } else {
+          return; // Pool is current
+        }
+      } catch {
+        return; // Can't read meta — assume pool is fine
+      }
     }
 
     // LadybugDB path
@@ -1525,31 +1563,49 @@ export class LocalBackend {
     let affectedModules: any[] = [];
 
     if (impacted.length > 0) {
-      const allIds = impacted.map(i => `'${i.id.replace(/'/g, "''")}'`).join(', ');
-      const d1Ids = (grouped[1] || []).map((i: any) => `'${i.id.replace(/'/g, "''")}'`).join(', ');
+      // Cap IN-clause to 100 IDs to prevent oversized queries that crash
+      // the native DB engine on arm64 macOS (#292)
+      const cappedImpacted = impacted.slice(0, 100);
+      const allIds = cappedImpacted.map(i => `'${String(i.id ?? '').replace(/'/g, "''")}'`).join(', ');
+      const d1Items = (grouped[1] || []).slice(0, 100);
+      const d1Ids = d1Items.map((i: any) => `'${String(i.id ?? '').replace(/'/g, "''")}'`).join(', ');
 
-      // Affected processes: which execution flows are broken and at which step
-      const [processRows, moduleRows, directModuleRows] = await Promise.all([
-        this.runQuery(repo.id, `
-          MATCH (s)-[r:CodeRelation {type: 'STEP_IN_PROCESS'}]->(p:Process)
-          WHERE s.id IN [${allIds}]
-          RETURN p.heuristicLabel AS name, COUNT(DISTINCT s.id) AS hits, MIN(r.step) AS minStep, p.stepCount AS stepCount
-          ORDER BY hits DESC
-          LIMIT 20
-        `).catch(() => []),
-        this.runQuery(repo.id, `
-          MATCH (s)-[:CodeRelation {type: 'MEMBER_OF'}]->(c:Community)
-          WHERE s.id IN [${allIds}]
-          RETURN c.heuristicLabel AS name, COUNT(DISTINCT s.id) AS hits
-          ORDER BY hits DESC
-          LIMIT 20
-        `).catch(() => []),
-        d1Ids ? this.runQuery(repo.id, `
-          MATCH (s)-[:CodeRelation {type: 'MEMBER_OF'}]->(c:Community)
-          WHERE s.id IN [${d1Ids}]
-          RETURN DISTINCT c.heuristicLabel AS name
-        `).catch(() => []) : Promise.resolve([]),
-      ]);
+      // Enrichment queries: sequential on arm64 macOS to avoid SIGSEGV from
+      // concurrent native DB access (#285, #290, #292); parallel elsewhere
+      // to preserve performance on unaffected platforms.
+      const isArm64Mac = process.platform === 'darwin' && process.arch === 'arm64';
+
+      const processQuery = this.runQuery(repo.id, `
+        MATCH (s)-[r:CodeRelation {type: 'STEP_IN_PROCESS'}]->(p:Process)
+        WHERE s.id IN [${allIds}]
+        RETURN p.heuristicLabel AS name, COUNT(DISTINCT s.id) AS hits, MIN(r.step) AS minStep, p.stepCount AS stepCount
+        ORDER BY hits DESC
+        LIMIT 20
+      `).catch(() => []);
+      const moduleQuery = () => this.runQuery(repo.id, `
+        MATCH (s)-[:CodeRelation {type: 'MEMBER_OF'}]->(c:Community)
+        WHERE s.id IN [${allIds}]
+        RETURN c.heuristicLabel AS name, COUNT(DISTINCT s.id) AS hits
+        ORDER BY hits DESC
+        LIMIT 20
+      `).catch(() => []);
+      const directModuleQuery = () => d1Ids
+        ? this.runQuery(repo.id, `
+            MATCH (s)-[:CodeRelation {type: 'MEMBER_OF'}]->(c:Community)
+            WHERE s.id IN [${d1Ids}]
+            RETURN DISTINCT c.heuristicLabel AS name
+          `).catch(() => [])
+        : Promise.resolve([]);
+
+      let processRows: any[], moduleRows: any[], directModuleRows: any[];
+      if (isArm64Mac) {
+        processRows = await processQuery;
+        moduleRows = await moduleQuery();
+        directModuleRows = await directModuleQuery();
+      } else {
+        processRows = await processQuery;
+        [moduleRows, directModuleRows] = await Promise.all([moduleQuery(), directModuleQuery()]);
+      }
 
       affectedProcesses = processRows.map((r: any) => ({
         name: r.name || r[0],

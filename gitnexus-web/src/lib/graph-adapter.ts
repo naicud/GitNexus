@@ -21,6 +21,7 @@ export interface SigmaNodeAttributes {
   childCount?: number;
   isExpanded?: boolean;
   isExpandable?: boolean;
+  fixed?: boolean; // ForceAtlas2 drag pinning
 }
 
 export interface SigmaEdgeAttributes {

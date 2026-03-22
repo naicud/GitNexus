@@ -1,6 +1,7 @@
 import type { SyntaxNode } from '../utils.js';
-import type { ConstructorBindingScanner, ForLoopExtractor, LanguageTypeConfig, ParameterExtractor, TypeBindingExtractor, PendingAssignmentExtractor, PatternBindingExtractor } from './types.js';
-import { extractSimpleTypeName, extractVarName, findChildByType, unwrapAwait, extractGenericTypeArgs, resolveIterableElementType, methodToTypeArgPosition, extractElementTypeFromString, type TypeArgPosition } from './shared.js';
+import type { ConstructorBindingScanner, ForLoopExtractor, LanguageTypeConfig, ParameterExtractor, TypeBindingExtractor, PendingAssignmentExtractor, PatternBindingExtractor, LiteralTypeInferrer } from './types.js';
+import { extractSimpleTypeName, extractVarName, unwrapAwait, resolveIterableElementType, methodToTypeArgPosition, extractElementTypeFromString, type TypeArgPosition } from './shared.js';
+import { findChild } from '../resolvers/utils.js';
 
 /** Known container property accessors that operate on the container itself (e.g., dict.Keys, dict.Values) */
 const KNOWN_CONTAINER_PROPS: ReadonlySet<string> = new Set(['Keys', 'Values']);
@@ -50,8 +51,8 @@ const extractDeclaration: TypeBindingExtractor = (node: SyntaxNode, env: Map<str
     // tree-sitter-c-sharp may put object_creation_expression as direct child
     // or inside equals_value_clause depending on grammar version
     if (declarators.length === 1) {
-      const initializer = findChildByType(declarators[0], 'object_creation_expression')
-        ?? findChildByType(declarators[0], 'equals_value_clause')?.firstNamedChild;
+      const initializer = findChild(declarators[0], 'object_creation_expression')
+        ?? findChild(declarators[0], 'equals_value_clause')?.firstNamedChild;
       if (initializer?.type === 'object_creation_expression') {
         const ctorType = initializer.childForFieldName('type');
         if (ctorType) typeName = extractSimpleTypeName(ctorType);
@@ -142,7 +143,7 @@ const extractCSharpElementTypeFromTypeNode = (typeNode: SyntaxNode, pos: TypeArg
   // generic_name: List<User>, IEnumerable<User>, Dictionary<string, User>
   // C# uses generic_name (not generic_type)
   if (typeNode.type === 'generic_name') {
-    const argList = findChildByType(typeNode, 'type_argument_list');
+    const argList = findChild(typeNode, 'type_argument_list');
     if (argList && argList.namedChildCount >= 1) {
       if (pos === 'first') {
         const firstArg = argList.namedChild(0);
@@ -463,6 +464,32 @@ const extractPendingAssignment: PendingAssignmentExtractor = (node, scopeEnv) =>
   return undefined;
 };
 
+/** Infer the type of a literal AST node for C# overload disambiguation. */
+const inferLiteralType: LiteralTypeInferrer = (node) => {
+  switch (node.type) {
+    case 'integer_literal':
+      if (node.text.endsWith('L') || node.text.endsWith('l')) return 'long';
+      return 'int';
+    case 'real_literal':
+      if (node.text.endsWith('f') || node.text.endsWith('F')) return 'float';
+      if (node.text.endsWith('m') || node.text.endsWith('M')) return 'decimal';
+      return 'double';
+    case 'string_literal':
+    case 'verbatim_string_literal':
+    case 'raw_string_literal':
+    case 'interpolated_string_expression':
+      return 'string';
+    case 'character_literal':
+      return 'char';
+    case 'boolean_literal':
+      return 'bool';
+    case 'null_literal':
+      return 'null';
+    default:
+      return undefined;
+  }
+};
+
 export const typeConfig: LanguageTypeConfig = {
   declarationNodeTypes: DECLARATION_NODE_TYPES,
   forLoopNodeTypes: FOR_LOOP_NODE_TYPES,
@@ -473,4 +500,5 @@ export const typeConfig: LanguageTypeConfig = {
   extractForLoopBinding,
   extractPendingAssignment,
   extractPatternBinding,
+  inferLiteralType,
 };

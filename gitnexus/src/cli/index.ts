@@ -18,9 +18,10 @@ program
 
 program
   .command('setup')
-  .description('One-time setup: configure MCP for Cursor, Claude Code, OpenCode')
+  .description('One-time setup: configure MCP for Cursor, Claude Code, OpenCode, Codex')
   .option('-y, --yes', 'Skip interactive prompts')
   .action(createLazyAction(() => import('./setup.js'), 'setupCommand'));
+
 
 program
   .command('analyze [path]')

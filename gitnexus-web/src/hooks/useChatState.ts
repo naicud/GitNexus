@@ -124,7 +124,7 @@ export function useChatState(deps: ChatStateDeps): ChatState {
 
       if (effectiveBackendUrl) {
         const fileContentsEntries = Array.from(
-          (overrideFileContents ?? fileContentsRef.current).entries()
+          (overrideFileContents ?? fileContentsRef.current ?? new Map()).entries()
         );
         result = await api.initializeBackendAgent(
           config,

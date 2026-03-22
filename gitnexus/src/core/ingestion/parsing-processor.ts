@@ -5,7 +5,7 @@ import { LANGUAGE_QUERIES } from './tree-sitter-queries.js';
 import { generateId } from '../../lib/utils.js';
 import { SymbolTable } from './symbol-table.js';
 import { ASTCache } from './ast-cache.js';
-import { getLanguageFromFilename, getLanguageFromPath, yieldToEventLoop, getDefinitionNodeFromCaptures, findEnclosingClassId, extractMethodSignature, isBuiltInOrNoise } from './utils.js';
+import { getLanguageFromFilename, getLanguageFromPath, yieldToEventLoop, getDefinitionNodeFromCaptures, findEnclosingClassId, extractMethodSignature, isBuiltInOrNoise, getLabelFromCaptures } from './utils.js';
 import { extractPropertyDeclaredType } from './type-extractors/shared.js';
 import { isNodeExported } from './export-detection.js';
 import { detectFrameworkFromAST } from './framework-detection.js';
@@ -13,7 +13,7 @@ import { typeConfigs } from './type-extractors/index.js';
 import { SupportedLanguages } from '../../config/supported-languages.js';
 import { preprocessCobolSource, extractCobolSymbolsWithRegex } from './cobol-preprocessor.js';
 import { WorkerPool } from './workers/worker-pool.js';
-import type { ParseWorkerResult, ParseWorkerInput, ExtractedImport, ExtractedCall, ExtractedAssignment, ExtractedHeritage, ExtractedRoute, FileConstructorBindings } from './workers/parse-worker.js';
+import type { ParseWorkerResult, ParseWorkerInput, ExtractedImport, ExtractedCall, ExtractedAssignment, ExtractedHeritage, ExtractedRoute, FileConstructorBindings, FileTypeEnvBindings } from './workers/parse-worker.js';
 import { getTreeSitterBufferSize, TREE_SITTER_MAX_BUFFER } from './constants.js';
 
 export type FileProgressCallback = (current: number, total: number, filePath: string) => void;
@@ -25,14 +25,10 @@ export interface WorkerExtractedData {
   heritage: ExtractedHeritage[];
   routes: ExtractedRoute[];
   constructorBindings: FileConstructorBindings[];
-  /** True when data came from the sequential fallback (only COBOL data present;
-   *  non-COBOL files still need tree-sitter-based import/call processing). */
+  typeEnvBindings: FileTypeEnvBindings[];
+  /** True when data came from the sequential fallback (only COBOL data present) */
   sequentialFallback?: boolean;
 }
-
-// isNodeExported imported from ./export-detection.js (shared module)
-// Re-export for backward compatibility with any external consumers
-export { isNodeExported } from './export-detection.js';
 
 // ============================================================================
 // Worker-based parallel parsing
@@ -53,7 +49,7 @@ const processParsingWithWorkers = async (
     if (lang) parseableFiles.push({ path: file.path, content: file.content });
   }
 
-  if (parseableFiles.length === 0) return { imports: [], calls: [], assignments: [], heritage: [], routes: [], constructorBindings: [] };
+  if (parseableFiles.length === 0) return { imports: [], calls: [], assignments: [], heritage: [], routes: [], constructorBindings: [], typeEnvBindings: [] };
 
   const total = files.length;
 
@@ -72,6 +68,7 @@ const processParsingWithWorkers = async (
   const allHeritage: ExtractedHeritage[] = [];
   const allRoutes: ExtractedRoute[] = [];
   const allConstructorBindings: FileConstructorBindings[] = [];
+  const allTypeEnvBindings: FileTypeEnvBindings[] = [];
   for (const result of chunkResults) {
     for (const node of result.nodes) {
       graph.addNode({
@@ -88,6 +85,8 @@ const processParsingWithWorkers = async (
     for (const sym of result.symbols) {
       symbolTable.add(sym.filePath, sym.name, sym.nodeId, sym.type, {
         parameterCount: sym.parameterCount,
+        requiredParameterCount: sym.requiredParameterCount,
+        parameterTypes: sym.parameterTypes,
         returnType: sym.returnType,
         declaredType: sym.declaredType,
         ownerId: sym.ownerId,
@@ -100,6 +99,7 @@ const processParsingWithWorkers = async (
     allHeritage.push(...result.heritage);
     allRoutes.push(...result.routes);
     allConstructorBindings.push(...result.constructorBindings);
+    allTypeEnvBindings.push(...result.typeEnvBindings);
   }
 
   // Merge and log skipped languages from workers
@@ -118,7 +118,7 @@ const processParsingWithWorkers = async (
 
   // Final progress
   onFileProgress?.(total, total, 'done');
-  return { imports: allImports, calls: allCalls, assignments: allAssignments, heritage: allHeritage, routes: allRoutes, constructorBindings: allConstructorBindings };
+  return { imports: allImports, calls: allCalls, assignments: allAssignments, heritage: allHeritage, routes: allRoutes, constructorBindings: allConstructorBindings, typeEnvBindings: allTypeEnvBindings };
 };
 
 // ============================================================================
@@ -452,58 +452,13 @@ const processParsingSequential = async (
         captureMap[c.name] = c.node;
       });
 
-      if (captureMap['import']) {
-        return;
-      }
-
-      if (captureMap['call']) {
-        return;
-      }
+      const nodeLabel = getLabelFromCaptures(captureMap, language);
+      if (!nodeLabel) return;
 
       const nameNode = captureMap['name'];
       // Synthesize name for constructors without explicit @name capture (e.g. Swift init)
-      if (!nameNode && !captureMap['definition.constructor']) return;
+      if (!nameNode && nodeLabel !== 'Constructor') return;
       const nodeName = nameNode ? nameNode.text : 'init';
-
-      let nodeLabel: NodeLabel = 'CodeElement';
-
-      if (captureMap['definition.function']) {
-        // C/C++: @definition.function is broad and also matches inline class methods (inside
-        // a class/struct body). Those are already captured by @definition.method, so skip
-        // the duplicate Function entry to prevent double-indexing in globalIndex.
-        if (language === SupportedLanguages.CPlusPlus || language === SupportedLanguages.C) {
-          let ancestor = captureMap['definition.function']?.parent;
-          while (ancestor) {
-            if (ancestor.type === 'class_specifier' || ancestor.type === 'struct_specifier') {
-              break;
-            }
-            ancestor = ancestor.parent;
-          }
-          if (ancestor) return; // inside a class body — handled by @definition.method
-        }
-        nodeLabel = 'Function';
-      }
-      else if (captureMap['definition.class']) nodeLabel = 'Class';
-      else if (captureMap['definition.interface']) nodeLabel = 'Interface';
-      else if (captureMap['definition.method']) nodeLabel = 'Method';
-      else if (captureMap['definition.struct']) nodeLabel = 'Struct';
-      else if (captureMap['definition.enum']) nodeLabel = 'Enum';
-      else if (captureMap['definition.namespace']) nodeLabel = 'Namespace';
-      else if (captureMap['definition.module']) nodeLabel = 'Module';
-      else if (captureMap['definition.trait']) nodeLabel = 'Trait';
-      else if (captureMap['definition.impl']) nodeLabel = 'Impl';
-      else if (captureMap['definition.type']) nodeLabel = 'TypeAlias';
-      else if (captureMap['definition.const']) nodeLabel = 'Const';
-      else if (captureMap['definition.static']) nodeLabel = 'Static';
-      else if (captureMap['definition.typedef']) nodeLabel = 'Typedef';
-      else if (captureMap['definition.macro']) nodeLabel = 'Macro';
-      else if (captureMap['definition.union']) nodeLabel = 'Union';
-      else if (captureMap['definition.property']) nodeLabel = 'Property';
-      else if (captureMap['definition.record']) nodeLabel = 'Record';
-      else if (captureMap['definition.delegate']) nodeLabel = 'Delegate';
-      else if (captureMap['definition.annotation']) nodeLabel = 'Annotation';
-      else if (captureMap['definition.constructor']) nodeLabel = 'Constructor';
-      else if (captureMap['definition.template']) nodeLabel = 'Template';
 
       const definitionNodeForRange = getDefinitionNodeFromCaptures(captureMap);
       const startLine = definitionNodeForRange ? definitionNodeForRange.startPosition.row : (nameNode ? nameNode.startPosition.row : 0);
@@ -545,6 +500,8 @@ const processParsingSequential = async (
           } : {}),
           ...(methodSig ? {
             parameterCount: methodSig.parameterCount,
+            ...(methodSig.requiredParameterCount !== undefined ? { requiredParameterCount: methodSig.requiredParameterCount } : {}),
+            ...(methodSig.parameterTypes ? { parameterTypes: methodSig.parameterTypes } : {}),
             returnType: methodSig.returnType,
           } : {}),
         },
@@ -564,6 +521,8 @@ const processParsingSequential = async (
 
       symbolTable.add(file.path, nodeName, nodeId, nodeLabel, {
         parameterCount: methodSig?.parameterCount,
+        requiredParameterCount: methodSig?.requiredParameterCount,
+        parameterTypes: methodSig?.parameterTypes,
         returnType: methodSig?.returnType,
         declaredType,
         ownerId: enclosingClassId ?? undefined,
@@ -607,7 +566,7 @@ const processParsingSequential = async (
   }
 
   if (cobolImports.length > 0 || cobolCalls.length > 0) {
-    return { imports: cobolImports, calls: cobolCalls, assignments: cobolAssignments, heritage: [], routes: [], constructorBindings: [], sequentialFallback: true };
+    return { imports: cobolImports, calls: cobolCalls, assignments: cobolAssignments, heritage: [], routes: [], constructorBindings: [], typeEnvBindings: [], sequentialFallback: true };
   }
 
   return null;

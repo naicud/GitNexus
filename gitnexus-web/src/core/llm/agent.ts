@@ -24,6 +24,7 @@ import type {
   OpenRouterConfig,
   CustomConfig,
   AWSBedrockConfig,
+  MiniMaxConfig,
   AgentStreamChunk,
 } from './types';
 import { 
@@ -200,7 +201,7 @@ export const createChatModel = (config: ProviderConfig): BaseChatModel => {
     
     case 'openrouter': {
       const openRouterConfig = config as OpenRouterConfig;
-      
+
       // Debug logging
       if (import.meta.env.DEV) {
         console.log('🌐 OpenRouter config:', {
@@ -210,11 +211,11 @@ export const createChatModel = (config: ProviderConfig): BaseChatModel => {
           baseUrl: openRouterConfig.baseUrl,
         });
       }
-      
+
       if (!openRouterConfig.apiKey || openRouterConfig.apiKey.trim() === '') {
         throw new Error('OpenRouter API key is required but was not provided');
       }
-      
+
       return new ChatOpenAI({
         openAIApiKey: openRouterConfig.apiKey,
         apiKey: openRouterConfig.apiKey, // Fallback for some versions
@@ -228,7 +229,26 @@ export const createChatModel = (config: ProviderConfig): BaseChatModel => {
         streaming: true,
       });
     }
-    
+
+    case 'minimax': {
+      const minimaxConfig = config as MiniMaxConfig;
+
+      if (!minimaxConfig.apiKey || minimaxConfig.apiKey.trim() === '') {
+        throw new Error('MiniMax API key is required but was not provided');
+      }
+
+      return new ChatAnthropic({
+        anthropicApiKey: minimaxConfig.apiKey,
+        model: minimaxConfig.model,
+        temperature: minimaxConfig.temperature ?? 0.1,
+        maxTokens: minimaxConfig.maxTokens ?? 8192,
+        streaming: true,
+        clientOptions: {
+          baseURL: 'https://api.minimax.io/anthropic',
+        },
+      });
+    }
+
     case 'custom': {
       const customConfig = config as CustomConfig;
       if (!customConfig.baseUrl?.trim()) {

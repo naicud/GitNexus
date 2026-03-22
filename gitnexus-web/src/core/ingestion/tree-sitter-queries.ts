@@ -497,5 +497,6 @@ export const LANGUAGE_QUERIES: Record<SupportedLanguages, string> = {
   [SupportedLanguages.Ruby]: RUBY_QUERIES,
   [SupportedLanguages.Kotlin]: '', // Kotlin WASM parser not yet available for web
   [SupportedLanguages.Swift]: SWIFT_QUERIES,
+  [SupportedLanguages.COBOL]: '',  // COBOL uses regex-only extraction, no tree-sitter queries
 };
  

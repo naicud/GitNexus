@@ -533,9 +533,10 @@ export const useSigma = (options: UseSigmaOptions = {}): UseSigmaReturn => {
     sigma.on('rightClickNode', ({ node, event }) => {
       event.preventSigmaDefault();
       event.original.preventDefault();
+      const mouseEvent = event.original as MouseEvent;
       options.onNodeRightClick?.(node, {
-        clientX: event.original.clientX,
-        clientY: event.original.clientY,
+        clientX: mouseEvent.clientX,
+        clientY: mouseEvent.clientY,
       });
     });
 

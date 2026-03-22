@@ -52,6 +52,5 @@ export {
   extractSimpleTypeName,
   extractGenericTypeArgs,
   extractVarName,
-  findChildByType,
   extractRubyConstructorAssignment
 } from './shared.js';

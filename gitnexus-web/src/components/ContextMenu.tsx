@@ -19,7 +19,7 @@ interface ContextMenuProps {
   // State
   isLayoutRunning: boolean;
   hasExpandedGroups: boolean;
-  graphViewMode: 'full' | 'summary';
+  graphViewMode: 'full' | 'summary' | 'hierarchy';
 }
 
 const MenuItem: React.FC<{
