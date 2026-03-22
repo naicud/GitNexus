@@ -833,7 +833,7 @@ export class LocalBackend {
     }
   }
 
-  async executeCypher(repoName: string, query: string): Promise<any> {
+  async executeCypher(repoName: string | undefined, query: string): Promise<any> {
     const repo = await this.resolveRepo(repoName);
     return this.cypher(repo, { query });
   }
@@ -888,6 +888,117 @@ export class LocalBackend {
       row_count: result.length,
     };
   }
+
+  // ─── HTTP API Helpers ──────────────────────────────────────────
+
+  /**
+   * Text search for the HTTP API layer.
+   * Routes through the correct backend (FTS for LadybugDB, CONTAINS for Neptune).
+   */
+  async searchForApi(
+    repoName: string | undefined,
+    query: string,
+    limit: number,
+  ): Promise<any[]> {
+    const repo = await this.resolveRepo(repoName);
+    await this.ensureInitialized(repo.id);
+
+    if (this.isNeptune(repo.id)) {
+      return this.getAdapter(repo.id).executeParameterized(`
+        MATCH (n)
+        WHERE toLower(n.name) CONTAINS toLower($q)
+        RETURN n.id AS id, n.name AS name, labels(n)[0] AS type, n.filePath AS filePath
+        LIMIT ${limit}
+      `, { q: query });
+    }
+
+    // LadybugDB path: hybrid search (BM25 + optional semantic)
+    const { searchFTSFromLbug } = await import('../../core/search/bm25-index.js');
+    const { hybridSearch } = await import('../../core/search/hybrid-search.js');
+    const { isEmbedderReady } = await import('../../core/embeddings/embedder.js');
+
+    if (isEmbedderReady()) {
+      const { semanticSearch } = await import('../../core/embeddings/embedding-pipeline.js');
+      return hybridSearch(query, limit, (cypher: string) => executeQuery(repo.id, cypher), semanticSearch);
+    }
+    // Pass repo.id so the MCP connection pool is used (not the legacy single-connection path)
+    return searchFTSFromLbug(query, limit, repo.id);
+  }
+
+  /**
+   * Get full graph for the HTTP API layer.
+   * Returns null for Neptune repos (graph visualization not supported).
+   */
+  async getGraphForApi(repoName: string | undefined): Promise<{ nodes: any[]; relationships: any[] } | null> {
+    const repo = await this.resolveRepo(repoName);
+    await this.ensureInitialized(repo.id);
+
+    if (this.isNeptune(repo.id)) {
+      return null; // Graph visualization not supported for Neptune
+    }
+
+    const { NODE_TABLES } = await import('../../core/lbug/schema.js');
+    const adapter = this.getAdapter(repo.id);
+
+    const nodes: any[] = [];
+    for (const table of NODE_TABLES) {
+      try {
+        let query = '';
+        if (table === 'File') {
+          query = `MATCH (n:File) RETURN n.id AS id, n.name AS name, n.filePath AS filePath, n.content AS content`;
+        } else if (table === 'Folder') {
+          query = `MATCH (n:Folder) RETURN n.id AS id, n.name AS name, n.filePath AS filePath`;
+        } else if (table === 'Community') {
+          query = `MATCH (n:Community) RETURN n.id AS id, n.label AS label, n.heuristicLabel AS heuristicLabel, n.cohesion AS cohesion, n.symbolCount AS symbolCount`;
+        } else if (table === 'Process') {
+          query = `MATCH (n:Process) RETURN n.id AS id, n.label AS label, n.heuristicLabel AS heuristicLabel, n.processType AS processType, n.stepCount AS stepCount, n.communities AS communities, n.entryPointId AS entryPointId, n.terminalId AS terminalId`;
+        } else {
+          query = `MATCH (n:${table}) RETURN n.id AS id, n.name AS name, n.filePath AS filePath, n.startLine AS startLine, n.endLine AS endLine, n.content AS content`;
+        }
+        const rows = await adapter.executeQuery(query);
+        for (const row of rows) {
+          nodes.push({
+            id: row.id ?? (row as any)[0],
+            label: table,
+            properties: {
+              name: row.name ?? row.label ?? (row as any)[1],
+              filePath: row.filePath ?? (row as any)[2],
+              startLine: row.startLine,
+              endLine: row.endLine,
+              content: row.content,
+              heuristicLabel: row.heuristicLabel,
+              cohesion: row.cohesion,
+              symbolCount: row.symbolCount,
+              processType: row.processType,
+              stepCount: row.stepCount,
+              communities: row.communities,
+              entryPointId: row.entryPointId,
+              terminalId: row.terminalId,
+            },
+          });
+        }
+      } catch {
+        // ignore empty tables
+      }
+    }
+
+    const relRows = await adapter.executeQuery(
+      `MATCH (a)-[r:CodeRelation]->(b) RETURN a.id AS sourceId, b.id AS targetId, r.type AS type, r.confidence AS confidence, r.reason AS reason, r.step AS step`
+    );
+    const relationships = relRows.map((row: any) => ({
+      id: `${row.sourceId}_${row.type}_${row.targetId}`,
+      type: row.type,
+      sourceId: row.sourceId,
+      targetId: row.targetId,
+      confidence: row.confidence,
+      reason: row.reason,
+      step: row.step,
+    }));
+
+    return { nodes, relationships };
+  }
+
+  // ─── Internal Helpers ──────────────────────────────────────────
 
   /**
    * Aggregate same-named clusters: group by heuristicLabel, sum symbols,

@@ -4,14 +4,16 @@ import { resolve } from 'path';
 
 describe('Neptune API search injection safety', () => {
   it('should NOT use string interpolation for query parameters in Neptune search', () => {
+    // Neptune search logic lives in LocalBackend.searchForApi (moved from api.ts)
     const src = readFileSync(
-      resolve(__dirname, '../../src/server/api.ts'),
+      resolve(__dirname, '../../src/mcp/local/local-backend.ts'),
       'utf-8',
     );
-    const neptuneSearchStart = src.indexOf('Neptune: CONTAINS-based text search');
+    const neptuneSearchStart = src.indexOf('CONTAINS toLower($q)');
     expect(neptuneSearchStart).toBeGreaterThan(-1);
 
-    const neptuneSearchEnd = src.indexOf('return;', neptuneSearchStart);
+    // Find the enclosing searchForApi method — look for the next closing brace pattern
+    const neptuneSearchEnd = src.indexOf('// LadybugDB path', neptuneSearchStart);
     expect(neptuneSearchEnd).toBeGreaterThan(neptuneSearchStart);
 
     const block = src.slice(neptuneSearchStart, neptuneSearchEnd);

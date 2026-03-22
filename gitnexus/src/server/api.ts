@@ -13,92 +13,10 @@ import cors from 'cors';
 import path from 'path';
 import fs from 'fs/promises';
 import { loadMeta, listRegisteredRepos, updateRepoDb } from '../storage/repo-manager.js';
-import { executeQuery, closeLbug, withLbugDb } from '../core/lbug/lbug-adapter.js';
-import { NODE_TABLES } from '../core/lbug/schema.js';
-import { GraphNode, GraphRelationship } from '../core/graph/types.js';
-import { searchFTSFromLbug } from '../core/search/bm25-index.js';
-import { hybridSearch } from '../core/search/hybrid-search.js';
-// Embedding imports are lazy (dynamic import) to avoid loading onnxruntime-node
-// at server startup — crashes on unsupported Node ABI versions (#89)
 import { LocalBackend } from '../mcp/local/local-backend.js';
 import { mountMCPEndpoints } from './mcp-http.js';
-import type { DbConfig, NeptuneDbConfig } from '../core/db/interfaces.js';
+import type { NeptuneDbConfig } from '../core/db/interfaces.js';
 import { NeptuneAdapter } from '../core/db/neptune/neptune-adapter.js';
-
-/** Resolve DB config for a registry entry. Falls back to LadybugDB. */
-function getDbConfigFromEntry(entry: { storagePath: string; db?: DbConfig }): DbConfig {
-  if ((entry as any).db) {
-    // Backwards compat: old entries may have type 'kuzu' from before migration
-    if ((entry as any).db.type === 'kuzu') {
-      return { type: 'lbug', lbugPath: path.join(entry.storagePath, 'lbug') };
-    }
-    return (entry as any).db;
-  }
-  return { type: 'lbug', lbugPath: path.join(entry.storagePath, 'lbug') };
-}
-
-const buildGraph = async (): Promise<{ nodes: GraphNode[]; relationships: GraphRelationship[] }> => {
-  const nodes: GraphNode[] = [];
-  for (const table of NODE_TABLES) {
-    try {
-      let query = '';
-      if (table === 'File') {
-        query = `MATCH (n:File) RETURN n.id AS id, n.name AS name, n.filePath AS filePath, n.content AS content`;
-      } else if (table === 'Folder') {
-        query = `MATCH (n:Folder) RETURN n.id AS id, n.name AS name, n.filePath AS filePath`;
-      } else if (table === 'Community') {
-        query = `MATCH (n:Community) RETURN n.id AS id, n.label AS label, n.heuristicLabel AS heuristicLabel, n.cohesion AS cohesion, n.symbolCount AS symbolCount`;
-      } else if (table === 'Process') {
-        query = `MATCH (n:Process) RETURN n.id AS id, n.label AS label, n.heuristicLabel AS heuristicLabel, n.processType AS processType, n.stepCount AS stepCount, n.communities AS communities, n.entryPointId AS entryPointId, n.terminalId AS terminalId`;
-      } else {
-        query = `MATCH (n:${table}) RETURN n.id AS id, n.name AS name, n.filePath AS filePath, n.startLine AS startLine, n.endLine AS endLine, n.content AS content`;
-      }
-
-      const rows = await executeQuery(query);
-      for (const row of rows) {
-        nodes.push({
-          id: row.id ?? row[0],
-          label: table as GraphNode['label'],
-          properties: {
-            name: row.name ?? row.label ?? row[1],
-            filePath: row.filePath ?? row[2],
-            startLine: row.startLine,
-            endLine: row.endLine,
-            content: row.content,
-            heuristicLabel: row.heuristicLabel,
-            cohesion: row.cohesion,
-            symbolCount: row.symbolCount,
-            processType: row.processType,
-            stepCount: row.stepCount,
-            communities: row.communities,
-            entryPointId: row.entryPointId,
-            terminalId: row.terminalId,
-          } as GraphNode['properties'],
-        });
-      }
-    } catch {
-      // ignore empty tables
-    }
-  }
-
-  const relationships: GraphRelationship[] = [];
-  const relRows = await executeQuery(
-    `MATCH (a)-[r:CodeRelation]->(b) RETURN a.id AS sourceId, b.id AS targetId, r.type AS type, r.confidence AS confidence, r.reason AS reason, r.step AS step`
-  );
-  for (const row of relRows) {
-    relationships.push({
-      id: `${row.sourceId}_${row.type}_${row.targetId}`,
-      type: row.type,
-      sourceId: row.sourceId,
-      targetId: row.targetId,
-      confidence: row.confidence,
-      reason: row.reason,
-      step: row.step,
-    });
-  }
-
-  return { nodes, relationships };
-};
 
 const statusFromError = (err: any): number => {
   const msg = String(err?.message ?? '');
@@ -188,13 +106,11 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
   // Get full graph
   app.get('/api/graph', async (req, res) => {
     try {
-      const entry = await resolveRepo(requestedRepo(req));
-      if (!entry) {
-        res.status(404).json({ error: 'Repository not found' });
+      const graph = await backend.getGraphForApi(requestedRepo(req));
+      if (!graph) {
+        res.status(501).json({ error: 'Graph visualization is not supported for Neptune-backed repos. Use Cypher queries instead.' });
         return;
       }
-      const lbugPath = path.join(entry.storagePath, 'lbug');
-      const graph = await withLbugDb(lbugPath, async () => buildGraph());
       res.json(graph);
     } catch (err: any) {
       res.status(500).json({ error: err.message || 'Failed to build graph' });
@@ -209,27 +125,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
         res.status(400).json({ error: 'Missing "cypher" in request body' });
         return;
       }
-
-      const entry = await resolveRepo(requestedRepo(req));
-      if (!entry) {
-        res.status(404).json({ error: 'Repository not found' });
-        return;
-      }
-
-      const dbConfig = getDbConfigFromEntry(entry);
-      if (dbConfig.type === 'neptune') {
-        const adapter = new NeptuneAdapter(dbConfig as NeptuneDbConfig);
-        try {
-          const result = await adapter.executeQuery(cypher);
-          res.json({ result });
-        } finally {
-          adapter.close();
-        }
-        return;
-      }
-
-      const lbugPath = path.join(entry.storagePath, 'lbug');
-      const result = await withLbugDb(lbugPath, () => executeQuery(cypher));
+      const result = await backend.executeCypher(requestedRepo(req), cypher);
       res.json({ result });
     } catch (err: any) {
       res.status(500).json({ error: err.message || 'Query failed' });
@@ -244,48 +140,9 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
         res.status(400).json({ error: 'Missing "query" in request body' });
         return;
       }
-
-      const entry = await resolveRepo(requestedRepo(req));
-      if (!entry) {
-        res.status(404).json({ error: 'Repository not found' });
-        return;
-      }
-
-      const dbConfig = getDbConfigFromEntry(entry);
-      if (dbConfig.type === 'neptune') {
-        // Neptune: CONTAINS-based text search fallback (no FTS)
-        const adapter = new NeptuneAdapter(dbConfig as NeptuneDbConfig);
-        try {
-          // Neptune openCypher does NOT support parameterized LIMIT — must be inline literal.
-          const limit = Math.max(1, Math.min(100, Math.trunc(Number(req.body.limit ?? 10))));
-          const results = await adapter.executeParameterized(`
-            MATCH (n)
-            WHERE toLower(n.name) CONTAINS toLower($q)
-            RETURN n.id AS id, n.name AS name, labels(n)[0] AS type, n.filePath AS filePath
-            LIMIT ${limit}
-          `, { q: query });
-          res.json({ results });
-        } finally {
-          adapter.close();
-        }
-        return;
-      }
-
-      const lbugPath = path.join(entry.storagePath, 'lbug');
       const parsedLimit = Number(req.body.limit ?? 10);
-      const limit = Number.isFinite(parsedLimit)
-        ? Math.max(1, Math.min(100, Math.trunc(parsedLimit)))
-        : 10;
-
-      const results = await withLbugDb(lbugPath, async () => {
-        const { isEmbedderReady } = await import('../core/embeddings/embedder.js');
-        if (isEmbedderReady()) {
-          const { semanticSearch } = await import('../core/embeddings/embedding-pipeline.js');
-          return hybridSearch(query, limit, executeQuery, semanticSearch);
-        }
-        // FTS-only fallback when embeddings aren't loaded
-        return searchFTSFromLbug(query, limit);
-      });
+      const limit = Number.isFinite(parsedLimit) ? Math.max(1, Math.min(100, Math.trunc(parsedLimit))) : 10;
+      const results = await backend.searchForApi(requestedRepo(req), query, limit);
       res.json({ results });
     } catch (err: any) {
       res.status(500).json({ error: err.message || 'Search failed' });
@@ -443,8 +300,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
   const shutdown = async () => {
     server.close();
     await cleanupMcp();
-    await closeLbug();
-    await backend.disconnect();
+    await backend.disconnect(); // closes LadybugDB + Neptune adapters
     process.exit(0);
   };
   process.once('SIGINT', shutdown);
